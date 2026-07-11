@@ -512,12 +512,14 @@ def _snow_core(
     ) * ztmst
 
     full_melt = zsstar1 < 0.0
+    zsstar_melt = torch.where(full_melt, torch.zeros_like(zsstar1), zsstar1)
     pgsn_melt = torch.where(full_melt, pgsn_full, pgsn_partial)
     ptsn_melt = zt0_t
 
     # Combine the melt / no-melt branches.
     ptsn_with_snow = torch.where(no_melt, ptsn_no_melt, ptsn_melt)
     pgsn_with_snow = torch.where(no_melt, pgsn_no_melt, pgsn_melt)
+    zsstar_with_snow = torch.where(no_melt, zsstar, zsstar_melt)
 
     # ------------------------------------------------------------------ #
     # Apply the no-snow branch (Fortran lines 216-220):
@@ -533,7 +535,7 @@ def _snow_core(
         torch.zeros_like(pgsn_with_snow),
         pgsn_with_snow,
     )
-    zsstar_out = torch.where(llnosnow, zsstar_nosnow, zsstar)
+    zsstar_out = torch.where(llnosnow, zsstar_nosnow, zsstar_with_snow)
     zlwc_out = torch.where(
         llnosnow, torch.zeros_like(zlwc), zlwc
     )
