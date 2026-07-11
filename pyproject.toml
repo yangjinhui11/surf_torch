@@ -1,0 +1,107 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "surf-pytorch"
+version = "0.1.0"
+description = "PyTorch port of the OpenIFS 48r1 land-surface package (HTESSEL + SEB + diffusion + snow)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "OpenIFS-ML team" },
+]
+keywords = ["openifs", "land-surface", "htessel", "pytorch", "differentiable"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Intended Audience :: Science/Research",
+]
+
+dependencies = [
+    "numpy>=1.22",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.urls]
+Source = "https://example.invalid/openifs-surf-pytorch"
+Issues = "https://example.invalid/openifs-surf-pytorch/issues"
+
+# --------------------------------------------------------------------------- #
+# Packaging: ship the package, the offline driver bridge, and the tests
+# --------------------------------------------------------------------------- #
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["surf_pytorch*"]
+exclude = ["tests*", "offline_driver*"]
+
+# --------------------------------------------------------------------------- #
+# Pytest: tests live under tests/, run with double precision by default
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "fortran_ref: marks tests that compare against a Fortran reference value",
+    "coupled_ref: marks tests that need a coupled OpenIFS run (OIFS_OGG_PATH)",
+]
+
+# --------------------------------------------------------------------------- #
+# Ruff: keep imports tidy, line length matches the Fortran (132 cols is
+# too wide for code review -- stick to 100)
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = ["offline_driver"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line length handled by formatter
+    "E741",  # ambiguous variable names (lots in physics: ZQ, ZT ...)
+]
+
+# --------------------------------------------------------------------------- #
+# Mypy: physics-heavy code is loosely typed; opt-in per file
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = false
+exclude = ["offline_driver/", "build/"]
