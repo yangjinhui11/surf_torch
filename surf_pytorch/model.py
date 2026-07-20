@@ -708,7 +708,18 @@ class LandSurface(nn.Module):
             snow_frac_raw = 100.0 * snow_out.psstar / snow_rho_safe * 0.1
         else:
             snow_frac_raw = snow_out.psstar * self.soil_table.consts.rqsmcr
-        new_snow_frac = torch.clamp(snow_frac_raw, 0.0, 1.0)
+        snow_frac_floor = torch.as_tensor(
+            self.soil_table.consts.rfrsmall, dtype=dtype, device=device,
+        )
+        snow_active = snow_frac_raw >= snow_frac_floor
+        new_snow_frac = torch.where(
+            snow_active,
+            torch.clamp(snow_frac_raw, 0.0, 1.0),
+            torch.zeros_like(snow_frac_raw),
+        )
+        new_snow_w = torch.where(
+            snow_active, snow_out.psstar, torch.zeros_like(snow_out.psstar),
+        )
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
@@ -792,19 +803,33 @@ class LandSurface(nn.Module):
         )
 
         new_snow_t = torch.where(
-            snow_out.psstar <= 0.0,
+            ~snow_active,
             torch.full_like(snow_out.ptsn, self.consts.rtt),
             snow_out.ptsn,
         )
+        provisional_state = state.like(
+            skin_t=surfpp_skin_t,
+            soil_t=new_soil_t,
+            snow_t=new_snow_t,
+            snow_w=new_snow_w,
+            snow_frac=new_snow_frac,
+            skin_water=skin_water_out,
+        )
+        next_frac = self._tile_frac(static, ntile, state=provisional_state)
+        next_tsrf = self._sub_surface_t(provisional_state, ntile)
+        skin_t_out = self._initialise_new_active_tile_skin_t(
+            surfpp_skin_t, frac, next_frac, next_tsrf,
+        )
+        skin_t_out = self._limit_active_snow_tile_skin_t(skin_t_out, next_frac)
         new_state = state.like(
-            skin_t=surfpp_skin_t.clone(),
+            skin_t=skin_t_out.clone(),
             # This is PTL at t+1.  It must use the fractions from the VDF
             # step, before snow/skin-water updates change the tile split.
-            radiative_skin_t=scatter_to_tiles(surfpp_skin_t, frac).clone(),
+            radiative_skin_t=scatter_to_tiles(skin_t_out, frac).clone(),
             soil_t=new_soil_t,
             soil_w_liq=new_soil_w,
             snow_t=new_snow_t,
-            snow_w=snow_out.psstar,
+            snow_w=new_snow_w,
             snow_rho=new_snow_rho,
             snow_frac=new_snow_frac,
             snow_alb=new_snow_alb,
@@ -853,7 +878,10 @@ class LandSurface(nn.Module):
         max_land_tile = min(ntile, TILE_BARE_SOIL + 1)
         mean_pssh = (frac * pssh).sum(dim=1, keepdim=True)
         mean_pjq = (frac * pjq).sum(dim=1, keepdim=True)
-        zero_frac = frac[:, :max_land_tile] == 0.0
+        frac_floor = torch.as_tensor(
+            self.soil_table.consts.rthrfri_ti, dtype=frac.dtype, device=frac.device,
+        )
+        zero_frac = frac[:, :max_land_tile] < frac_floor
         if max_land_tile > TILE_WET_SKIN:
             zero_frac[:, TILE_WET_SKIN] = False
         pssh_land = torch.where(
@@ -874,8 +902,49 @@ class LandSurface(nn.Module):
     ) -> torch.Tensor:
         """Mirror SURFPPS_CTL zero-fraction PTSKTI replacement."""
         mean_tsk = (frac * ptsktip1).sum(dim=1, keepdim=True)
-        zero_frac = frac == 0.0
+        frac_floor = torch.as_tensor(
+            self.soil_table.consts.rthrfri_ti, dtype=frac.dtype, device=frac.device,
+        )
+        zero_frac = frac < frac_floor
         return torch.where(zero_frac, mean_tsk.expand_as(ptsktip1), ptsktip1)
+
+    def _initialise_new_active_tile_skin_t(
+        self,
+        skin_t: torch.Tensor,
+        old_frac: torch.Tensor,
+        new_frac: torch.Tensor,
+        tsrf_next: torch.Tensor,
+    ) -> torch.Tensor:
+        """Initialise tiles that appear after the SURFBC fraction update."""
+        frac_floor = torch.as_tensor(
+            self.soil_table.consts.rthrfri_ti,
+            dtype=skin_t.dtype,
+            device=skin_t.device,
+        )
+        newly_active = (old_frac < frac_floor) & (new_frac >= frac_floor)
+        return torch.where(newly_active, tsrf_next, skin_t)
+
+    def _limit_active_snow_tile_skin_t(
+        self,
+        skin_t: torch.Tensor,
+        frac: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep active snow-tile restart skin temperatures at or below RTT."""
+        ntile = skin_t.shape[1]
+        if ntile <= TILE_LOW_VEG_SNOW:
+            return skin_t
+        frac_floor = torch.as_tensor(
+            self.soil_table.consts.rthrfri_ti,
+            dtype=skin_t.dtype,
+            device=skin_t.device,
+        )
+        tile_index = torch.arange(ntile, device=skin_t.device)
+        snow_tile = tile_index == TILE_LOW_VEG_SNOW
+        if ntile > TILE_HIGH_VEG_SNOW:
+            snow_tile = snow_tile | (tile_index == TILE_HIGH_VEG_SNOW)
+        active_snow = snow_tile.unsqueeze(0) & (frac >= frac_floor)
+        capped = torch.minimum(skin_t, self.consts.rtt)
+        return torch.where(active_snow, capped, skin_t)
 
     def _snow_under_forest_evap(
         self,
@@ -895,9 +964,23 @@ class LandSurface(nn.Module):
         if ntile <= TILE_HIGH_VEG_SNOW:
             return zero
 
+        frac_floor = torch.as_tensor(
+            self.soil_table.consts.rthrfri_ti, dtype=dtype, device=device,
+        )
+        active = frac[:, TILE_HIGH_VEG_SNOW] >= frac_floor
         snow_t = state.snow_t if state.snow_t is not None else state.soil_t[:, 0]
-        qssn = qsat(
+        snow_t_for_qsat = torch.clamp(
             snow_t.to(dtype=dtype, device=device),
+            min=self.consts.rtice,
+            max=self.consts.rtt,
+        )
+        snow_t_safe = torch.where(
+            active,
+            snow_t_for_qsat,
+            torch.full((ngrid,), self.consts.rtt, dtype=dtype, device=device),
+        )
+        qssn = qsat(
+            snow_t_safe,
             forcing.p_surf.to(dtype=dtype, device=device),
             self.consts,
         )
@@ -906,7 +989,7 @@ class LandSurface(nn.Module):
             * pcsnw[:, TILE_HIGH_VEG_SNOW]
             * (forcing.q.to(dtype=dtype, device=device) - qssn)
         )
-        return torch.where(frac[:, TILE_HIGH_VEG_SNOW] > 0.0, pevapsnw, zero)
+        return torch.where(active, pevapsnw, zero)
 
     def _exchange_coeffs(
         self,
@@ -2789,6 +2872,10 @@ class LandSurface(nn.Module):
         zcvs = state.snow_frac if state.snow_frac is not None else \
             torch.zeros(ngrid, dtype=dtype, device=device)
         zcvs = torch.clamp(zcvs, 0.0, 1.0)
+        snow_frac_floor = torch.as_tensor(
+            self.soil_table.consts.rfrsmall, dtype=dtype, device=device,
+        )
+        zcvs = torch.where(zcvs >= snow_frac_floor, zcvs, torch.zeros_like(zcvs))
 
         # Interception capacity PWLMX (surfbc_ctl_mod.F90:308-310) and
         # wet-skin fraction ZCVW <- PWLM1M / PWLMX (:311).

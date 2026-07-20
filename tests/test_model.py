@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from surf_pytorch import SurfConfig, ConstantBundle, LandSurface
-from surf_pytorch.config import TILE_WET_SKIN
+from surf_pytorch.config import TILE_HIGH_VEG_SNOW, TILE_WET_SKIN
 from surf_pytorch.state import Forcing, Static, SurfState
 from surf_pytorch.physics.seb import _tile_solar_transmission
 
@@ -199,6 +199,125 @@ class TestLandSurfaceForward:
         # Inactive tiles use the diagnostic mean, including wet skin.
         assert result[0, 1] == pytest.approx(281.0)
         assert result[0, TILE_WET_SKIN] == pytest.approx(281.0)
+
+    def test_surfpp_replaces_subthreshold_tile_temperatures(self):
+        model = LandSurface(SurfConfig(dtype=torch.float64))
+        ptsktip1 = torch.tensor(
+            [[280.0, 281.0, 282.0, 283.0, 284.0, 285.0, 4000.0, 286.0]],
+            dtype=torch.float64,
+        )
+        frac = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.4, 0.0, 0.3, 5.0e-7, 0.3]],
+            dtype=torch.float64,
+        )
+
+        result = model._surfpp_zero_tile_skin_t(ptsktip1, frac)
+
+        expected_mean = (frac * ptsktip1).sum(dim=1).item()
+        assert result[0, TILE_HIGH_VEG_SNOW] == pytest.approx(expected_mean)
+
+    def test_snow_under_forest_evap_ignores_subthreshold_tile(self):
+        state, forcing, static, cfg = _make_inputs(N=1)
+        model = LandSurface(cfg)
+        ntile = cfg.n_tile
+        frac = torch.zeros((1, ntile), dtype=cfg.dtype)
+        frac[:, 3] = 0.4
+        frac[:, 5] = 0.3
+        frac[:, 6] = 5.0e-7
+        frac[:, 7] = 0.3 - 5.0e-7
+        state = dataclasses.replace(
+            state,
+            snow_t=torch.tensor([-7.0], dtype=cfg.dtype),
+        )
+        rhoc_q_t = torch.ones((1, ntile), dtype=cfg.dtype)
+        pcsnw = torch.ones((1, ntile), dtype=cfg.dtype)
+
+        evap = model._snow_under_forest_evap(
+            forcing=forcing,
+            state=state,
+            rhoc_q_t=rhoc_q_t,
+            pcsnw=pcsnw,
+            frac=frac,
+            ntile=ntile,
+            dtype=cfg.dtype,
+            device=torch.device("cpu"),
+        )
+
+        assert torch.isfinite(evap).all()
+        assert evap.item() == pytest.approx(0.0)
+
+    def test_snow_under_forest_evap_clamps_qsat_temperature(self):
+        state, forcing, static, cfg = _make_inputs(N=1)
+        model = LandSurface(cfg)
+        ntile = cfg.n_tile
+        frac = torch.zeros((1, ntile), dtype=cfg.dtype)
+        frac[:, 3] = 0.2
+        frac[:, 5] = 0.2
+        frac[:, 6] = 0.3
+        frac[:, 7] = 0.3
+        state = dataclasses.replace(
+            state,
+            snow_t=torch.tensor([-7.0], dtype=cfg.dtype),
+        )
+        rhoc_q_t = torch.ones((1, ntile), dtype=cfg.dtype)
+        pcsnw = torch.ones((1, ntile), dtype=cfg.dtype)
+
+        evap = model._snow_under_forest_evap(
+            forcing=forcing,
+            state=state,
+            rhoc_q_t=rhoc_q_t,
+            pcsnw=pcsnw,
+            frac=frac,
+            ntile=ntile,
+            dtype=cfg.dtype,
+            device=torch.device("cpu"),
+        )
+
+        assert torch.isfinite(evap).all()
+
+    def test_newly_active_tile_skin_uses_next_subsurface_temperature(self):
+        model = LandSurface(SurfConfig(dtype=torch.float64))
+        skin_t = torch.tensor(
+            [[1001.0, 1001.0, 1001.0, 1001.0, 271.0, 1001.0, 2975.0, 1001.0]],
+            dtype=torch.float64,
+        )
+        old_frac = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.73, 0.0, 0.27, 0.0]],
+            dtype=torch.float64,
+        )
+        new_frac = torch.tensor(
+            [[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            dtype=torch.float64,
+        )
+        tsrf_next = torch.tensor(
+            [[290.0, 273.16, 279.0, 279.0, 273.16, 279.0, 273.16, 279.0]],
+            dtype=torch.float64,
+        )
+
+        result = model._initialise_new_active_tile_skin_t(
+            skin_t, old_frac, new_frac, tsrf_next,
+        )
+
+        assert result[0, TILE_WET_SKIN] == pytest.approx(279.0)
+        assert result[0, 4] == pytest.approx(271.0)
+        assert result[0, 6] == pytest.approx(2975.0)
+
+    def test_active_snow_tile_skin_is_limited_to_melting_point(self):
+        model = LandSurface(SurfConfig(dtype=torch.float64))
+        skin_t = torch.tensor(
+            [[280.0, 281.0, 282.0, 283.0, 350.0, 285.0, 500.0, 286.0]],
+            dtype=torch.float64,
+        )
+        frac = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.2, 0.3, 0.2, 0.3, 0.0]],
+            dtype=torch.float64,
+        )
+
+        result = model._limit_active_snow_tile_skin_t(skin_t, frac)
+
+        assert result[0, 4] == pytest.approx(273.16)
+        assert result[0, 6] == pytest.approx(273.16)
+        assert result[0, 3] == pytest.approx(283.0)
 
     def test_ocean_tile_pins_to_sst(self, atol_loose):
         # lambda_skin=LARGE for the water tile forces the *instantaneous*
