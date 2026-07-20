@@ -69,7 +69,8 @@ from surf_pytorch.tables.ritbl import (
 # --------------------------------------------------------------------------- #
 RHO_ICE = vlamsk_mod.RHO_ICE          # 920.0 kg/m^3
 RHO_CI = vlamsk_mod.RHO_CI            # 2.05e6 J/m^3/K (RHOCI)
-RQSNCR_DEFAULT = vlamsk_mod.RQSNCR_DEFAULT     # 1/15 m (cy48r1 default)
+RQSNCR_DEFAULT = vlamsk_mod.RQSNCR_DEFAULT     # 1/15 m (legacy snow)
+RQSNCR_SN09 = vlamsk_mod.RQSNCR_SN09              # 1/10 m (LESN09 snow)
 RURBTC_DEFAULT = 20.0                 # urban tile skin conductivity
 
 
@@ -88,10 +89,10 @@ class _LoadedLib:
     """Holds the loaded shared library and its configured FuncPtrs."""
 
     __slots__ = ("lib", "vlamsk", "seb", "vexcs", "dqsdt", "stomata", "vevap",
-                 "vdfdifh", "soilt", "snow", "soilw", "farquhar")
+                 "vdfdifh", "soilt", "snow", "soilw", "farquhar", "srfwl")
 
     def __init__(self, lib, vlamsk, seb, vexcs, dqsdt, stomata, vevap, vdfdifh,
-                 soilt, snow, soilw, farquhar) -> None:
+                 soilt, snow, soilw, farquhar, srfwl) -> None:
         self.lib = lib
         self.vlamsk = vlamsk
         self.seb = seb
@@ -104,6 +105,7 @@ class _LoadedLib:
         self.snow = snow
         self.soilw = soilw
         self.farquhar = farquhar
+        self.srfwl = srfwl
 
 
 def _default_so_path() -> str:
@@ -213,6 +215,22 @@ def _configure_stomata(step) -> None:
         _P_F64,                                  # PEXDIAG (2D: KLON,10 out)
     ]
 
+
+
+def _configure_srfwl(step) -> None:
+    """argtypes for SURF_REF_SRFWL -- mirrors srfwl_mod.F90."""
+    step.restype = None
+    step.argtypes = [
+        _I32, _I32,                              # KLON_C, NTILES_C
+        _F64,                                    # PTMST
+        _P_F64, _P_F64, _P_F64, _P_F64,          # PWLM1M,PCVL,PCVH,PWLMX
+        _P_F64, _P_F64,                          # PFRTI,PEVAPTI (2D)
+        _P_F64, _P_F64, _P_F64,                  # PRSFC,PRSFL,PEVAPSNW
+        _P_BOOL,                                 # LDLAND
+        _F64, _F64, _BOOL,                       # RPSFR,RVINTER,LEWBSOILFIX
+        _P_F64, _P_F64, _P_F64, _P_F64,          # PWL,PFWEL1,PTSFC,PTSFL
+        _P_F64,                                  # PEINTTI (2D)
+    ]
 
 def _configure_vevap(step) -> None:
     """argtypes for SURF_REF_VEVAP -- mirrors the .F90 dummy order."""
@@ -411,6 +429,7 @@ def _load_lib(path: Optional[str] = None) -> _LoadedLib:
     # SURF_REF_FARQUHAR degrades gracefully if the .so predates the P2.1
     # Farquhar photosynthesis reference entry (see tests/test_farquhar_ref.py).
     farquhar_fn = getattr(lib, "surf_ref_farquhar", None)
+    srfwl_fn = getattr(lib, "surf_ref_srfwl", None)
     _configure_vlamsk(vlamsk_fn)
     _configure_seb(seb_fn)
     _configure_vexcs(vexcs_fn)
@@ -430,11 +449,13 @@ def _load_lib(path: Optional[str] = None) -> _LoadedLib:
         _configure_soilw(soilw_fn)
     if farquhar_fn is not None:
         _configure_farquhar(farquhar_fn)
+    if srfwl_fn is not None:
+        _configure_srfwl(srfwl_fn)
     return _LoadedLib(
         lib=lib, vlamsk=vlamsk_fn, seb=seb_fn, vexcs=vexcs_fn,
         dqsdt=dqsdt_fn, stomata=stomata_fn, vevap=vevap_fn,
         vdfdifh=vdfdifh_fn, soilt=soilt_fn, snow=snow_fn, soilw=soilw_fn,
-        farquhar=farquhar_fn,
+        farquhar=farquhar_fn, srfwl=srfwl_fn,
     )
 
 
@@ -483,6 +504,10 @@ def _ptr_i32(arr: np.ndarray):
     return arr.ctypes.data_as(_P_I32)
 
 
+def _ptr_bool(arr: np.ndarray):
+    return arr.ctypes.data_as(_P_BOOL)
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -525,7 +550,7 @@ class SurfRef:
         lsicoup: bool = False,
         rhoice: float = RHO_ICE,
         rhoci: float = RHO_CI,
-        rqsmcr: float = RQSNCR_DEFAULT,
+        rqsmcr: Optional[float] = None,
         rurban_c: float = RURBTC_DEFAULT,
     ) -> torch.Tensor:
         """Run VLAMSK via the Fortran kernel; return PLAMSK (Ngrid, Ntile).
@@ -534,6 +559,9 @@ class SurfRef:
         so the test can feed identical tensors to both.  Returns a
         torch tensor with the same dtype/device as ``ptskm1m``.
         """
+        if rqsmcr is None:
+            rqsmcr = RQSNCR_SN09 if getattr(config, "lesn09", False) else RQSNCR_DEFAULT
+
         ngrid, ntile = ptskm1m.shape
         tskm1m = _as_fortran_2d(ptskm1m)
         tsrf = _as_fortran_2d(ptsrf)
@@ -1003,6 +1031,78 @@ class SurfRef:
             "pwetl": _t1(pwetl), "pweth": _t1(pweth), "pweths": _t1(pweths),
             "pwetb": _t1(pwetb), "pwetlu": _t1(pwetlu),
             "exdiag": _t1(pexdiag),
+        }
+
+    # ------------------------------------------------------------------ #
+    # SRFWL (skin-reservoir / canopy interception update)
+    # ------------------------------------------------------------------ #
+    def srfwl(
+        self,
+        *,
+        ptmst: float,
+        pwlm1m: torch.Tensor,
+        pcvl: torch.Tensor,
+        pcvh: torch.Tensor,
+        pwlmx: torch.Tensor,
+        pfrti: torch.Tensor,
+        pevapti: torch.Tensor,
+        prsfc: torch.Tensor,
+        prsfl: torch.Tensor,
+        pevapsnw: torch.Tensor,
+        ldland: torch.Tensor,
+        rpsfr: float = 2.0,
+        rvinter: float = 0.5,
+        lewbsoilfix: bool = True,
+    ) -> dict:
+        """Run standalone Fortran SRFWL for identical Torch inputs."""
+        if self._loaded.srfwl is None:
+            raise RuntimeError(
+                "SURF_REF_SRFWL not exported by this .so -- rebuild with "
+                "offline_driver/build_ref.sh after adding the srfwl entry."
+            )
+        ngrid, ntile = pfrti.shape
+        out_dtype = pwlm1m.dtype
+        out_device = pwlm1m.device
+
+        pwlm1m_a = _as_contig_1d(pwlm1m)
+        pcvl_a = _as_contig_1d(pcvl)
+        pcvh_a = _as_contig_1d(pcvh)
+        pwlmx_a = _as_contig_1d(pwlmx)
+        pfrti_a = _as_fortran_2d(pfrti)
+        pevapti_a = _as_fortran_2d(pevapti)
+        prsfc_a = _as_contig_1d(prsfc)
+        prsfl_a = _as_contig_1d(prsfl)
+        pevapsnw_a = _as_contig_1d(pevapsnw)
+        ldland_a = np.ascontiguousarray(
+            ldland.detach().to("cpu").numpy().astype(np.bool_), dtype=np.bool_
+        )
+
+        pwl = np.zeros(ngrid, dtype=np.float64)
+        pfwel1 = np.zeros(ngrid, dtype=np.float64)
+        ptsfc = np.zeros(ngrid, dtype=np.float64)
+        ptsfl = np.zeros(ngrid, dtype=np.float64)
+        peintti = np.zeros((ngrid, ntile), dtype=np.float64, order="F")
+
+        self._loaded.srfwl(
+            _I32(ngrid), _I32(ntile), _F64(float(ptmst)),
+            _ptr_f64(pwlm1m_a), _ptr_f64(pcvl_a), _ptr_f64(pcvh_a), _ptr_f64(pwlmx_a),
+            _ptr_f64(pfrti_a), _ptr_f64(pevapti_a),
+            _ptr_f64(prsfc_a), _ptr_f64(prsfl_a), _ptr_f64(pevapsnw_a),
+            _ptr_bool(ldland_a),
+            _F64(float(rpsfr)), _F64(float(rvinter)), _BOOL(bool(lewbsoilfix)),
+            _ptr_f64(pwl), _ptr_f64(pfwel1), _ptr_f64(ptsfc), _ptr_f64(ptsfl),
+            _ptr_f64(peintti),
+        )
+
+        def t1(arr):
+            return torch.from_numpy(arr.copy()).to(out_dtype).to(out_device)
+
+        return {
+            "pwl": t1(pwl),
+            "pfwel1": t1(pfwel1),
+            "ptsfc": t1(ptsfc),
+            "ptsfl": t1(ptsfl),
+            "peintti": torch.from_numpy(peintti.copy()).to(out_dtype).to(out_device),
         }
 
     # ------------------------------------------------------------------ #

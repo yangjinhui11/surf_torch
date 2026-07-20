@@ -78,6 +78,8 @@ as latent heat of vapourisation).
 
 from __future__ import annotations
 
+import csv
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -106,6 +108,8 @@ _RRCSICE = 1.884e6
 # used by SRFRCG in the sea-ice branch (ZGICE = 0.5*RGH2O).  Surf points
 # are zeroed regardless, but the constant is kept here for parity.
 _RGH2O = 4.18e6
+
+_SRFT_DEBUG_STEP = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +155,11 @@ class SoilTempInputs:
 
     # ---- Timestep ----
     ptmst: torch.Tensor              # PTMST    timestep            [s]     scalar
+
+    # SRFT uses tiled net longwave (PSLRFLTI).  Keep pslrfl above for
+    # legacy SRFTS-style callers and tests; when this field is present it
+    # takes precedence in the surface heat-flux assembly.
+    pslrflti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [W/m^2]
 
 
 @dataclass
@@ -268,17 +277,20 @@ def _soil_temperature_core(
     zsurfl = _surface_net_heat_flux(
         inp.pfrti, inp.pssrflti, inp.pslrfl,
         inp.pahfsti, inp.pevapti, inp.pgsn,
-        land, rlvtt, dtype, device,
+        land, rlvtt, dtype, device, inp.pslrflti,
     )
 
     # ------------------------------------------------------------------ #
-    # Step 3: SRFTS section 3 -- per-layer thermal conductivity ZDIF.
-    # Peters-Liddard / Kersten formula (vectorised over Nsoil).
+    # Step 3: SRFT section 3 -- per-layer thermal conductivity ZDIF.
+    # The offline namelist default uses LESOILCOND=.TRUE.; keep the old
+    # ZFF=0 path available for the standalone SURF_REF_SOILT test helper.
     # ------------------------------------------------------------------ #
     zdif = _thermal_conductivity(
-        inp.pwsam1m, wsat, lambdadry, lamsat1,
+        inp.pwsam1m, inp.ptsam1m, wsat, lambdadry, lamsat1,
         land, soil_table.consts,
+        rtf1, rtf2, rtf3, rtf4,
         nlevs, dtype, device,
+        lesoilcond=getattr(config, "lesoilcond", True),
     )
 
     # ------------------------------------------------------------------ #
@@ -318,6 +330,11 @@ def _soil_temperature_core(
     # ------------------------------------------------------------------ #
     ztsa = _solve_tridiag(inp.ptsam1m, zlst, zrhs, zcdz, land, rsimp)
 
+    _write_srft_debug(
+        inp.ptsam1m, zsurfl, inp.pgsn, zdif, zlst, zcdz, zrhs, ztsa,
+        inp.ptsam1m * (1.0 - 1.0 / rsimp) + ztsa,
+    )
+
     # ------------------------------------------------------------------ #
     # Step 6: SRFTS section 7 -- new temperatures.
     #   PTSA = PTSAM1M*ZCONS2 + ZTSA,  ZCONS2 = 1 - 1/RSIMP.
@@ -330,6 +347,73 @@ def _soil_temperature_core(
     )
 
     return SoilTempOutputs(ptsa=ptsa, pctsa=pctsa, zsurfl=zsurfl)
+
+
+def _write_srft_debug(
+    ptsam1m: torch.Tensor,
+    zsurfl: torch.Tensor,
+    pgsn: torch.Tensor,
+    zdif: torch.Tensor,
+    zlst: torch.Tensor,
+    zcdz: torch.Tensor,
+    zrhs: torch.Tensor,
+    ztsa: torch.Tensor,
+    ptsa_land: torch.Tensor,
+) -> None:
+    """Optional CSV diagnostic matching the Fortran SRFT debug columns."""
+    global _SRFT_DEBUG_STEP
+    path = os.environ.get("SURF_TORCH_SRFT_DEBUG_CSV")
+    if not path:
+        return
+
+    ngrid, nlevs = ptsam1m.shape
+    if nlevs != 4:
+        return
+
+    write_header = not os.path.exists(path)
+    rows = []
+    arrays = [
+        ptsam1m.detach().cpu(),
+        zsurfl.detach().cpu(),
+        pgsn.detach().cpu(),
+        zdif.detach().cpu(),
+        zlst.detach().cpu(),
+        zcdz.detach().cpu(),
+        zrhs.detach().cpu(),
+        ztsa.detach().cpu(),
+        ptsa_land.detach().cpu(),
+    ]
+    ptsam1m_c, zsurfl_c, pgsn_c, zdif_c, zlst_c, zcdz_c, zrhs_c, ztsa_c, ptsa_c = arrays
+    for jl in range(ngrid):
+        rows.append([
+            _SRFT_DEBUG_STEP, jl + 1,
+            *[float(ptsam1m_c[jl, k]) for k in range(4)],
+            float(zsurfl_c[jl]), float(pgsn_c[jl]),
+            *[float(zdif_c[jl, k]) for k in range(4)],
+            *[float(zlst_c[jl, k]) for k in range(4)],
+            *[float(zcdz_c[jl, k]) for k in range(4)],
+            *[float(zrhs_c[jl, k]) for k in range(4)],
+            *[float(ztsa_c[jl, k]) for k in range(4)],
+            *[float(ptsa_c[jl, k]) for k in range(4)],
+        ])
+
+    fieldnames = [
+        "step", "jl",
+        "ptsa_in1", "ptsa_in2", "ptsa_in3", "ptsa_in4",
+        "zsurfl", "pgsn",
+        "zdif1", "zdif2", "zdif3", "zdif4",
+        "zlst1", "zlst2", "zlst3", "zlst4",
+        "zcdz1", "zcdz2", "zcdz3", "zcdz4",
+        "zrhs1", "zrhs2", "zrhs3", "zrhs4",
+        "ztsa1", "ztsa2", "ztsa3", "ztsa4",
+        "ptsa1", "ptsa2", "ptsa3", "ptsa4",
+    ]
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(fieldnames)
+        writer.writerows(rows)
+    _SRFT_DEBUG_STEP += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +487,7 @@ def _surface_net_heat_flux(
     land: torch.Tensor,
     rlvtt: float,
     dtype: torch.dtype, device,
+    pslrflti: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SRFTS section 2 -- net surface heat flux ZSURFL (positive downward).
 
@@ -428,7 +513,15 @@ def _surface_net_heat_flux(
         + f6 * pssrflti[:, TILE_HIGH_VEG_DRY]
         + f8 * pssrflti[:, TILE_BARE_SOIL]
     )
-    zslrfl = (f3 + f4 + f6 + f8) * pslrfl
+    if pslrflti is None:
+        zslrfl = (f3 + f4 + f6 + f8) * pslrfl
+    else:
+        zslrfl = (
+            f3 * pslrflti[:, TILE_WET_SKIN]
+            + f4 * pslrflti[:, TILE_LOW_VEG_DRY]
+            + f6 * pslrflti[:, TILE_HIGH_VEG_DRY]
+            + f8 * pslrflti[:, TILE_BARE_SOIL]
+        )
     zthfl = (
         f3 * (pahfsti[:, TILE_WET_SKIN] + rlvtt * pevapti[:, TILE_WET_SKIN])
         + f4 * (pahfsti[:, TILE_LOW_VEG_DRY] + rlvtt * pevapti[:, TILE_LOW_VEG_DRY])
@@ -448,30 +541,40 @@ def _surface_net_heat_flux(
 
 def _thermal_conductivity(
     pwsam1m: torch.Tensor,
+    ptsam1m: torch.Tensor,
     wsat: torch.Tensor,        # (Ngrid,)
     lambdadry: torch.Tensor,   # (Ngrid,)
     lamsat1: torch.Tensor,     # (Ngrid,)
     land: torch.Tensor,
     soil_consts,               # SoilConstants dataclass
+    rtf1: float, rtf2: float, rtf3: float, rtf4: float,
     nlevs: int,
     dtype: torch.dtype, device,
+    *,
+    lesoilcond: bool = True,
 ) -> torch.Tensor:
-    """SRFTS section 3 -- per-layer soil thermal conductivity ZDIF.
+    """SRFT section 3 -- per-layer soil thermal conductivity ZDIF.
 
-    Peters-Liddard / Kersten formula (srfts_mod.F90 lines 223-247)::
+    Default path matches ``srft_mod.F90`` with ``LESOILCOND=.TRUE.`` and
+    the ``FSOILTCOND`` statement function from ``fcsurf.h``::
 
-        ZWU        = W * (1 - ZFF),    ZFF = 0
+        ZFF        = temperature-dependent frozen fraction
+        ZWU        = WSAT * (1 - ZFF)
         ZLWT       = RLAMBDAWAT ** ZWU
-        ZLIC       = RLAMBDAICE ** (WSAT - ZWU)
+        ZLIC       = RLAMBDAICE ** (WSAT * ZFF)
         ZLAMBDASAT = RLAMSAT1M * ZLIC * ZLWT
         ZCOND      = MAX(RKERST1, W / WSAT)
         ZKERSTEN   = RKERST2 * LOG10(ZCOND) + RKERST3
         ZDIF       = RLAMBDADRYM + ZKERSTEN * (ZLAMBDASAT - RLAMBDADRYM)
 
+    ``lesoilcond=False`` selects the standalone ``SURF_REF_SOILT`` helper
+    branch: ``ZFF=0`` and ``ZWU=W``.
+
     Vectorised over (Ngrid, Nsoil); per-class columns broadcast across
     the soil-axis.  Surf points stay zero (LDLAND=.F. branch).
     """
     w = pwsam1m
+    t = ptsam1m
     wsat_b = wsat[:, None].expand(-1, nlevs)
     lamsat1_b = lamsat1[:, None].expand(-1, nlevs)
     lambdadry_b = lambdadry[:, None].expand(-1, nlevs)
@@ -482,9 +585,21 @@ def _thermal_conductivity(
     rkerst2 = float(soil_consts.rkerst2)
     rkerst3 = float(soil_consts.rkerst3)
 
-    zwu = w * (1.0 - 0.0)                          # ZFF = 0
+    if lesoilcond:
+        zff_ramp = 0.5 * (1.0 - torch.sin(rtf4 * (t - rtf3)))
+        zff = torch.where(
+            t <= rtf2,
+            torch.ones_like(t),
+            torch.where(t < rtf1, zff_ramp, torch.zeros_like(t)),
+        )
+        zwu = wsat_b * (1.0 - zff)
+        zlic_exp = wsat_b * zff
+    else:
+        zwu = w
+        zlic_exp = wsat_b - zwu
+
     zlwt = rlambdawat ** zwu
-    zlic = rlambdace ** (wsat_b - zwu)
+    zlic = rlambdace ** zlic_exp
     zlambdasat = lamsat1_b * zlic * zlwt
 
     zcond = torch.clamp(w / wsat_b, min=rkerst1)   # MAX(RKERST1, W/WSAT)
@@ -843,6 +958,7 @@ def _soil_moisture_core(
     zrootw, zext = _root_extraction_weights(
         inp.pfrti, inp.pevapti, inp.pevapsnw, zliq, wpwp, zf,
         inp.ktvl, inp.ktvh, ksoty, veg_table, nlevs,
+        lewbsoilfix=getattr(soil_table.consts, "lewbsoilfix", True),
     )
 
     # ------------------------------------------------------------------ #
@@ -945,6 +1061,7 @@ def _root_extraction_weights(
     ksoty: torch.Tensor,
     veg_table,
     nlevs: int,
+    lewbsoilfix: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tile root extraction weights ZROOTW and normaliser ZEXT.
 
@@ -969,6 +1086,7 @@ def _root_extraction_weights(
     roots_hi = veg_table.gather_roots(ktvh.long().detach())
 
     wpwp_b = wpwp[:, None].expand(-1, nlevs)
+    zeps_add = 100.0 * torch.finfo(dtype).eps if lewbsoilfix else 0.0
 
     zrootw = torch.zeros((ngrid, nlevs, 3), dtype=dtype, device=device)
     zext = torch.zeros((ngrid, 3), dtype=dtype, device=device)
@@ -977,7 +1095,7 @@ def _root_extraction_weights(
     zevap4 = pfrti[:, 3] * pevapti[:, 3]
     dew4 = zevap4 > 0.0
     # Layer 1 = 1 for dew; else roots*(zliq - wpwp).
-    w4 = roots_lo * (zliq - wpwp_b)
+    w4 = roots_lo * (zliq - wpwp_b + zeps_add)
     zrootw[:, 0, 0] = torch.where(dew4, torch.ones_like(zrootw[:, 0, 0]), w4[:, 0])
     zrootw[:, 1:, 0] = torch.where(
         dew4[:, None].expand(-1, nlevs - 1),
@@ -989,7 +1107,7 @@ def _root_extraction_weights(
     # Tile 6 (high-veg-dry) -> uses KTVH roots.
     zevap6 = pfrti[:, 5] * pevapti[:, 5]
     dew6 = zevap6 > 0.0
-    w6 = roots_hi * (zliq - wpwp_b)
+    w6 = roots_hi * (zliq - wpwp_b + zeps_add)
     zrootw[:, 0, 1] = torch.where(dew6, torch.ones_like(zrootw[:, 0, 1]), w6[:, 0])
     zrootw[:, 1:, 1] = torch.where(
         dew6[:, None].expand(-1, nlevs - 1),
@@ -1001,7 +1119,7 @@ def _root_extraction_weights(
     # Tile 7 (high-veg-snow) -> uses KTVH roots; evap excludes PEVAPSNW.
     zevap7 = pfrti[:, 6] * (pevapti[:, 6] - pevapsnw)
     dew7 = zevap7 > 0.0
-    w7 = roots_hi * (zliq - wpwp_b)
+    w7 = roots_hi * (zliq - wpwp_b + zeps_add)
     zrootw[:, 0, 2] = torch.where(dew7, torch.ones_like(zrootw[:, 0, 2]), w7[:, 0])
     zrootw[:, 1:, 2] = torch.where(
         dew7[:, None].expand(-1, nlevs - 1),
@@ -1042,9 +1160,17 @@ def _vg_hydraulics(
     [m^2/s] at the given half-level moisture.
     """
     wfac = wsat - wrest
+
+    # Fortran evaluates the Van Genuchten closed form only in the middle
+    # branch.  torch.where evaluates both branches eagerly, so protect the
+    # fractional powers for floor/saturated columns with a valid placeholder.
+    floor = w <= 1.001 * wrest
+    sat = w >= 0.999 * wsat
+    mid = ~(floor | sat)
     se = (w - wrest) / wfac
+    se_safe = torch.where(mid, se, torch.full_like(se, 0.5))
     rmfac = 1.0 / mfac
-    se_rmfac = se ** rmfac
+    se_rmfac = se_safe ** rmfac
     # NOTE the bracketing matches the Fortran closed form exactly.
     # The K formula is
     #   ZKD = ZWCONS * ZSE**ZLAM * (1 - (1 - ZSE**ZRMFAC)**ZMFAC)**2
@@ -1059,16 +1185,13 @@ def _vg_hydraulics(
     d_summand = raw_pow ** mfac + raw_pow ** (-mfac) - 2.0
 
     # Mid-branch K and D (closed-form VG).
-    zk_mid = wconsm * (se ** lam) * (k_bracket ** 2)
+    zk_mid = wconsm * (se_safe ** lam) * (k_bracket ** 2)
     # D uses SIGN(MAX(ABS(x),eps),x) to protect against zero -- with the
     # default positive alpha/mfac/wfac this is just MAX(ABS(x),eps).
     denom = torch.clamp((mvgalpha * mfac * wfac).abs(), min=eps)
-    zd_mid = ((1.0 - mfac) * wconsm / denom) * (se ** (lam - rmfac)) * d_summand
+    zd_mid = ((1.0 - mfac) * wconsm / denom) * (se_safe ** (lam - rmfac)) * d_summand
 
     # Branch selection.
-    floor = w <= 1.001 * wrest
-    sat = w >= 0.999 * wsat
-    mid = ~(floor | sat)
 
     zk = torch.where(mid, zk_mid, torch.zeros_like(zk_mid))
     zk = torch.where(sat, wconsm, zk)                  # near-sat -> K = WCONS
@@ -1363,20 +1486,21 @@ def _vg_hydraulics_toponly(
     only K (ZKM is never used as a diffusivity).
     """
     wfac = wsat - wrest
+    floor = w <= wrest
+    sat = w >= 0.999 * wsat
+    mid = ~(floor | sat)
     se = (w - wrest) / wfac
+    se_safe = torch.where(mid, se, torch.full_like(se, 0.5))
     rmfac = 1.0 / mfac
-    se_rmfac = se ** rmfac
+    se_rmfac = se_safe ** rmfac
     raw_pow = 1.0 - se_rmfac
     # NOTE: same bracketing as :func:`_vg_hydraulics` -- the K closed form
     # is (1 - (1 - se^rm)^m)**2, NOT ((1 - se^rm)^m)**2.  See the lengthy
     # comment in _vg_hydraulics for the derivation.
     k_bracket = 1.0 - raw_pow ** mfac
 
-    zkm_mid = wconsm * (se ** lam) * (k_bracket ** 2)
+    zkm_mid = wconsm * (se_safe ** lam) * (k_bracket ** 2)
 
-    floor = w <= wrest
-    sat = w >= 0.999 * wsat
-    mid = ~(floor | sat)
     zkm = torch.where(mid, zkm_mid, torch.zeros_like(zkm_mid))
     zkm = torch.where(sat, wconsm, zkm)
     # Return (zkm, None) so the call site mirrors _vg_hydraulics.

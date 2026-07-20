@@ -91,12 +91,13 @@ from ..tables.veg import VegTable
 # --------------------------------------------------------------------------- #
 # Fortran tile indices used by SRFWL, mapped to the port tile enum.
 # Fortran PFRTI(JL,3) == port TILE_WET_SKIN (2); dew-collection tiles are
-# Fortran 4/6/7/8/10 == port 3/5/6/7/9.  Indices are guarded by ntile below.
+# Fortran 3/4/6/7/8/10 == port 2/3/5/6/7/9.  Indices are guarded by ntile below.
 # --------------------------------------------------------------------------- #
-# Dew-collection tile set (Fortran tiles 4, 6, 7, 8, 10).  Each entry is the
+# Dew-collection tile set (Fortran tiles 3, 4, 6, 7, 8, 10).  Each entry is the
 # (port_index, is_snow_under_high_veg) pair; only the snow-under-high-veg
 # tile excludes PEVAPSNW from its intercepted flux.
 _DEW_TILES = (
+    (TILE_WET_SKIN, False),        # F90 3 -> port 2
     (TILE_LOW_VEG_DRY, False),     # F90 4 -> port 3
     (TILE_HIGH_VEG_DRY, False),    # F90 6 -> port 5
     (TILE_HIGH_VEG_SNOW, True),    # F90 7 -> port 6 (snow-under-high-veg)
@@ -138,6 +139,7 @@ class CanopyInputs:
 
     # Land mask (bool).
     ldland: torch.Tensor            # LDLAND
+    lewbsoilfix: bool = True         # YDSOIL%LEWBSOILFIX
 
 
 @dataclass
@@ -216,13 +218,18 @@ def update_canopy(
     land = ldland.to(dtype=dtype)             # 1.0 on land, 0.0 on sea
 
     # ------------------------------------------------------------------ #
-    # 1. Initialise PEINTTI to zero and the reservoir to t-1 on land.
+    # 1. Initialise PEINTTI and apply the LEWBSOILFIX reservoir clamp.
     # ------------------------------------------------------------------ #
     peintti = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
-    # Sea points carry PWL = 0; land points start from PWLM1M (label 3
-    # initialisation -- LEWBSOILFIX is .FALSE. in the offline default, so
-    # PWL is reseeded from PWLM1M rather than the clamped value).
-    pwl = inp.pwlm1m * land
+    pwl_clamped = torch.minimum(inp.pwlmx - zeptiny, inp.pwlm1m)
+    pwl_clamped = torch.clamp(pwl_clamped, min=0.0) * land
+    if inp.lewbsoilfix:
+        pwl = pwl_clamped
+    else:
+        pwl = inp.pwlm1m * land
+    if ntile > TILE_WET_SKIN and inp.lewbsoilfix:
+        clamp_flux = (pwl_clamped - inp.pwlm1m) * ztmst
+        peintti[:, TILE_WET_SKIN] = clamp_flux * land
 
     # ------------------------------------------------------------------ #
     # 2. Evaporation of the skin reservoir (label 3, PEVAPTI(:,3) < 0).
@@ -246,6 +253,8 @@ def update_canopy(
         peintti[:, TILE_WET_SKIN] = peintti[:, TILE_WET_SKIN] + \
             torch.where(is_evap, realised_evap, torch.zeros_like(realised_evap))
 
+    dew_touched_reservoir = torch.zeros((ngrid,), dtype=torch.bool, device=device)
+
     # ------------------------------------------------------------------ #
     # 3. Dew collection (label 4): tiles 4/6/7/8/10 with ZELIQUID > 0
     #    deposit dew onto the reservoir up to PWLMX.
@@ -265,11 +274,12 @@ def update_canopy(
         # ZQHFLW = PTMST*ZELIQUID; PWL += min(PWLMX - ZEPTINY - PWL, ZQHFLW).
         zqhf = ptmst * zliquid
         zwl_dew = pwl
-        headroom = torch.clamp(inp.pwlmx - zeptiny - zwl_dew, min=0.0)
+        headroom = inp.pwlmx - zeptiny - zwl_dew
         inc = torch.minimum(headroom, zqhf)
         pwl = torch.where(is_dew, zwl_dew + inc, pwl)
         # Book the realised dew increment onto PEINTTI(:, tile).
         realised_dew = (pwl - zwl_dew) * ztmst
+        dew_touched_reservoir = dew_touched_reservoir | (is_dew & (pwl != zwl_dew))
         peintti[:, port_idx] = peintti[:, port_idx] + \
             torch.where(is_dew, realised_dew, torch.zeros_like(realised_dew))
 
@@ -287,7 +297,7 @@ def update_canopy(
     #                 1/RPSFR); PTSFC = PRSFC - ZMPRCP/PTMST.
     #    Sea points: throughfall = raw rainfall.
     # ------------------------------------------------------------------ #
-    headroom_l = torch.clamp(inp.pwlmx - zeptiny - pwl, min=0.0)
+    headroom_l = inp.pwlmx - zeptiny - pwl
 
     # Large-scale rain.
     zziprcp_l = inp.prsfl * (inp.pcvl + inp.pcvh) * rvinter
@@ -298,18 +308,20 @@ def update_canopy(
     # only fire where there is large-scale rain (has_ls); elsewhere the
     # reservoir is untouched and the throughfall is zero.
     zmprcp_l = torch.where(has_ls, zmprcp_l, torch.zeros_like(zmprcp_l))
+    pwl_before_ls = pwl
     pwl = pwl + zmprcp_l
     ptsfl_land = torch.where(has_ls, inp.prsfl - zmprcp_l * ztmst,
                              torch.zeros_like(inp.prsfl))
 
     # Convective rain (RPSFR-folded).  Recompute the headroom after the
     # large-scale interception has filled part of the reservoir.
-    headroom_c = torch.clamp(inp.pwlmx - zeptiny - pwl, min=0.0)
+    headroom_c = inp.pwlmx - zeptiny - pwl
     ztprcp_c = inp.prsfc * rpsfr
     zziprcp_c = ztprcp_c * (inp.pcvl + inp.pcvh) * rvinter
     zmprcp_c = torch.minimum(headroom_c, ptmst * zziprcp_c) * zpsfr
     has_cv = inp.prsfc > zepprcp
     zmprcp_c = torch.where(has_cv, zmprcp_c, torch.zeros_like(zmprcp_c))
+    pwl_before_cv = pwl
     pwl = pwl + zmprcp_c
     ptsfc_land = torch.where(has_cv, inp.prsfc - zmprcp_c * ztmst,
                              torch.zeros_like(inp.prsfc))

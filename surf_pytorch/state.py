@@ -91,6 +91,38 @@ class Forcing:
     vcurr: Optional[torch.Tensor] = None   # (Ngrid,) ocean current v [m/s]
     i10fgcv: Optional[torch.Tensor] = None  # (Ngrid,) convective gust [m/s]
 
+    # Optional lowest-level momentum fluxes from the atmospheric diffusion
+    # solve (SURFPP_CTL PSTRTULEV/PSTRTVLEV). When supplied, these are the
+    # authoritative PUSTRTI/PVSTRTI warm-start values for the next step.
+    u_stress: Optional[torch.Tensor] = None  # (Ngrid,) E-W surface stress [N/m2]
+    v_stress: Optional[torch.Tensor] = None  # (Ngrid,) N-S surface stress [N/m2]
+
+    # Optional lowest-level tendencies used by the offline driver when it
+    # receives both current and next atmospheric forcing records.
+    u_tendency: Optional[torch.Tensor] = None  # (Ngrid,) zonal wind tendency [m/s2]
+    v_tendency: Optional[torch.Tensor] = None  # (Ngrid,) meridional wind tendency [m/s2]
+    sl_tendency: Optional[torch.Tensor] = None  # (Ngrid,) dry static energy tendency [J/kg/s]
+    q_tendency: Optional[torch.Tensor] = None   # (Ngrid,) specific humidity tendency [kg/kg/s]
+
+    # Optional radiative-time skin temperature PTSKRAD. The offline driver
+    # carries this diagnostic across radiation and surface substeps.
+    radiative_skin_t: Optional[torch.Tensor] = None  # (Ngrid,) [K]
+
+    # Optional authoritative tiled VUPDZ0 boundary from an atmospheric
+    # diffusion driver.  These fields support strict offline comparison;
+    # absent values preserve the self-contained surface-layer path.
+    vupdz0_pustrti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [N/m2]
+    vupdz0_pvstrti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [N/m2]
+    vupdz0_pahfsti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [W/m2]
+    vupdz0_pevapti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [kg/m2/s]
+    vupdz0_z0mti: Optional[torch.Tensor] = None    # (Ngrid, Ntile) momentum roughness [m]
+    vupdz0_z0hti: Optional[torch.Tensor] = None    # (Ngrid, Ntile) heat roughness [m]
+    vupdz0_z0qti: Optional[torch.Tensor] = None    # (Ngrid, Ntile) moisture roughness [m]
+    vupdz0_pbuomti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [m2/s3]
+    vupdz0_pzdlti: Optional[torch.Tensor] = None   # (Ngrid, Ntile) [-]
+    vupdz0_praqti: Optional[torch.Tensor] = None   # (Ngrid, Ntile) [s/m]
+
+
     # Optional: atmospheric profiles for explicit diffusion above the
     # surface layer (VDFMAIN1S args PUM1/.../PAPHM1, full KLEV axis).
     # None by default -- the surface-only mode ignores these.
@@ -113,6 +145,19 @@ class Forcing:
             rain=_mv(self.rain), snow=_mv(self.snow), dt=_mv(self.dt),
             buom=_mv(self.buom), ucurr=_mv(self.ucurr), vcurr=_mv(self.vcurr),
             i10fgcv=_mv(self.i10fgcv),
+            u_stress=_mv(self.u_stress), v_stress=_mv(self.v_stress),
+            sl_tendency=_mv(self.sl_tendency), q_tendency=_mv(self.q_tendency),
+            radiative_skin_t=_mv(self.radiative_skin_t),
+            vupdz0_pustrti=_mv(self.vupdz0_pustrti),
+            vupdz0_pvstrti=_mv(self.vupdz0_pvstrti),
+            vupdz0_pahfsti=_mv(self.vupdz0_pahfsti),
+            vupdz0_pevapti=_mv(self.vupdz0_pevapti),
+            vupdz0_z0mti=_mv(self.vupdz0_z0mti),
+            vupdz0_z0hti=_mv(self.vupdz0_z0hti),
+            vupdz0_z0qti=_mv(self.vupdz0_z0qti),
+            vupdz0_pbuomti=_mv(self.vupdz0_pbuomti),
+            vupdz0_pzdlti=_mv(self.vupdz0_pzdlti),
+            vupdz0_praqti=_mv(self.vupdz0_praqti),
             u_profile=_mv(self.u_profile), v_profile=_mv(self.v_profile),
             t_profile=_mv(self.t_profile), q_profile=_mv(self.q_profile),
             p_profile=_mv(self.p_profile),
@@ -153,6 +198,7 @@ class Static:
     # Soil layer thicknesses (m), constant across columns but kept as
     # a tensor for convenience (broadcast to (Ngrid, Nsoil)).
     soil_thickness: torch.Tensor          # (Nsoil,) or (Ngrid, Nsoil)
+    orography_stddev: Optional[torch.Tensor] = None  # (Ngrid,) SDOR [m]
 
     # Albedo background (visible / near-IR, dry / wet skin) from
     # SURFBC.  Optional here -- surfaced by SURFRAD.
@@ -220,6 +266,7 @@ class Static:
             tile_frac_base=_mv(self.tile_frac_base),
             land_frac=_mv(self.land_frac),
             orography=_mv(self.orography),
+            orography_stddev=_mv(self.orography_stddev),
             soil_type=_mv(self.soil_type),
             veg_type=_mv(self.veg_type),
             soil_thickness=_mv(self.soil_thickness),
@@ -293,8 +340,24 @@ class SurfState:
     snow_alb: Optional[torch.Tensor] = None      # (Ngrid,) PASNM1M [-]
     ice_t: Optional[torch.Tensor] = None         # (Ngrid, Nice_layers)
 
+    # Gridpoint skin temperature at the latest radiation timestep
+    # (PTSKRAD/PTL).  This cannot in general be reconstructed from skin_t
+    # after snow cover changes, because the radiation step used the tile
+    # fractions from before that prognostic update.
+    radiative_skin_t: Optional[torch.Tensor] = None  # (Ngrid,) [K]
+
     # FLake lake state -- delayed to a stub.
     lake_t: Optional[torch.Tensor] = None        # (Ngrid,)
+
+    # VUPDZ0 requires the previous SURFPP fluxes.  They are integration
+    # metadata, not physical prognostics, but belong to the trajectory
+    # state so independent calls cannot inherit another rollout's history.
+    vupdz0_step: int = 0
+    vupdz0_pustrti: Optional[torch.Tensor] = None
+    vupdz0_pvstrti: Optional[torch.Tensor] = None
+    vupdz0_pahfsti: Optional[torch.Tensor] = None
+    vupdz0_pevapti: Optional[torch.Tensor] = None
+    vupdz0_pzdl: Optional[torch.Tensor] = None
 
     def to(self, *, dtype=None, device=None) -> "SurfState":
         def _mv(x):
@@ -310,7 +373,14 @@ class SurfState:
             sst=_mv(self.sst), snow_t=_mv(self.snow_t),
             snow_rho=_mv(self.snow_rho), snow_alb=_mv(self.snow_alb),
             ice_t=_mv(self.ice_t),
+            radiative_skin_t=_mv(self.radiative_skin_t),
             lake_t=_mv(self.lake_t),
+            vupdz0_step=self.vupdz0_step,
+            vupdz0_pustrti=_mv(self.vupdz0_pustrti),
+            vupdz0_pvstrti=_mv(self.vupdz0_pvstrti),
+            vupdz0_pahfsti=_mv(self.vupdz0_pahfsti),
+            vupdz0_pevapti=_mv(self.vupdz0_pevapti),
+            vupdz0_pzdl=_mv(self.vupdz0_pzdl),
         )
 
     def like(self, **kwargs) -> "SurfState":

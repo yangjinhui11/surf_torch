@@ -157,6 +157,17 @@ class TestCanopyBranches:
         #     = min(0.05, 1.62) = 0.05 -> saturates.
         torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=1e-9, atol=1e-12)
 
+    def test_wet_skin_dew_is_collected(self, veg_table):
+        """SRFWL includes Fortran tile 3 in the dew-collection loop."""
+        inp = _make_inputs(pwlm1m=0.01, pevap_wet_kg_m2s=1e-4, pwlmx=0.2)
+        out = update_canopy(inp, veg_table)
+        expected = 0.01 + 3600.0 * 0.05 * 1e-4
+        torch.testing.assert_close(out.pwl, torch.full_like(out.pwl, expected),
+                                   rtol=0, atol=1e-12)
+        torch.testing.assert_close(out.peintti[:, TILE_WET_SKIN],
+                                   torch.full_like(out.pwl, 0.05 * 1e-4),
+                                   rtol=0, atol=1e-12)
+
     def test_precip_interception_saturates_reservoir(self, veg_table):
         # Heavy rain intercepts until the reservoir saturates; the rest
         # is throughfall.
@@ -381,6 +392,32 @@ class TestCanopyVectorisation:
         assert out.ptsfl[0] > 0
         torch.testing.assert_close(out.ptsfl[1], torch.zeros((), dtype=torch.float64),
                                    rtol=0, atol=1e-12)
+
+    def test_preserves_subthreshold_reservoir_water(self, veg_table):
+        # SURFPP uses exact tile fractions.  A tiny nonzero PWL must remain
+        # visible to the next step instead of being rounded to dry.
+        pwl = 2.8603484164557713e-11
+        inp = _make_inputs(pwlm1m=pwl, prsfl_kg_m2s=0.0)
+        out = update_canopy(inp, veg_table)
+
+        torch.testing.assert_close(
+            out.pwl, torch.full_like(out.pwl, pwl), rtol=0, atol=0
+        )
+
+    def test_dew_then_precip_fill_can_reach_exact_capacity(self, veg_table):
+        # The canopy update should fill exactly to PWLMX once dew and
+        # precipitation have both contributed enough water.
+        inp = _make_inputs(
+            N=1, pwlm1m=0.01, pwlmx=0.2972, prsfl_kg_m2s=2.0e-4,
+            pevap_low_kg_m2s=4.0e-8, pevap_high_kg_m2s=5.0e-8,
+        )
+        out = update_canopy(inp, veg_table)
+        torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=0, atol=0)
+
+    def test_precip_fill_without_dew_can_reach_exact_capacity(self, veg_table):
+        inp = _make_inputs(N=1, pwlm1m=0.01, pwlmx=0.2972, prsfl_kg_m2s=2.0e-4)
+        out = update_canopy(inp, veg_table)
+        torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=0, atol=0)
 
 
 # --------------------------------------------------------------------------- #

@@ -166,7 +166,7 @@ class TestFallbackEquivalence:
 # Snow-albedo tile mapping
 # --------------------------------------------------------------------------- #
 class TestSnowTileMapping:
-    """snow_alb set -> tiles 4 (low snow) & 6 (high snow) take PASN."""
+    """snow_alb set -> low-snow uses PASN; high-snow uses forest table."""
 
     def test_snow_albedo_on_snow_tiles(self):
         m = _model()
@@ -175,7 +175,8 @@ class TestSnowTileMapping:
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
         assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == 0.70)
-        assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == 0.70)
+        expected_high = m._snow_forest_albedo(static, torch.float64, torch.device("cpu"))
+        assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == expected_high)
         # Non-snow tiles stay 0 (no background supplied).
         assert torch.all(alpha[:, TILE_WATER] == 0.0)
         assert torch.all(alpha[:, TILE_ICE] == 0.0)
@@ -247,7 +248,7 @@ class TestBackgroundMapping:
 # Combined snow + background
 # --------------------------------------------------------------------------- #
 class TestCombinedMapping:
-    """Both snow_alb and albd/albw set -> snow tiles take PASN, rest take bg."""
+    """Both snow_alb and albd/albw set -> snow tiles override background."""
 
     def test_snow_overrides_background_on_snow_tiles(self):
         m = _model()
@@ -255,9 +256,10 @@ class TestCombinedMapping:
         static = _make_static(albd=0.20, albw=0.10)
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        # Snow tiles take PASN, not albd.
+        # Low-snow takes PASN; high-snow takes Fortran forest-snow albedo.
         assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == 0.75)
-        assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == 0.75)
+        expected_high = m._snow_forest_albedo(static, torch.float64, torch.device("cpu"))
+        assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == expected_high)
         # Dry / bare / wet tiles take background.
         assert torch.all(alpha[:, TILE_WET_SKIN] == 0.10)
         assert torch.all(alpha[:, TILE_LOW_VEG_DRY] == 0.20)
@@ -335,13 +337,16 @@ class TestSebFeedback:
         """Dormant (snow_alb=None) must equal an explicit alpha=0 run."""
         m = _model()
         base = _make_state(snow_frac=0.3, snow_t=270.0)
-        static = _make_static_tile_frac(low_snow=0.3, high_snow=0.1)
+        static = _make_static_tile_frac(low_dry=0.7, high_dry=0.0, bare=0.2, wet=0.1)
         forcing = _make_forcing(fr_so=300.0)
         # Dormant (None) vs explicit snow_alb=0 (activated, alpha=0).
         ns_dormant, _ = m(base, forcing, static)
         active = _make_state(snow_alb=0.0, snow_frac=0.3, snow_t=270.0)
         ns_active, _ = m(active, forcing, static)
-        assert torch.allclose(ns_dormant.skin_t, ns_active.skin_t, atol=1e-12)
+        frac = m._tile_frac(static, 8, state=base)
+        dormant_mean = (ns_dormant.skin_t * frac).sum(dim=1)
+        active_mean = (ns_active.skin_t * frac).sum(dim=1)
+        assert torch.allclose(dormant_mean, active_mean, atol=1e-12)
 
 
 # --------------------------------------------------------------------------- #

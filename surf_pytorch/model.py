@@ -61,16 +61,16 @@ Still stubbed (drop-in placeholders, gated behind SurfConfig flags):
   the real ``OCEAN_ML_DRIVER`` body is a future drop-in via
   :meth:`_update_ocean_ml`.
 * Farquhar photosynthesis (:mod:`surf_pytorch.physics.farquhar`) --
-  full Farquhar + Ball-Berry conductance port.  When
-  ``use_farquhar=True`` the moisture-flux closure is driven by the
-  Farquhar canopy conductance (``PGSTOT -> 1/max(RCONDCTMIN, PGSTOT)``)
-  instead of the Jarvis multiplicative stress model, mirroring the
-  upstream ``LEFARQUHAR`` branch (``cotworestress_mod.F90`` 412-431).
+  full Farquhar + Ball-Berry conductance port.  ``use_farquhar=True``
+  computes the carbon diagnostics (LEFARQUHAR); ``use_ags=True`` also
+  feeds its canopy conductance into VEVAP (LEAGS).  The two switches are
+  independent in the upstream configuration.
 """
 
 from __future__ import annotations
 
 from typing import Optional, Tuple
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -88,11 +88,14 @@ from .tables import SoilTable, VegTable, RootTable, RitblTable
 from .utils import qsat, dqsat_dt_ifs, expand_as_tiles, scatter_to_tiles
 from .physics.seb import SebInputs, SebOutputs, surf_seb  # noqa: F401  (re-exported for tests / downstream consumers)
 from .physics.vlamsk import vlamsk as compute_vlamsk
-from .physics.exchange import vexcs as compute_vexcs, ExchangeOutputs
+from .physics.exchange import (
+    vexcs as compute_vexcs, vexcss as compute_vexcss, ExchangeOutputs, RKAP, RPARZI, REPDU2, psihu, psihs,
+)
 from .physics.diffusion import (
     DiffusionInputs, DiffusionOutputs, vdfdifh1s as compute_vdfdifh1s,
     RVDIFTS,
 )
+from .physics.offline_vdf import vdfdifm1s_surface_stress
 from .physics.stomata import (
     jarvis_resistance as compute_jarvis_resistance,
     build_tile_alpha as compute_tile_alpha,
@@ -200,6 +203,23 @@ class LandSurface(nn.Module):
             device=self.config.device,
         )
 
+        # Stateful SURFEXCDRIVER warm-start fields. OpenIFS threads the
+        # previous tiled stress and turbulent fluxes through VUPDZ0 before
+        # each VEXCS call. They are initialised lazily so one-off kernel
+        # tests that call helper methods directly keep their cold-start path.
+        self._surf_step_count = 0
+        self._last_pustrti = None
+        self._last_pvstrti = None
+        self._last_pahfsti = None
+        self._last_pevapti = None
+        self._last_pzdl = None
+        self._last_pcfm_tile = None
+        self._last_pcfh_tile = None
+        self._last_pcfq_tile = None
+        self._last_vup_pzdl0 = None
+        self._last_vup_pbuom0 = None
+        self._last_vup_praqti = None
+
         # Physics sub-modules are added in M3-M6.  The SEB step is a
         # pure function (no learnable parameters), so we don't wrap it
         # in an nn.Module -- it's called directly from forward().
@@ -270,7 +290,7 @@ class LandSurface(nn.Module):
         * :meth:`_snow_density` -- t-1 reader (PRSNM1M): prefers the
           prognostic ``state.snow_rho``, else the 300 kg/m^3 fresh-snow
           cold-start.  The *evolved* density is produced by
-          :meth:`_update_snow_density` (``SRFSN_LWIMP`` section 3.1),
+        :meth:`_update_snow_density` (``SRFSN_LWIMP`` section 3.1),
           now wired into forward() and written back to
           ``new_state.snow_rho``.
         * :meth:`_dominant_veg_types` -- returns the low / high veg-type
@@ -291,12 +311,11 @@ class LandSurface(nn.Module):
         * Moisture-flux closure via the faithful VEVAP transcription
           (PCSAT -> alphas, PCAIR -> alphal).  Two canopy-resistance
           sources are supported (both feed the same downstream VEVAP
-          chain): the Jarvis multiplicative stress model (default,
-          ``use_farquhar=False``) or the Farquhar photosynthesis /
-          Ball-Berry conductance model (``use_farquhar=True``, mirror of
-          the upstream ``LEFARQUHAR`` branch in
-          ``cotworestress_mod.F90`` 412-431).  Bare soil / urban
-          resistance always uses the Jarvis formula even under Farquhar
+          chain): Jarvis by default, or Farquhar / Ball-Berry when both
+          ``use_farquhar`` (LEFARQUHAR) and ``use_ags`` (LEAGS) are true.
+          This preserves the OpenIFS case LEFARQUHAR=.TRUE., LEAGS=.FALSE.,
+          where carbon diagnostics are computed but Jarvis still controls
+          PWET*. Bare soil / urban resistance always uses the Jarvis formula
           (``vsurf_mod.F90:687``).
 
         Returns
@@ -306,10 +325,39 @@ class LandSurface(nn.Module):
             untouched) suitable for chaining into the next step.
             ``diagnostics`` holds the fluxes and 2 m / 10 m fields.
         """
+        # VUPDZ0 carries preceding SURFPP fluxes along one integration
+        # trajectory.  Load them from the input state so a module instance
+        # can safely serve independent columns and state.like() feedback.
+        self._surf_step_count = state.vupdz0_step
+        self._last_pustrti = state.vupdz0_pustrti
+        self._last_pvstrti = state.vupdz0_pvstrti
+        self._last_pahfsti = state.vupdz0_pahfsti
+        self._last_pevapti = state.vupdz0_pevapti
+        self._last_pzdl = state.vupdz0_pzdl
+        # In strict offline validation, the atmospheric diffusion driver can
+        # provide the complete VUPDZ0 tile boundary for this surface step.
+        # These values are authoritative over the trajectory cache.
+        for forcing_name, cache_name in (
+            ("vupdz0_pustrti", "_last_pustrti"),
+            ("vupdz0_pvstrti", "_last_pvstrti"),
+            ("vupdz0_pahfsti", "_last_pahfsti"),
+            ("vupdz0_pevapti", "_last_pevapti"),
+        ):
+            value = getattr(forcing, forcing_name)
+            if value is not None:
+                setattr(self, cache_name, value)
         ntile = self.config.n_tile
         ngrid = state.skin_t.shape[0]
         dtype = self.config.dtype
         device = state.skin_t.device
+
+        if self.config.snow_temperature_floor is not None and state.snow_t is not None:
+            snow_t_floor = torch.as_tensor(
+                self.config.snow_temperature_floor, dtype=dtype, device=device,
+            )
+            state = state.like(
+                snow_t=torch.clamp(state.snow_t, min=snow_t_floor, max=self.consts.rtt)
+            )
 
         # ------------------------------------------------------------------ #
         # 1. Lowest-model-level quantities.
@@ -331,7 +379,7 @@ class LandSurface(nn.Module):
         # is the upstream PDQS form (see utils.dqsat_dt_ifs) -- NOT the
         # exact derivative -- so the SEB skin-T Jacobian matches the
         # Fortran driver to last-ULP.
-        skin_t_prev = state.skin_t                 # (Ngrid, Ntile)
+        skin_t_prev = state.skin_t
         p_surf_t = expand_as_tiles(forcing.p_surf, ntile)
         salinity = self._tile_salinity(ntile, dtype, device)
         qskm1m = qsat(skin_t_prev, p_surf_t, self.consts, salinity=salinity)
@@ -345,7 +393,9 @@ class LandSurface(nn.Module):
         #    to the neutral-Cd placeholder so existing tests that do not
         #    populate z0 keep working.
         # ------------------------------------------------------------------ #
-        rhoc_u, rhoc_q = self._exchange_coeffs(forcing, static, state)
+        rhoc_u, rhoc_q = self._exchange_coeffs(
+            forcing, static, state, skin_t=skin_t_prev
+        )
         if self.config.per_tile_exchange:
             # _exchange_coeffs already returns per-tile (Ngrid, ntile).
             rhoc_u_t, rhoc_q_t = rhoc_u, rhoc_q
@@ -368,33 +418,71 @@ class LandSurface(nn.Module):
             ktvl=ktvl, ktvh=ktvh,
             veg_table=self.veg_table, consts=self.consts, config=self.config,
             ptstep=ptstep,
+            lesn09=self.config.lesn09,
         )
 
         # ------------------------------------------------------------------ #
         # 5. Radiation -- convert cumulative fluxes (J/m^2) to mean W/m^2.
         # ------------------------------------------------------------------ #
         dt = forcing.dt
-        ssrfl_grid = forcing.fr_so / dt
+        srfd_grid = forcing.fr_so / dt
         slrfl_grid = forcing.fr_th / dt
-        ssrfl_t = expand_as_tiles(ssrfl_grid, ntile)
         # Surface albedo -- per-tile broadband alpha (dimensionless).
         # Returns all-zeros when neither the snow-albedo prognostic nor the
         # background albedo fields are set, so the absorbed SW is then
         # ``ssrfl_t`` unchanged (bit-identical to the build before the
-        # albedo work).  Uses the t-1 PASN (step-start field), consistent
+        # albedo work). Uses the t-1 PASN (step-start field), consistent
         # with the t-1 skin T used for radiation above; the freshly-evolved
         # PASN is written to new_state.snow_alb in section 7 for next step.
         alpha_t = self._surface_albedo(state, static, forcing, ntile, dtype, device)
-        ssrfl_t = ssrfl_t * (1.0 - alpha_t)
 
-        # Tiled skin T at radiation time -- cold-start uses the t-1 tile
-        # fractions-weighted mean.
+        # OpenIFS SURF redistributes the grid-box net solar flux to tiles
+        # according to tile albedo, then limits excessive tile net SW and
+        # renormalises the capped tiled fluxes back to the grid-box value.
+        # This mirrors SURFEXCDRIVER_CTL's PSSRFLTI construction.
         frac = self._tile_frac(static, ntile, state=state)
-        tskrad_grid = scatter_to_tiles(state.skin_t, frac)
+        grid_albedo = (frac * alpha_t).sum(dim=1)
+        ssrfl_grid = srfd_grid * (1.0 - grid_albedo)
+        one_minus_grid_albedo = 1.0 - grid_albedo
+        ssrfl_raw = (
+            ((1.0 - alpha_t) / one_minus_grid_albedo.unsqueeze(1))
+            * ssrfl_grid.unsqueeze(1)
+        )
+        ssrfl_capped = torch.minimum(
+            ssrfl_raw,
+            torch.as_tensor(700.0, dtype=dtype, device=device),
+        )
+        high_ssr = (ssrfl_raw > 700.0).any(dim=1)
+        ssrfl_sum = (frac * ssrfl_capped).sum(dim=1)
+        ssrfl_rescaled = ssrfl_capped * (
+            ssrfl_grid / ssrfl_sum
+        ).unsqueeze(1)
+        ssrfl_t = torch.where(high_ssr.unsqueeze(1), ssrfl_rescaled, ssrfl_capped)
 
-        # Emissivity -- fall back to 0.99 (offline-driver default).
-        emis_grid = static.emis if static.emis is not None else \
-            torch.full((ngrid,), 0.99, dtype=dtype, device=device)
+        # Gridpoint skin T at radiation time (PTSKRAD).  It is an explicit
+        # carried state: after snow/skin-water prognostics change PFRTI, a
+        # re-average of PTSKTI with the *new* fractions does not reproduce
+        # the PTL used by the previous radiation call.  External forcing
+        # remains authoritative for coupled callers.
+        tskrad_grid = (
+            forcing.radiative_skin_t.to(dtype=dtype, device=device)
+            if forcing.radiative_skin_t is not None
+            else (
+                state.radiative_skin_t.to(dtype=dtype, device=device)
+                if state.radiative_skin_t is not None
+                else scatter_to_tiles(state.skin_t, frac)
+            )
+        )
+
+        # Use the provided static emissivity when available; the strict
+        # reference-assembly tests supply the Fortran value directly.
+        # Fall back to the diagnostic surface-emissivity reconstruction only
+        # when no explicit emissivity was provided.
+        emis_grid = (
+            static.emis.to(dtype=dtype, device=device)
+            if static.emis is not None
+            else self._surface_emissivity(state, static, frac, dtype, device)
+        )
 
         # ------------------------------------------------------------------ #
         # 6. Build DiffusionInputs and run the VDFDIFH1S wrapper (M4.2).
@@ -412,19 +500,12 @@ class LandSurface(nn.Module):
         # vegetated dry tiles but differ for the wet-skin (interception
         # clamp) and snow-under-high-veg (ZRAS) branches.
         #
-        # When use_farquhar is True we keep the unit-alpha placeholder
-        # (Farquhar photosynthesis lands in a later milestone); otherwise
-        # the Jarvis stomatal-resistance chain (vsurf §2.3) feeds the
-        # faithful VEVAP transcription (vsurf/vevap), which fixes the
-        # rho-convention bug that the old build_tile_alpha carried
-        # (an extra 1/rho in the alpha denominator).
+        # Jarvis controls VEVAP unless both LEFARQUHAR and LEAGS are active.
+        # LEFARQUHAR alone still evaluates carbon diagnostics but, exactly as
+        # in vsurf_mod.F90:694-717, does not overwrite PWETL/PWETH/PWETHS.
         #
-        # Both moisture-flux closures (Jarvis and Farquhar) share the
-        # downstream VEVAP chain: the only difference is the *source* of
-        # the canopy resistance PWET* for tiles 4/6/7.  Jarvis computes
-        # PWETL/PWETH/PWETHS from the multiplicative stress model; Farquhar
-        # derives them from the Farquhar photosynthesis conductance
-        # (PGSTOT -> 1/max(RCONDCTMIN, PGSTOT); cotworestress_mod.F90:427).
+        # Both moisture-flux closures share the downstream VEVAP chain. The
+        # only difference is the canopy-resistance source for tiles 4/6/7.
         # Bare soil (PWETB) always uses the Jarvis formula even under
         # LEFARQUHAR (vsurf_mod.F90:687 -- COTWORESTRESS only computes the
         # vegetation canopy conductance), so the Jarvis chain runs in both
@@ -436,18 +517,20 @@ class LandSurface(nn.Module):
             soil_type=static.soil_type,
             ktvl=ktvl, ktvh=ktvh,
             t_air=forcing.t, q_air=forcing.q, p_surf=forcing.p_surf,
-            sw_down=ssrfl_grid,
+            sw_down=srfd_grid,
             veg_table=self.veg_table,
             soil_table=self.soil_table,
             root_table=self.root_table,
             consts=self.consts,
             tile_frac=frac, n_tile=ntile,
+            lai_low=static.lai_low,
+            lai_high=static.lai_high,
         )
         if self.config.use_farquhar:
             # LEFARQUHAR branch (cotworestress_mod.F90:412-431): the
             # Farquhar canopy conductance replaces Jarvis PWETL/PWETH/
             # PWETHS for the vegetated tiles; PWETB is preserved.
-            resist = compute_farquhar_resistance(
+            farquhar_resist = compute_farquhar_resistance(
                 forcing=forcing, skin_t_prev=skin_t_prev, qskm1m=qskm1m,
                 ssrfl_grid=ssrfl_grid, ktvl=ktvl, ktvh=ktvh,
                 jarvis=jarvis, veg_table=self.veg_table, consts=self.consts,
@@ -461,11 +544,14 @@ class LandSurface(nn.Module):
             # it does not feed back on the prognostic state in the current
             # single-step forward.
             _farquhar_diag = {
-                "farquhar_pgstot": resist["farquhar_pgstot"],
-                "farquhar_pgpp":   resist["farquhar_pgpp"],
-                "farquhar_prd":    resist["farquhar_prd"],
-                "farquhar_pan":    resist["farquhar_pan"],
+                "farquhar_pgstot": farquhar_resist["farquhar_pgstot"],
+                "farquhar_pgpp":   farquhar_resist["farquhar_pgpp"],
+                "farquhar_prd":    farquhar_resist["farquhar_prd"],
+                "farquhar_pan":    farquhar_resist["farquhar_pan"],
             }
+            # LEAGS is the independent OpenIFS switch that transfers ZWET
+            # from COTWORESTRESS into the VEVAP PWET* arrays.
+            resist = farquhar_resist if self.config.use_ags else jarvis
         else:
             resist = jarvis
             _farquhar_diag = None
@@ -479,9 +565,9 @@ class LandSurface(nn.Module):
         # only fires when ZEP<0, so a coarse WLMX has negligible effect
         # on the SEB alphas outside that regime.
         wlmx_grid = self._interception_capacity(static, frac, ktvl, ktvh)
-        # t_sub for the KTILE=7 snow-under-canopy stability selector:
-        # the top soil-layer temperature, broadcast per grid.
-        t_sub_grid = tsrf[:, 0]
+        # t_sub for VEVAP: SURFEXCDRIVER passes the per-tile ZTSA
+        # (snow tiles get PTSN, snow-free land gets top-soil T).
+        t_sub_grid = tsrf
         vegc = self.veg_table.consts
         vevap_out = compute_tile_vevap(
             pwetl=resist["pwetl"], pweth=resist["pweth"],
@@ -501,6 +587,16 @@ class LandSurface(nn.Module):
         # feed downstream canopy / M5 updates, not the SEB closure.
         alphas = vevap_out["pcsat"]
         alphal = vevap_out["pcair"]
+        pevapsnw = self._snow_under_forest_evap(
+            forcing=forcing,
+            state=state,
+            rhoc_q_t=rhoc_q_t,
+            pcsnw=vevap_out["pcsnw"],
+            frac=frac,
+            ntile=ntile,
+            dtype=dtype,
+            device=device,
+        )
 
         # Pack into DiffusionInputs and dispatch through the VDFDIFH1S
         # wrapper.  This routes the per-tile PTSRF build, the exchange-
@@ -518,9 +614,19 @@ class LandSurface(nn.Module):
             ssrfl_t=ssrfl_t, slrfl_grid=slrfl_grid,
             tskrad_grid=tskrad_grid, emis_grid=emis_grid,
             plamsk=plamsk, tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
+            pevapsnw=pevapsnw,
             dt=dt, ntile=ntile, ngrid=ngrid, dtype=dtype, device=device,
         )
         out = compute_vdfdifh1s(diff_inp, self.consts, self.config)
+
+        # SURFPP_CTL post-processes zero-area tile PAHFSTI/PEVAPTI before the
+        # land-surface routines consume them. Keep `out` as the raw SEB
+        # diagnostic so per-tile energy closure remains inspectable.
+        surfpp_pssh, surfpp_pjq = self._surfpp_zero_tile_fluxes(out.pssh, out.pjq, frac)
+        surfpp_skin_t = self._surfpp_zero_tile_skin_t(out.ptsktip1, frac)
+        land_flux_out = replace(out, pssh=surfpp_pssh, pjq=surfpp_pjq)
+        self._last_pahfsti = land_flux_out.pssh.detach().clone()
+        self._last_pevapti = land_flux_out.pjq.detach().clone()
 
         # ------------------------------------------------------------------ #
         # 6. Skin-reservoir / canopy interception update (M6, SRFWL).
@@ -539,9 +645,10 @@ class LandSurface(nn.Module):
         # (snow-under-forest evaporation) is zero on the cold start -- the
         # single-layer snow scheme does not thread it back yet.
         canopy_out = self._update_canopy(
-            state=state, static=static, diff_out=out, frac=frac,
+            state=state, static=static, diff_out=land_flux_out, frac=frac,
             wlmx_grid=wlmx_grid, ktvl=ktvl, ktvh=ktvh,
             forcing=forcing, dt=dt,
+            pevapsnw=pevapsnw,
             ngrid=ngrid, dtype=dtype, device=device,
         )
 
@@ -564,14 +671,28 @@ class LandSurface(nn.Module):
         # large-scale, so all snow is treated as large-scale, matching the
         # same convention used for rainfall in _update_soil_moisture).
         snow_out = self._update_snow(
-            state=state, static=static, diff_out=out,
-            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pfrti=frac,
+            state=state, static=static, diff_out=land_flux_out,
+            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=out.pstr, pfrti=frac,
             forcing=forcing,
+            pevapsnw=pevapsnw,
+            ptsfc=canopy_out.ptsfc, ptsfl=canopy_out.ptsfl,
             dt=dt, ngrid=ngrid, dtype=dtype, device=device,
         )
+        if self.config.snow_temperature_floor is not None:
+            snow_t_floor = torch.as_tensor(
+                self.config.snow_temperature_floor, dtype=dtype, device=device,
+            )
+            snow_out = replace(
+                snow_out,
+                ptsn=torch.clamp(snow_out.ptsn, min=snow_t_floor, max=self.consts.rtt),
+            )
+            snow_out = replace(
+                snow_out,
+                psstar=torch.clamp(snow_out.psstar, min=0.0),
+            )
         # Advance the snow density (PRSN <- SRFSN_LWIMP section 3.1).
         new_snow_rho = self._update_snow_density(
-            state=state, snow_out=snow_out, forcing=forcing,
+            state=state, snow_out=snow_out, forcing=forcing, frac=frac,
             dt=dt, dtype=dtype, device=device,
         )
         # Advance the snow albedo (PASN <- SRFSN lines 340-361).  Returns
@@ -582,6 +703,12 @@ class LandSurface(nn.Module):
             state=state, static=static, snow_out=snow_out, forcing=forcing,
             dt=dt, dtype=dtype, device=device,
         )
+        snow_rho_safe = torch.clamp(new_snow_rho, min=torch.finfo(dtype).tiny)
+        if self.config.lesn09:
+            snow_frac_raw = 100.0 * snow_out.psstar / snow_rho_safe * 0.1
+        else:
+            snow_frac_raw = snow_out.psstar * self.soil_table.consts.rqsmcr
+        new_snow_frac = torch.clamp(snow_frac_raw, 0.0, 1.0)
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
@@ -594,7 +721,7 @@ class LandSurface(nn.Module):
         # pjq, net SW/LW from the radiation terms).  The snow-bottom heat
         # flux PGSN flows from the SRFSN_LWIMPS solve above.
         new_soil_t = self._update_soil_temperature(
-            state=state, static=static, diff_out=out,
+            state=state, static=static, diff_out=land_flux_out,
             pssrflti=ssrfl_t, pslrfl=slrfl_grid, pfrti=frac,
             pgsn=snow_out.pgsn,
             dt=dt, ngrid=ngrid, dtype=dtype, device=device,
@@ -614,15 +741,20 @@ class LandSurface(nn.Module):
         # interception) and the per-tile interception-layer evaporation
         # mismatch PEINTTI (the difference between the realised and the
         # raw PEVAPTI the soil must close against); convective throughfall
-        # PTSFC and snowmelt / snow-evap mismatch PMSN / PEMSSN /
-        # PEVAPSNW stay zero -- the ``-s`` single-layer snow variant
-        # upstream has no SRFWEXC/SRFWDIF soil-W snow coupling.  PSDOR
+        # PTSFC stays zero because the offline forcing has no convective
+        # split. Snowmelt and the snow-mass clipping mismatch are passed
+        # through to SRFWEXC_VG, as in the Fortran single-layer scheme. PSDOR
         # (orography std-dev for the VIC runoff) defaults to flat terrain
         # (0 m) -- cold start.
+        snow_rain_intercept = snow_out.ptsflin
+        if snow_rain_intercept is None:
+            snow_rain_intercept = torch.zeros_like(canopy_out.ptsfl)
+        soil_ptsfl = torch.clamp(canopy_out.ptsfl - snow_rain_intercept, min=0.0)
         soilw_out = self._update_soil_moisture(
-            state=state, static=static, diff_out=out,
+            state=state, static=static, diff_out=land_flux_out,
             forcing=forcing, pfrti=frac,
-            ptsfl=canopy_out.ptsfl, peintti=canopy_out.peintti,
+            ptsfl=soil_ptsfl, peintti=canopy_out.peintti,
+            pmsn=snow_out.pmsn, pemssn=snow_out.pemssn, pevapsnw=pevapsnw,
             dt=dt, ngrid=ngrid, dtype=dtype, device=device,
         )
         new_soil_w = soilw_out.pwsa
@@ -640,15 +772,49 @@ class LandSurface(nn.Module):
         # through the SRFSN_LWIMP section-3.1 density-evolution port
         # (_update_snow_density).  The skin-reservoir water advances
         # through SRFWL: PWL <- canopy_out.pwl.
+        # The single-layer solver can retain an intermediate PTSN after
+        # the snow store is clipped to zero. The offline driver writes
+        # RTT for an inactive snow column, which is also the required
+        # next-step restart state.
+        skin_water_prev = (
+            state.skin_water.to(dtype=dtype, device=device)
+            if state.skin_water is not None
+            else torch.zeros((ngrid,), dtype=dtype, device=device)
+        )
+        skin_water_tendency = skin_water_prev + dt * canopy_out.pfwel1
+        skin_water_tendency = torch.where(
+            (canopy_out.pwl == 0.0) & (skin_water_tendency > 1.0e-20),
+            torch.zeros_like(skin_water_tendency), skin_water_tendency,
+        )
+        stores_intercepted_rain = canopy_out.pwl > skin_water_tendency
+        skin_water_out = torch.where(
+            stores_intercepted_rain, canopy_out.pwl, skin_water_tendency,
+        )
+
+        new_snow_t = torch.where(
+            snow_out.psstar <= 0.0,
+            torch.full_like(snow_out.ptsn, self.consts.rtt),
+            snow_out.ptsn,
+        )
         new_state = state.like(
-            skin_t=out.ptsktip1,
+            skin_t=surfpp_skin_t.clone(),
+            # This is PTL at t+1.  It must use the fractions from the VDF
+            # step, before snow/skin-water updates change the tile split.
+            radiative_skin_t=scatter_to_tiles(surfpp_skin_t, frac).clone(),
             soil_t=new_soil_t,
             soil_w_liq=new_soil_w,
-            snow_t=snow_out.ptsn,
+            snow_t=new_snow_t,
             snow_w=snow_out.psstar,
             snow_rho=new_snow_rho,
+            snow_frac=new_snow_frac,
             snow_alb=new_snow_alb,
-            skin_water=canopy_out.pwl,
+            skin_water=skin_water_out,
+            vupdz0_step=self._surf_step_count + 1,
+            vupdz0_pustrti=self._last_pustrti,
+            vupdz0_pvstrti=self._last_pvstrti,
+            vupdz0_pahfsti=self._last_pahfsti,
+            vupdz0_pevapti=self._last_pevapti,
+            vupdz0_pzdl=self._last_pzdl,
         )
         diag = self._build_diag(out, static, ntile, state=state)
 
@@ -676,11 +842,78 @@ class LandSurface(nn.Module):
     # ----------------------------------------------------------------- #
     # Helpers used by forward()
     # ----------------------------------------------------------------- #
+    def _surfpp_zero_tile_fluxes(
+        self,
+        pssh: torch.Tensor,
+        pjq: torch.Tensor,
+        frac: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Mirror SURFPP_CTL zero-fraction PAHFSTI/PEVAPTI replacement."""
+        ntile = pssh.shape[1]
+        max_land_tile = min(ntile, TILE_BARE_SOIL + 1)
+        mean_pssh = (frac * pssh).sum(dim=1, keepdim=True)
+        mean_pjq = (frac * pjq).sum(dim=1, keepdim=True)
+        zero_frac = frac[:, :max_land_tile] == 0.0
+        if max_land_tile > TILE_WET_SKIN:
+            zero_frac[:, TILE_WET_SKIN] = False
+        pssh_land = torch.where(
+            zero_frac, mean_pssh.expand(-1, max_land_tile), pssh[:, :max_land_tile]
+        )
+        pjq_land = torch.where(
+            zero_frac, mean_pjq.expand(-1, max_land_tile), pjq[:, :max_land_tile]
+        )
+        if max_land_tile < ntile:
+            pssh_land = torch.cat((pssh_land, pssh[:, max_land_tile:]), dim=1)
+            pjq_land = torch.cat((pjq_land, pjq[:, max_land_tile:]), dim=1)
+        return pssh_land, pjq_land
+
+    def _surfpp_zero_tile_skin_t(
+        self,
+        ptsktip1: torch.Tensor,
+        frac: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mirror SURFPPS_CTL zero-fraction PTSKTI replacement."""
+        mean_tsk = (frac * ptsktip1).sum(dim=1, keepdim=True)
+        zero_frac = frac == 0.0
+        return torch.where(zero_frac, mean_tsk.expand_as(ptsktip1), ptsktip1)
+
+    def _snow_under_forest_evap(
+        self,
+        *,
+        forcing: Forcing,
+        state: SurfState,
+        rhoc_q_t: torch.Tensor,
+        pcsnw: torch.Tensor,
+        frac: torch.Tensor,
+        ntile: int,
+        dtype: torch.dtype,
+        device,
+    ) -> torch.Tensor:
+        """Compute SURFEXCDRIVER_CTL PEVAPSNW for tile 7."""
+        ngrid = forcing.q.shape[0]
+        zero = torch.zeros((ngrid,), dtype=dtype, device=device)
+        if ntile <= TILE_HIGH_VEG_SNOW:
+            return zero
+
+        snow_t = state.snow_t if state.snow_t is not None else state.soil_t[:, 0]
+        qssn = qsat(
+            snow_t.to(dtype=dtype, device=device),
+            forcing.p_surf.to(dtype=dtype, device=device),
+            self.consts,
+        )
+        pevapsnw = (
+            rhoc_q_t[:, TILE_HIGH_VEG_SNOW]
+            * pcsnw[:, TILE_HIGH_VEG_SNOW]
+            * (forcing.q.to(dtype=dtype, device=device) - qssn)
+        )
+        return torch.where(frac[:, TILE_HIGH_VEG_SNOW] > 0.0, pevapsnw, zero)
+
     def _exchange_coeffs(
         self,
         forcing: Forcing,
         static: Static,
         state: SurfState,
+        skin_t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(rho*Ch*|U|, rho*Cq*|U|)`` at the lowest model level.
 
@@ -704,7 +937,9 @@ class LandSurface(nn.Module):
         falls back to the neutral ``Cd = 1e-3`` placeholder.
         """
         if self.config.per_tile_exchange:
-            return self._per_tile_monin_obukhov_coeffs(forcing, static, state)
+            return self._per_tile_monin_obukhov_coeffs(
+                forcing, static, state, skin_t=skin_t
+            )
         if static.z0m is None or static.z0h is None or static.z0q is None:
             return self._neutral_exchange_coeffs(forcing)
         return self._gridmean_monin_obukhov_coeffs(forcing, static, state)
@@ -723,6 +958,192 @@ class LandSurface(nn.Module):
         rhoc = rho * cd_n * wind
         return rhoc, rhoc
 
+    def _vexcs_step_controls(self) -> Tuple[bool, int]:
+        """SURFEXCDRIVER VEXCS controls: LLINIT and IITT from KSTEP."""
+        kstep = int(getattr(self, "_surf_step_count", 0))
+        return kstep == 0, 3 if kstep <= 3 else 1
+
+    def _vupdz0_warm_start(
+        self,
+        forcing: Forcing,
+        state: SurfState,
+        ntile: int,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Rebuild VUPDZ0 PZDLTI/PBUOMTI from previous tiled fluxes."""
+        ngrid = state.skin_t.shape[0]
+        dtype = state.skin_t.dtype
+        device = state.skin_t.device
+        zero = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+        needed = (self._last_pustrti, self._last_pvstrti,
+                  self._last_pahfsti, self._last_pevapti)
+        if any(x is None for x in needed):
+            return None, zero.reshape(-1)
+        if any(tuple(x.shape) != (ngrid, ntile) for x in needed):
+            return None, zero.reshape(-1)
+
+        pustr = self._last_pustrti.to(dtype=dtype, device=device)
+        pvstr = self._last_pvstrti.to(dtype=dtype, device=device)
+        pahfs = self._last_pahfsti.to(dtype=dtype, device=device)
+        pevap = self._last_pevapti.to(dtype=dtype, device=device)
+
+        rho = forcing.p_surf / (
+            self.consts.rd * forcing.t * (1.0 + self.consts.retv * forcing.q)
+        )
+        zrowq = pevap
+        zrowt = pahfs / self.consts.cpd
+        pbuom = self.consts.g * (
+            -self.consts.retv * zrowq - zrowt / state.skin_t
+        ) / rho.unsqueeze(-1)
+
+        zust2 = torch.sqrt(pustr.square() + pvstr.square()) / rho.unsqueeze(-1)
+        pos_buom = torch.clamp(pbuom, min=0.0)
+        zwst2 = torch.where(
+            pbuom > 0.0,
+            (pos_buom * RPARZI) ** (2.0 / 3.0),
+            torch.zeros_like(pbuom),
+        )
+        zust2 = torch.where(pbuom > 0.0, zust2 + 2.0e-3 * zwst2, zust2)
+        zust = torch.clamp(torch.sqrt(torch.clamp(zust2, min=0.0)), min=1.0e-4)
+        pzdl = -forcing.geom1.unsqueeze(-1) * RKAP * pbuom / (
+            self.consts.g * zust ** 3
+        )
+        return pzdl.reshape(-1), pbuom.reshape(-1)
+
+    def _vupdz0_praqti(
+        self,
+        forcing: Forcing,
+        state: SurfState,
+        z0m: torch.Tensor,
+        z0q: torch.Tensor,
+        pzdl0: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Preliminary moisture aerodynamic resistance from VUPDZ0."""
+        ngrid, ntile = z0m.shape
+        dtype = state.skin_t.dtype
+        device = state.skin_t.device
+        pzdl = torch.zeros((ngrid, ntile), dtype=dtype, device=device) if pzdl0 is None else pzdl0.reshape(ngrid, ntile)
+
+        rho = forcing.p_surf / (
+            self.consts.rd * forcing.t * (1.0 + self.consts.retv * forcing.q)
+        )
+        if self._last_pustrti is not None and self._last_pvstrti is not None                 and tuple(self._last_pustrti.shape) == (ngrid, ntile)                 and tuple(self._last_pvstrti.shape) == (ngrid, ntile):
+            pustr = self._last_pustrti.to(dtype=dtype, device=device)
+            pvstr = self._last_pvstrti.to(dtype=dtype, device=device)
+            zust2 = torch.sqrt(pustr.square() + pvstr.square()) / rho.unsqueeze(-1)
+            # Match VUPDZ0's free-convection correction when previous fluxes exist.
+            if self._last_pahfsti is not None and self._last_pevapti is not None                     and tuple(self._last_pahfsti.shape) == (ngrid, ntile)                     and tuple(self._last_pevapti.shape) == (ngrid, ntile):
+                pahfs = self._last_pahfsti.to(dtype=dtype, device=device)
+                pevap = self._last_pevapti.to(dtype=dtype, device=device)
+                pbuom = self.consts.g * (
+                    -self.consts.retv * pevap - (pahfs / self.consts.cpd) / state.skin_t
+                ) / rho.unsqueeze(-1)
+                zwst2 = torch.where(
+                    pbuom > 0.0,
+                    (torch.clamp(pbuom, min=0.0) * RPARZI) ** (2.0 / 3.0),
+                    torch.zeros_like(pbuom),
+                )
+                zust2 = torch.where(pbuom > 0.0, zust2 + 2.0e-3 * zwst2, zust2)
+            zust = torch.clamp(torch.sqrt(torch.clamp(zust2, min=0.0)), min=1.0e-4)
+        else:
+            ucurr = forcing.ucurr if forcing.ucurr is not None else torch.zeros(ngrid, dtype=dtype, device=device)
+            vcurr = forcing.vcurr if forcing.vcurr is not None else torch.zeros(ngrid, dtype=dtype, device=device)
+            zdu2 = torch.clamp((forcing.u - ucurr).square() + (forcing.v - vcurr).square(), min=REPDU2)
+            # Neutral cold-start drag estimate used by VUPDZ0 to initialise U*.
+            cdn = (RKAP / torch.log(1.0 + forcing.geom1.unsqueeze(-1) / (self.consts.g * z0m))) ** 2
+            zust = torch.sqrt(zdu2).unsqueeze(-1) * torch.sqrt(cdn)
+            zust = torch.clamp(zust, min=1.0e-4)
+
+        znlev = forcing.geom1.unsqueeze(-1) / self.consts.g + z0m
+        z1dz0q = znlev / z0q
+        zxlnq = torch.log(z1dz0q)
+        stable = pzdl > 0.0
+        zprh1 = torch.where(stable, psihs(pzdl), psihu(pzdl))
+        eta0 = pzdl / z1dz0q
+        zprq0 = torch.where(stable, psihs(eta0), psihu(eta0))
+        return (zxlnq - zprh1 + zprq0) / (zust * RKAP)
+
+    def _vsurf_apparent_humidity(
+        self,
+        forcing: Forcing,
+        static: Static,
+        state: SurfState,
+        frac: torch.Tensor,
+        ktvl: torch.Tensor,
+        ktvh: torch.Tensor,
+        qs_skin: torch.Tensor,
+        praqti: torch.Tensor,
+        ntile: int,
+    ) -> torch.Tensor:
+        """VSURF apparent surface humidity ZQSATI before VEXCS."""
+        ssrfl_grid = forcing.fr_so / forcing.dt
+        jarvis = compute_jarvis_resistance(
+            soil_t=state.soil_t,
+            soil_w=state.soil_w_liq,
+            soil_type=static.soil_type,
+            ktvl=ktvl, ktvh=ktvh,
+            t_air=forcing.t, q_air=forcing.q, p_surf=forcing.p_surf,
+            sw_down=ssrfl_grid,
+            veg_table=self.veg_table,
+            soil_table=self.soil_table,
+            root_table=self.root_table,
+            consts=self.consts,
+            tile_frac=frac, n_tile=ntile,
+            lai_low=static.lai_low,
+            lai_high=static.lai_high,
+        )
+        pqsam = qs_skin.clone()
+        qdef = torch.clamp(forcing.q.unsqueeze(-1) - qs_skin, max=0.0)
+
+        def set_tile(tile: int, resistance: torch.Tensor) -> None:
+            if ntile > tile:
+                r = resistance.unsqueeze(-1)
+                pqsam[:, tile:tile + 1] = qs_skin[:, tile:tile + 1] + qdef[:, tile:tile + 1] * r / (r + praqti[:, tile:tile + 1])
+
+        set_tile(TILE_LOW_VEG_DRY, jarvis["pwetl"])
+        set_tile(TILE_HIGH_VEG_DRY, jarvis["pweth"])
+        set_tile(TILE_HIGH_VEG_SNOW, jarvis.get("pweths", jarvis["pweth"]))
+        set_tile(TILE_BARE_SOIL, jarvis["pwetb"])
+        if ntile > TILE_URBAN:
+            set_tile(TILE_URBAN, jarvis["pwetb"])
+        return torch.clamp(pqsam, min=1.0e-12)
+
+    def _cache_vexcs_stress(
+        self,
+        out: ExchangeOutputs,
+        forcing: Forcing,
+        frac: torch.Tensor,
+        ngrid: int,
+        ntile: int,
+    ) -> None:
+        """Cache the offline VDFMAIN1S stress for the next VUPDZ0 call.
+
+        SURFPP copies the VDFINCR lowest-level grid stress to every tile.
+        In OSM offline mode VDFDIFM1S has no vertical solve; VDFINCR reduces
+        exactly to the area-weighted VEXCS coefficient times relative wind.
+        """
+        dtype = out.pcfm.dtype
+        device = out.pcfm.device
+        ucurr = forcing.ucurr if forcing.ucurr is not None else torch.zeros(
+            ngrid, dtype=dtype, device=device)
+        vcurr = forcing.vcurr if forcing.vcurr is not None else torch.zeros(
+            ngrid, dtype=dtype, device=device)
+        momentum = vdfdifm1s_surface_stress(
+            out.pcfm.reshape(ngrid, ntile), frac,
+            forcing.u.to(dtype=dtype, device=device) + (forcing.dt * forcing.u_tendency.to(dtype=dtype, device=device) if forcing.u_tendency is not None else 0.0),
+            forcing.v.to(dtype=dtype, device=device) + (forcing.dt * forcing.v_tendency.to(dtype=dtype, device=device) if forcing.v_tendency is not None else 0.0),
+            ucurr,
+            vcurr,
+        )
+        stress_u = (forcing.u_stress.to(dtype=dtype, device=device)
+                    if forcing.u_stress is not None else momentum.stress_u)
+        stress_v = (forcing.v_stress.to(dtype=dtype, device=device)
+                    if forcing.v_stress is not None else momentum.stress_v)
+        pustr_grid = stress_u.unsqueeze(-1)
+        pvstr_grid = stress_v.unsqueeze(-1)
+
+        self._last_pustrti = pustr_grid.expand(ngrid, ntile).detach().clone()
+        self._last_pvstrti = pvstr_grid.expand(ngrid, ntile).detach().clone()
+
     def _per_tile_z0(
         self,
         static: Static,
@@ -732,6 +1153,7 @@ class LandSurface(nn.Module):
         ntile: int,
         dtype: torch.dtype,
         device,
+        state: Optional[SurfState] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-tile roughness lengths ``(z0m, z0h, z0q)`` each (Ngrid, ntile).
 
@@ -754,7 +1176,7 @@ class LandSurface(nn.Module):
         z0h_low = self.veg_table.gather("rvz0h", ktvl)
         z0m_high = self.veg_table.gather("rvz0m", ktvh)
         z0h_high = self.veg_table.gather("rvz0h", ktvh)
-        # Snow type 12 (exposed-snow, vupdz0s_mod.F90:351).
+        # Snow type 12 (exposed-snow, vupdz0_mod.F90).
         snow_idx = torch.full_like(ktvl, 12)
         z0m_snow = self.veg_table.gather("rvz0m", snow_idx)
         z0h_snow = self.veg_table.gather("rvz0h", snow_idx)
@@ -763,21 +1185,26 @@ class LandSurface(nn.Module):
         z0m_bare = self.veg_table.gather("rvz0m", bare_idx)
         z0h_bare = self.veg_table.gather("rvz0h", bare_idx)
 
-        # Cover fractions CVL / CVH (low / high veg tile fractions).
-        cvl = frac.new_zeros(frac.shape[:-1])
-        cvh = frac.new_zeros(frac.shape[:-1])
-        if ntile > TILE_LOW_VEG_DRY:
-            cvl = cvl + frac[..., TILE_LOW_VEG_DRY]
-        if ntile > TILE_LOW_VEG_SNOW:
-            cvl = cvl + frac[..., TILE_LOW_VEG_SNOW]
-        if ntile > TILE_HIGH_VEG_DRY:
-            cvh = cvh + frac[..., TILE_HIGH_VEG_DRY]
-        if ntile > TILE_HIGH_VEG_SNOW:
-            cvh = cvh + frac[..., TILE_HIGH_VEG_SNOW]
-        one_minus = 1.0 - cvl - cvh
+        # VUPDZ0 uses the RVCOV-corrected climatological covers (PCVL/PCVH),
+        # not the transient snow-split tile fractions. Retain the latter as a
+        # fallback for callers that do not provide vegetation-cover metadata.
+        covers = self._cover_fractions(static)
+        if covers is None:
+            pcvl = frac[..., TILE_LOW_VEG_DRY] + frac[..., TILE_LOW_VEG_SNOW]
+            pcvh = frac[..., TILE_HIGH_VEG_DRY] + frac[..., TILE_HIGH_VEG_SNOW]
+        else:
+            pcvl, pcvh = covers[0], covers[1]
+        one_minus = 1.0 - pcvl - pcvh
         # Wet-skin blend: cvl*RVZ0M(ktvl)+cvh*RVZ0M(ktvh)+(1-cvl-cvh)*RVZ0M(0)
-        z0m_wet = cvl * z0m_low + cvh * z0m_high + one_minus * z0m_bare
-        z0h_wet = cvl * z0h_low + cvh * z0h_high + one_minus * z0h_bare
+        z0m_wet = pcvl * z0m_low + pcvh * z0m_high + one_minus * z0m_bare
+        z0h_wet = pcvl * z0h_low + pcvh * z0h_high + one_minus * z0h_bare
+        # Exposed-snow blend (VUPDZ0 tile 5): low vegetation + bare soil,
+        # normalized by the non-high-vegetation cover, then blended toward
+        # snow type 12 by snow depth. This is distinct from the grid log
+        # blend used only for momentum roughness.
+        denom_low = torch.clamp(1.0 - pcvh, min=torch.finfo(dtype).tiny)
+        z0m_low_bare = pcvl / denom_low * z0m_low + one_minus / denom_low * z0m_bare
+        z0h_low_bare = pcvl / denom_low * z0h_low + one_minus / denom_low * z0h_bare
 
         # Placeholder for water / ice (frac=0 in pure-land default).
         z0_placeholder = torch.full(
@@ -810,8 +1237,22 @@ class LandSurface(nn.Module):
         z0h[:, TILE_WET_SKIN] = z0h_wet
         z0m[:, TILE_LOW_VEG_DRY] = z0m_low
         z0h[:, TILE_LOW_VEG_DRY] = z0h_low
-        z0m[:, TILE_LOW_VEG_SNOW] = z0m_snow
-        z0h[:, TILE_LOW_VEG_SNOW] = z0h_snow
+        # VUPDZ0 blends the exposed-snow roughness with the low/bare value
+        # using total physical snow depth, PDSN = SWE / snow density.
+        if state is None or state.snow_w is None or state.snow_rho is None:
+            snow_weight = torch.zeros(ngrid, dtype=dtype, device=device)
+        else:
+            snow_depth = state.snow_w.to(dtype=dtype, device=device) / torch.clamp(
+                state.snow_rho.to(dtype=dtype, device=device),
+                min=torch.finfo(dtype).tiny,
+            )
+            snow_weight = torch.clamp(snow_depth / 0.25, min=0.0, max=1.0)
+        z0m[:, TILE_LOW_VEG_SNOW] = (
+            snow_weight * z0m_snow + (1.0 - snow_weight) * z0m_low_bare
+        )
+        z0h[:, TILE_LOW_VEG_SNOW] = (
+            snow_weight * z0h_snow + (1.0 - snow_weight) * z0h_low_bare
+        )
         z0m[:, TILE_HIGH_VEG_DRY] = z0m_high
         z0h[:, TILE_HIGH_VEG_DRY] = z0h_high
         z0m[:, TILE_HIGH_VEG_SNOW] = z0m_high      # sheltered snow uses ktvh
@@ -819,15 +1260,39 @@ class LandSurface(nn.Module):
         if ntile > TILE_BARE_SOIL:
             z0m[:, TILE_BARE_SOIL] = z0m_bare
             z0h[:, TILE_BARE_SOIL] = z0h_bare
-        # z0q = z0h for every land tile (vupdz0s_mod.F90:337,345,...).
+        # z0q = z0h for every land tile (vupdz0_mod.F90).
         z0q = z0h.clone()
         return z0m, z0h, z0q
+
+    def _blend_momentum_z0(
+        self,
+        z0m: torch.Tensor,
+        frac: torch.Tensor,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        """SURFEXCDRIVER_CTL log-blend for momentum roughness.
+
+        VUPDZ0 first computes PRAQTI with tile-specific PZ0MTI.  Only after
+        VUPDZ0 returns does SURFEXCDRIVER_CTL compute the grid log-blend and
+        write it back to every tile before VEXCS.  Keeping this as a separate
+        helper preserves that ordering.
+        """
+        dtype = z0m.dtype
+        device = z0m.device
+        zblend = torch.as_tensor(10.0, dtype=dtype, device=device)
+        tiny = torch.as_tensor(1.0e-12, dtype=dtype, device=device)
+        z0_safe = torch.clamp(z0m, min=tiny, max=zblend * (1.0 - 1.0e-12))
+        cblend = (frac / torch.log(zblend / z0_safe).square()).sum(dim=-1)
+        cblend_safe = torch.where(cblend > 0.0, cblend, torch.ones_like(cblend))
+        blended = zblend * torch.exp(-1.0 / torch.sqrt(cblend_safe))
+        return torch.where(cblend > 0.0, blended, fallback)
 
     def _per_tile_monin_obukhov_coeffs(
         self,
         forcing: Forcing,
         static: Static,
         state: SurfState,
+        skin_t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-tile Beljaars Monin-Obukhov exchange coefficients (VEXCS).
 
@@ -847,22 +1312,42 @@ class LandSurface(nn.Module):
         """
         ntile = self.config.n_tile
         cp = self.consts.cpd
-        ngrid = state.skin_t.shape[0]
+        skin_t = state.skin_t if skin_t is None else skin_t
+        ngrid = skin_t.shape[0]
         dtype = self.config.dtype
-        device = state.skin_t.device
+        device = skin_t.device
 
         frac = self._tile_frac(static, ntile, state=state)
         ktvl, ktvh = self._dominant_veg_types(static)
 
-        # Per-tile surface state (kept per-tile -- NOT scattered to grid).
-        pcpts = cp * state.skin_t                       # (Ngrid, ntile)
+        # Per-tile saturation humidity and roughness lengths.
         p_surf_t = expand_as_tiles(forcing.p_surf, ntile)
-        pqsam = qsat(state.skin_t, p_surf_t, self.consts)
-
-        # Per-tile roughness lengths.
-        z0m, z0h, z0q = self._per_tile_z0(
-            static, frac, ktvl, ktvh, ntile, dtype, device,
+        qs_skin = qsat(skin_t, p_surf_t, self.consts)
+        z0m_tile, z0h, z0q = self._per_tile_z0(
+            static, frac, ktvl, ktvh, ntile, dtype, device, state=state,
         )
+        boundary_mode = self.config.vup_boundary_mode
+        if boundary_mode == "coupled":
+            roughness = {
+                "vupdz0_z0mti": forcing.vupdz0_z0mti,
+                "vupdz0_z0hti": forcing.vupdz0_z0hti,
+                "vupdz0_z0qti": forcing.vupdz0_z0qti,
+            }
+            missing = [name for name, value in roughness.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "Coupled mode requires authoritative VUPDZ0 roughness fields: "
+                    + ", ".join(missing)
+                )
+            for name, value in roughness.items():
+                if tuple(value.shape) != (ngrid, ntile):
+                    raise ValueError(
+                        f"Forcing.{name} must have shape ({ngrid}, {ntile}), "
+                        f"got {tuple(value.shape)}"
+                    )
+            z0m_tile = roughness["vupdz0_z0mti"].to(dtype=dtype, device=device)
+            z0h = roughness["vupdz0_z0hti"].to(dtype=dtype, device=device)
+            z0q = roughness["vupdz0_z0qti"].to(dtype=dtype, device=device)
 
         # Optional buoyancy flux / ocean current -- zero when absent.
         buom_g = forcing.buom if forcing.buom is not None else \
@@ -880,16 +1365,104 @@ class LandSurface(nn.Module):
         def _rep(g):
             return g.unsqueeze(-1).expand(ngrid, ntile).reshape(-1)
         pcptgzlev_g = cp * forcing.t + forcing.geom1
+        ldinit, kitt = self._vexcs_step_controls()
+        if boundary_mode == "offline":
+            pzdl0, pbuom0 = self._vupdz0_warm_start(forcing, state, ntile)
+            praqti = self._vupdz0_praqti(forcing, state, z0m_tile, z0q, pzdl0)
+            self._last_vup_pzdl0 = (
+                None if pzdl0 is None else pzdl0.reshape(ngrid, ntile).detach()
+            )
+            self._last_vup_pbuom0 = pbuom0.reshape(ngrid, ntile).detach()
+            self._last_vup_praqti = praqti.detach()
+        elif boundary_mode == "coupled":
+            external = {
+                "vupdz0_pustrti": forcing.vupdz0_pustrti,
+                "vupdz0_pvstrti": forcing.vupdz0_pvstrti,
+                "vupdz0_pahfsti": forcing.vupdz0_pahfsti,
+                "vupdz0_pevapti": forcing.vupdz0_pevapti,
+                "vupdz0_pbuomti": forcing.vupdz0_pbuomti,
+                "vupdz0_pzdlti": forcing.vupdz0_pzdlti,
+                "vupdz0_praqti": forcing.vupdz0_praqti,
+            }
+            missing = [name for name, value in external.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "Coupled mode requires "
+                    "authoritative VUPDZ0 forcing fields: " + ", ".join(missing)
+                )
+            for name, value in external.items():
+                if tuple(value.shape) != (ngrid, ntile):
+                    raise ValueError(
+                        f"Forcing.{name} must have shape ({ngrid}, {ntile}), "
+                        f"got {tuple(value.shape)}"
+                    )
+            self._last_pustrti = external["vupdz0_pustrti"].to(dtype=dtype, device=device).clone()
+            self._last_pvstrti = external["vupdz0_pvstrti"].to(dtype=dtype, device=device).clone()
+            self._last_pahfsti = external["vupdz0_pahfsti"].to(dtype=dtype, device=device).clone()
+            self._last_pevapti = external["vupdz0_pevapti"].to(dtype=dtype, device=device).clone()
+            pzdl0 = external["vupdz0_pzdlti"].to(dtype=dtype, device=device).reshape(-1)
+            pbuom0 = external["vupdz0_pbuomti"].to(dtype=dtype, device=device).reshape(-1)
+            praqti = external["vupdz0_praqti"].to(dtype=dtype, device=device)
+            self._last_vup_praqti = praqti.detach()
+        else:
+            raise ValueError(
+                "SurfConfig.vup_boundary_mode must be 'offline' or 'coupled', "
+                f"got {boundary_mode!r}"
+            )
+        # SURFEXCDRIVER_CTL calls VSURF before VEXCS and passes the
+        # resulting apparent surface humidity ZQSATI(:,JTILE) into VEXCS.
+        # PRAQTI is computed above solely to close this VSURF relation.
+        pqsam = self._vsurf_apparent_humidity(
+            forcing, static, state, frac, ktvl, ktvh, qs_skin, praqti, ntile,
+        )
+        pcpts = skin_t * cp
+        # SURFEXCDRIVER_CTL first uses tile-specific momentum roughness in
+        # VUPDZ0/PRAQTI, then log-blends it to one grid value and writes that
+        # blended PZ0M back to every tile before VEXCS/VEXCSS.  Heat/moisture
+        # roughness lengths remain tile-specific.
+        z0m_fallback = (
+            static.z0m.to(dtype=dtype, device=device)
+            if static.z0m is not None
+            else z0m_tile[:, TILE_BARE_SOIL]
+        )
+        z0m_blend = self._blend_momentum_z0(z0m_tile, frac, z0m_fallback)
+        z0m = z0m_blend.unsqueeze(-1).expand_as(z0m_tile)
+        if boundary_mode == "offline":
+            out: ExchangeOutputs = compute_vexcs(
+                _rep(forcing.u), _rep(forcing.v), _rep(forcing.t), _rep(forcing.q),
+                _rep(forcing.p_surf), _rep(forcing.geom1), _rep(pcptgzlev_g),
+                pcpts.reshape(-1), pqsam.reshape(-1),
+                z0m.reshape(-1), z0h.reshape(-1), z0q.reshape(-1),
+                pzdl0, pbuom0, _rep(ucurr_g), _rep(vcurr_g), _rep(i10fgcv_g),
+                self.consts, self.ritbl_table,
+                kitt=kitt,
+                ldinit=ldinit,
+            )
+            self._last_pcfm_tile = out.pcfm.reshape(ngrid, ntile).detach()
+            self._last_pcfh_tile = out.pcfh.reshape(ngrid, ntile).detach()
+            self._last_pcfq_tile = out.pcfq.reshape(ngrid, ntile).detach()
+            self._cache_vexcs_stress(out, forcing, frac, ngrid, ntile)
+            self._last_pzdl = scatter_to_tiles(
+                out.pzdl.reshape(ngrid, ntile), frac,
+            ).detach()
+            return (
+                out.pcfh.reshape(ngrid, ntile),
+                out.pcfq.reshape(ngrid, ntile),
+            )
         out: ExchangeOutputs = compute_vexcs(
             _rep(forcing.u), _rep(forcing.v), _rep(forcing.t), _rep(forcing.q),
             _rep(forcing.p_surf), _rep(forcing.geom1), _rep(pcptgzlev_g),
             pcpts.reshape(-1), pqsam.reshape(-1),
             z0m.reshape(-1), z0h.reshape(-1), z0q.reshape(-1),
-            None, _rep(buom_g), _rep(ucurr_g), _rep(vcurr_g), _rep(i10fgcv_g),
+            pzdl0, pbuom0, _rep(ucurr_g), _rep(vcurr_g), _rep(i10fgcv_g),
             self.consts, self.ritbl_table,
-            kitt=self.config.vexcs_kitt,
-            ldinit=True,
+            kitt=kitt,
+            ldinit=ldinit,
         )
+        self._last_pcfm_tile = out.pcfm.reshape(ngrid, ntile).detach()
+        self._last_pcfh_tile = out.pcfh.reshape(ngrid, ntile).detach()
+        self._last_pcfq_tile = out.pcfq.reshape(ngrid, ntile).detach()
+        self._cache_vexcs_stress(out, forcing, frac, ngrid, ntile)
         # Cache the per-tile z/L (grid-mean for the warm-start thread).
         self._last_pzdl = scatter_to_tiles(
             out.pzdl.reshape(ngrid, ntile), frac,
@@ -952,14 +1525,15 @@ class LandSurface(nn.Module):
         i10fgcv = forcing.i10fgcv if forcing.i10fgcv is not None else \
             torch.zeros(ngrid, dtype=dtype, device=device)
 
+        ldinit, kitt = self._vexcs_step_controls()
         out: ExchangeOutputs = compute_vexcs(
             forcing.u, forcing.v, forcing.t, forcing.q,
             forcing.p_surf, forcing.geom1, pcptgzlev, pcpts, pqsam,
             static.z0m, static.z0h, static.z0q,
             None, buom, ucurr, vcurr, i10fgcv,
             self.consts, self.ritbl_table,
-            kitt=self.config.vexcs_kitt,
-            ldinit=True,
+            kitt=kitt,
+            ldinit=ldinit,
         )
         # Cache the latest z/L on the module for warm-start on the next
         # step (the upstream driver threads PZDL between calls).  Tests
@@ -970,10 +1544,11 @@ class LandSurface(nn.Module):
     def _sub_surface_t(self, state: SurfState, ntile: int) -> torch.Tensor:
         """Per-tile sub-surface temperature PTSRF (K).
 
-        Land tiles use the top soil layer temperature; the water tile
-        uses SST (skin pins to it via lambda_skin = LARGE); ice uses
-        the sea-ice skin.  Until the sea-ice / lake stubs land this is
-        simply a broadcast of the top soil layer to every tile.
+        Land snow-free tiles use the top soil layer temperature; snow
+        tiles use the prognostic snow temperature, matching
+        ``SURFEXCDRIVER`` where ``PTSRF(:,5)`` and ``PTSRF(:,7)`` are
+        set from ``PTSN(:,1)`` before ``VLAMSK``.  The water tile uses
+        SST (skin pins to it via lambda_skin = LARGE).
 
         Note: this is the *VLAMSK* path (which needs the per-tile PTSRF
         to compute lambda_skin).  The VDFDIFH1S wrapper builds its own
@@ -983,7 +1558,62 @@ class LandSurface(nn.Module):
         tsrf = expand_as_tiles(state.soil_t[:, 0], ntile).clone()
         if state.sst is not None:
             tsrf[:, TILE_WATER] = state.sst
+        snow_t = state.snow_t if state.snow_t is not None else \
+            self.consts.rtt.to(dtype=tsrf.dtype, device=tsrf.device).expand(tsrf.shape[0])
+        if ntile > TILE_LOW_VEG_SNOW:
+            tsrf[:, TILE_LOW_VEG_SNOW] = snow_t
+        if ntile > TILE_HIGH_VEG_SNOW:
+            tsrf[:, TILE_HIGH_VEG_SNOW] = snow_t
         return tsrf
+
+    def _surface_emissivity(
+        self,
+        state: SurfState,
+        static: Static,
+        frac: torch.Tensor,
+        dtype: torch.dtype,
+        device,
+    ) -> torch.Tensor:
+        """SURFRAD broadband longwave emissivity PEMIT for NEMISSSCHEME=1."""
+        weights = torch.tensor([0.149, 0.111, 0.126, 0.190, 0.290, 0.134], dtype=dtype, device=device)
+        remiss_land = torch.tensor([0.98836, 0.98179, 0.98257, 0.98685, 0.98746, 0.98746], dtype=dtype, device=device)
+        remiss_desert = torch.tensor([0.97395, 0.89598, 0.93831, 0.96009, 0.89529, 0.91139], dtype=dtype, device=device)
+        remiss_snow = torch.tensor([0.97851, 0.98896, 0.98112, 0.96727, 0.98421, 0.99240], dtype=dtype, device=device)
+        remiss_sea = torch.tensor([0.93780, 0.94782, 0.95285, 0.91103, 0.88590, 0.87016], dtype=dtype, device=device)
+        e_land = (remiss_land * weights).sum()
+        e_desert = (remiss_desert * weights).sum()
+        e_snow = (remiss_snow * weights).sum()
+        e_sea = (remiss_sea * weights).sum()
+
+        soil_type = static.soil_type.to(device=device)
+        wcap = self.soil_table.gather("wcap", soil_type).to(dtype=dtype, device=device)
+        wpwp = self.soil_table.gather("wpwp", soil_type).to(dtype=dtype, device=device)
+        zprop = torch.clamp(
+            (state.soil_w_liq[:, 0] - wpwp) / torch.clamp(wcap - wpwp, min=torch.finfo(dtype).tiny),
+            0.0, 1.0,
+        )
+        e_soilveg = e_land * zprop + e_desert * (1.0 - zprop)
+
+        ntile = frac.shape[1]
+        emis_t = torch.zeros_like(frac)
+        if ntile > TILE_WATER:
+            emis_t[:, TILE_WATER] = e_sea
+        if ntile > TILE_ICE:
+            emis_t[:, TILE_ICE] = e_snow
+        if ntile > TILE_WET_SKIN:
+            emis_t[:, TILE_WET_SKIN] = e_land
+        if ntile > TILE_LOW_VEG_DRY:
+            emis_t[:, TILE_LOW_VEG_DRY] = e_soilveg
+        if ntile > TILE_LOW_VEG_SNOW:
+            emis_t[:, TILE_LOW_VEG_SNOW] = e_snow
+        if ntile > TILE_HIGH_VEG_DRY:
+            emis_t[:, TILE_HIGH_VEG_DRY] = e_soilveg
+        if ntile > TILE_HIGH_VEG_SNOW:
+            emis_t[:, TILE_HIGH_VEG_SNOW] = e_soilveg
+        if ntile > TILE_BARE_SOIL:
+            albd = static.albd.to(dtype=dtype, device=device) if static.albd is not None else torch.zeros_like(zprop)
+            emis_t[:, TILE_BARE_SOIL] = torch.where(albd > 0.30, e_desert, e_soilveg)
+        return (emis_t * frac).sum(dim=1)
 
     def _build_diffusion_inputs(
         self,
@@ -1010,6 +1640,7 @@ class LandSurface(nn.Module):
         frac: torch.Tensor,
         ktvl: torch.Tensor,
         ktvh: torch.Tensor,
+        pevapsnw: torch.Tensor,
         dt: torch.Tensor,
         ntile: int,
         ngrid: int,
@@ -1027,10 +1658,11 @@ class LandSurface(nn.Module):
         PTSM1M / PTSNOW) are surfaced from the :class:`SurfState`; the
         VDFDIFH1S wrapper assembles the per-tile PTSRF internally.
 
-        Lowest-level tendencies PSLGE / PQTE default to zero (standalone
-        mode -- the surface step does not update the lowest model level
-        within the coupling interval), so the Dirichlet boundary
-        condition reduces to ``bsl = PSLM1`` and ``bql = PQTM1``.
+        Lowest-level tendencies PSLGE / PQTE default to zero for legacy
+        standalone calls.  Offline OSM forcing supplies both current and
+        next atmospheric records; callers can provide the equivalent
+        tendencies on ``Forcing`` so the Dirichlet boundary condition is
+        ``bsl = PSLM1 + PTMST*PSLGE`` and ``bql = PQTM1 + PTMST*PQTE``.
         """
         cp = self.consts.cpd          # 0-d tensor, broadcasts
         rg = self.consts.g
@@ -1056,10 +1688,6 @@ class LandSurface(nn.Module):
         ptsnow = state.snow_t if state.snow_t is not None else \
             state.soil_t[:, 0].clone()
 
-        # Optional snow-under-forest evaporation -- None until the
-        # canopy / snow prognostic update (M6) feeds a non-zero value.
-        pevapsnw = getattr(state, "_pevapsnw", None)
-
         # Optional lake tile fields -- surfaced from SurfState.lake_t
         # when present, otherwise left as None (the wrapper only
         # consumes them when n_tile > TILE_LAKE).
@@ -1070,8 +1698,10 @@ class LandSurface(nn.Module):
         return DiffusionInputs(
             pslm1_lev=sl_lev,
             pqtm1_lev=q_lev,
-            pslge_lev=torch.zeros((ngrid,), dtype=dtype, device=device),
-            pqte_lev=torch.zeros((ngrid,), dtype=dtype, device=device),
+            pslge_lev=forcing.sl_tendency.to(dtype=dtype, device=device)
+            if forcing.sl_tendency is not None else torch.zeros((ngrid,), dtype=dtype, device=device),
+            pqte_lev=forcing.q_tendency.to(dtype=dtype, device=device)
+            if forcing.q_tendency is not None else torch.zeros((ngrid,), dtype=dtype, device=device),
             pcfhti=pcfhti, pcfqti=pcfqti,
             psst=psst, ptice=ptice,
             ptsm1m=ptsm1m, ptsnow=ptsnow,
@@ -1086,7 +1716,7 @@ class LandSurface(nn.Module):
             pevapsnw=pevapsnw,
             phlice=phlice, ptlice=ptlice, ptlwml=ptlwml,
             lesnml=self.config.lesnml,
-            lelwdd=True, lelwtl=False,
+            lelwdd=self.config.lelwdd, lelwtl=self.config.lelwtl,
         )
 
     def _update_soil_temperature(
@@ -1139,17 +1769,23 @@ class LandSurface(nn.Module):
 
         ntile = pfrti.shape[-1]
 
-        # Vegetation cover fractions from the tile fractions.
-        pcvl = pfrti.new_zeros(pfrti.shape[:-1])
-        pcvh = pfrti.new_zeros(pfrti.shape[:-1])
-        if ntile > TILE_LOW_VEG_DRY:
-            pcvl = pcvl + pfrti[..., TILE_LOW_VEG_DRY]
-        if ntile > TILE_LOW_VEG_SNOW:
-            pcvl = pcvl + pfrti[..., TILE_LOW_VEG_SNOW]
-        if ntile > TILE_HIGH_VEG_DRY:
-            pcvh = pcvh + pfrti[..., TILE_HIGH_VEG_DRY]
-        if ntile > TILE_HIGH_VEG_SNOW:
-            pcvh = pcvh + pfrti[..., TILE_HIGH_VEG_SNOW]
+        # SRFRCG receives SURFBC's corrected static vegetation covers.
+        # Snow-low (tile 5) also contains bare ground, so its fraction
+        # cannot reconstruct PCVL after the dynamic snow split.
+        covers = self._cover_fractions(static)
+        if covers is not None:
+            pcvl, pcvh, _, _, _ = covers
+        else:
+            pcvl = pfrti.new_zeros(pfrti.shape[:-1])
+            pcvh = pfrti.new_zeros(pfrti.shape[:-1])
+            if ntile > TILE_LOW_VEG_DRY:
+                pcvl = pcvl + pfrti[..., TILE_LOW_VEG_DRY]
+            if ntile > TILE_LOW_VEG_SNOW:
+                pcvl = pcvl + pfrti[..., TILE_LOW_VEG_SNOW]
+            if ntile > TILE_HIGH_VEG_DRY:
+                pcvh = pcvh + pfrti[..., TILE_HIGH_VEG_DRY]
+            if ntile > TILE_HIGH_VEG_SNOW:
+                pcvh = pcvh + pfrti[..., TILE_HIGH_VEG_SNOW]
 
         # Snow-bottom heat flux PGSN comes from the SRFSN_LWIMPS solve
         # run by _update_snow() just before this helper; see M6c.
@@ -1167,6 +1803,9 @@ class LandSurface(nn.Module):
             pevapti=diff_out.pjq,
             pssrflti=pssrflti,
             pslrfl=pslrfl,
+            # SURFTSTP_CTL calls SRFT with tiled net longwave ZSLRFLTI.
+            # VDFDIFH1S/SURFSEB provides the corresponding per-tile PSTR.
+            pslrflti=diff_out.pstr,
             pgsn=pgsn,
             ksoty=static.soil_type,
             pcvl=pcvl, pcvh=pcvh,
@@ -1186,8 +1825,12 @@ class LandSurface(nn.Module):
         diff_out,                       # DiffusionOutputs
         pssrflti: torch.Tensor,
         pslrfl: torch.Tensor,
+        pslrflti: torch.Tensor | None,
         pfrti: torch.Tensor,
         forcing: Forcing,
+        pevapsnw: torch.Tensor,
+        ptsfc: torch.Tensor,
+        ptsfl: torch.Tensor,
         dt: torch.Tensor,
         ngrid: int,
         dtype: torch.dtype,
@@ -1236,7 +1879,9 @@ class LandSurface(nn.Module):
             PSSRFLTI (tile net SW)          <- pssrflti arg
             PSLRFL   (grid net LW)          <- pslrfl arg
             PSSFL    (large-scale snowfall) <- forcing.snow / dt   (M2d)
-            PSSFC/PTSFC/PTSFL/PEVAPSNW      <- 0 (cold start)
+            PSSFC                           <- 0 (no convective split)
+            PTSFC/PTSFL                     <- canopy throughfall
+            PEVAPSNW                        <- driver evaporation
             PTMST    (coupling interval)    <- dt arg
         """
         # Cold-start fallback for PTSNM1M: if no snow temperature is
@@ -1271,9 +1916,11 @@ class LandSurface(nn.Module):
             pevapti=diff_out.pjq,
             pssrflti=pssrflti,
             pslrfl=pslrfl,
+            pslrflti=pslrflti,
             pssfc=zero1d, pssfl=pssfl,
-            ptsfc=zero1d, ptsfl=zero1d,
-            pevapsnw=zero1d,
+            ptsfc=ptsfc.to(dtype=dtype, device=device),
+            ptsfl=ptsfl.to(dtype=dtype, device=device),
+            pevapsnw=pevapsnw.to(dtype=dtype, device=device),
             ptmst=dt,
         )
         return port_snow(inp, self.soil_table, self.consts, self.config)
@@ -1290,6 +1937,7 @@ class LandSurface(nn.Module):
         ktvh: torch.Tensor,
         forcing: Forcing,
         dt: torch.Tensor,
+        pevapsnw: torch.Tensor,
         ngrid: int,
         dtype: torch.dtype,
         device,
@@ -1321,7 +1969,7 @@ class LandSurface(nn.Module):
         Mapping to the :class:`CanopyInputs` field list::
 
             PWLM1M   (skin-reservoir water) <- state.skin_water
-            PCVL/PCVH (veg cover)           <- reconstructed from frac
+            PCVL/PCVH (veg cover)           <- corrected static SURFBC cover
             PWLMX    (interception capacity) <- wlmx_grid arg
             PFRTI    (tile fractions)       <- frac arg
             PEVAPTI  (tile moisture flux)   <- diff_out.pjq
@@ -1332,31 +1980,34 @@ class LandSurface(nn.Module):
         ptmst = dt if torch.is_tensor(dt) else torch.tensor(dt, dtype=dtype, device=device)
         ntile = frac.shape[-1]
 
-        # Vegetation cover fractions PCVL / PCVH from the active tile
-        # fractions (mirrors _interception_capacity / _update_soil_-
-        # temperature).  Low-veg = dry-low + snow-low; high-veg =
-        # dry-high + snow-high.
+        # SRFWL receives SURFBC's corrected static vegetation covers.
+        # Wet-skin is a mixture of bare and vegetated surfaces, so PCVL /
+        # PCVH cannot be reconstructed from the evolving tile fractions.
         from .config import (
             TILE_LOW_VEG_DRY, TILE_LOW_VEG_SNOW,
             TILE_HIGH_VEG_DRY, TILE_HIGH_VEG_SNOW,
         )
-        pcvl = frac.new_zeros(frac.shape[:-1])
-        pcvh = frac.new_zeros(frac.shape[:-1])
-        if ntile > TILE_LOW_VEG_DRY:
-            pcvl = pcvl + frac[..., TILE_LOW_VEG_DRY]
-        if ntile > TILE_LOW_VEG_SNOW:
-            pcvl = pcvl + frac[..., TILE_LOW_VEG_SNOW]
-        if ntile > TILE_HIGH_VEG_DRY:
-            pcvh = pcvh + frac[..., TILE_HIGH_VEG_DRY]
-        if ntile > TILE_HIGH_VEG_SNOW:
-            pcvh = pcvh + frac[..., TILE_HIGH_VEG_SNOW]
+        covers = self._cover_fractions(static)
+        if covers is not None:
+            pcvl, pcvh, _, _, _ = covers
+        else:
+            pcvl = frac.new_zeros(frac.shape[:-1])
+            pcvh = frac.new_zeros(frac.shape[:-1])
+            if ntile > TILE_LOW_VEG_DRY:
+                pcvl = pcvl + frac[..., TILE_LOW_VEG_DRY]
+            if ntile > TILE_LOW_VEG_SNOW:
+                pcvl = pcvl + frac[..., TILE_LOW_VEG_SNOW]
+            if ntile > TILE_HIGH_VEG_DRY:
+                pcvh = pcvh + frac[..., TILE_HIGH_VEG_DRY]
+            if ntile > TILE_HIGH_VEG_SNOW:
+                pcvh = pcvh + frac[..., TILE_HIGH_VEG_SNOW]
 
         # Rainfall fluxes: large-scale from forcing.rain; convective
-        # zero (cold start).  PEVAPSNW zero (snow-under-forest evap;
-        # the single-layer snow scheme does not thread it back yet).
+        # zero (cold start).  PEVAPSNW is computed by SURFEXCDRIVER before
+        # VDF and must be threaded through SRFWL.
         prsfl = forcing.rain / ptmst
         prsfc = torch.zeros((ngrid,), dtype=dtype, device=device)
-        pevapsnw = torch.zeros((ngrid,), dtype=dtype, device=device)
+        pevapsnw = pevapsnw.to(dtype=dtype, device=device)
 
         # Land mask from the static descriptor (LDLAND).
         ldland = static.land_frac > 0.5
@@ -1378,6 +2029,7 @@ class LandSurface(nn.Module):
             prsfc=prsfc, prsfl=prsfl,
             pevapsnw=pevapsnw,
             ldland=ldland,
+            lewbsoilfix=getattr(self.soil_table.consts, "lewbsoilfix", True),
         )
         return port_canopy(inp, self.veg_table)
 
@@ -1391,6 +2043,9 @@ class LandSurface(nn.Module):
         pfrti: torch.Tensor,
         ptsfl: torch.Tensor,
         peintti: torch.Tensor,
+        pmsn: torch.Tensor | None,
+        pemssn: torch.Tensor | None,
+        pevapsnw: torch.Tensor,
         dt: torch.Tensor,
         ngrid: int,
         dtype: torch.dtype,
@@ -1413,8 +2068,8 @@ class LandSurface(nn.Module):
         * ``PTSFC``   (convective throughfall rate)  <- zero (cold start;
           the port's :class:`Forcing` does not yet split convective vs
           large-scale precip, so all rain is treated as large-scale)
-        * ``PMSN`` / ``PEMSSN`` / ``PEVAPSNW``       <- zero (the ``-s``
-          single-layer snow variant has no soil-W snow coupling)
+        * ``PMSN`` / ``PEMSSN``                       <- ``snow_out``
+        * ``PEVAPSNW``                                 <- driver evaporation
         * ``PEINTTI`` (interception-layer evap mismatch) <- ``peintti``
           arg (from :meth:`_update_canopy`)
 
@@ -1423,25 +2078,21 @@ class LandSurface(nn.Module):
         soil, negative = evaporation removing water).  The HTESSEL
         solve clamps the result to ``[WRES, WSAT]`` per layer.
 
-        ``PSDOR`` (orography std-dev for the VIC sub-grid runoff) is
-        not carried by :class:`Static` -- the port has geopotential
-        height only.  We pass zero (flat terrain); the VIC runoff is
-        still activated through its moisture-dependence, just without
-        the orographic enhancement.
+ `PSDOR` (sub-grid orography standard deviation) is read from
+ :class:Static when supplied; legacy callers fall back to 0 m.
         """
-        # Convective throughfall + snow / snow-evap mismatch terms stay
-        # zero (cold start: no convective precip split, no soil-W snow
-        # coupling in the ``-s`` single-layer variant).
+        # Convective throughfall is unavailable in the offline forcing.
         ptsfc = torch.zeros((ngrid,), dtype=dtype, device=device)
-        pmsn = torch.zeros((ngrid,), dtype=dtype, device=device)
-        pemssn = torch.zeros((ngrid,), dtype=dtype, device=device)
-        pevapsnw = torch.zeros((ngrid,), dtype=dtype, device=device)
+        pmsn = pmsn.to(dtype=dtype, device=device) if pmsn is not None else torch.zeros((ngrid,), dtype=dtype, device=device)
+        pemssn = pemssn.to(dtype=dtype, device=device) if pemssn is not None else torch.zeros((ngrid,), dtype=dtype, device=device)
+        pevapsnw = pevapsnw.to(dtype=dtype, device=device)
 
-        # PSDOR (orography std-dev) -- flat-terrain cold start.
-        psdor = torch.zeros((ngrid,), dtype=dtype, device=device)
+        # PSDOR is the restart/climatology sub-grid orography standard deviation.
+        psdor = static.orography_stddev.to(dtype=dtype, device=device) if static.orography_stddev is not None else torch.zeros((ngrid,), dtype=dtype, device=device)
 
         # Land mask from the static descriptor (LDLAND).
         ldland = static.land_frac > 0.5
+        ktvl, ktvh = self._dominant_veg_types(static)
 
         inp = SoilMoistInputs(
             pwsam1m=state.soil_w_liq,
@@ -1451,7 +2102,7 @@ class LandSurface(nn.Module):
             ptsfc=ptsfc, ptsfl=ptsfl,
             pmsn=pmsn, pemssn=pemssn, pevapsnw=pevapsnw, peintti=peintti,
             ksoty=static.soil_type,
-            ktvl=static.veg_type, ktvh=static.veg_type,
+            ktvl=ktvl, ktvh=ktvh,
             psdor=psdor, ldland=ldland,
             ptmst=dt,
         )
@@ -1645,6 +2296,7 @@ class LandSurface(nn.Module):
         state: SurfState,
         snow_out: SnowOutputs,
         forcing: Forcing,
+        frac: torch.Tensor,
         dt: torch.Tensor,
         dtype: torch.dtype,
         device,
@@ -1662,7 +2314,7 @@ class LandSurface(nn.Module):
         Inputs come from the t-1 snow state (``PSSNM1M``, ``PRSNM1M``,
         ``PTSNM1M``), the new snow temperature ``PTSN`` and tile
         fraction / mask from the snow solve, and the surface forcing
-        (skin temperature ``PTSRF`` from the t-1 skin, surface wind
+        (lowest-level air temperature ``PTSRF``, surface wind
         ``PUSRF`` / ``PVSRF`` from ``forcing.u`` / ``forcing.v``, and the
         large-scale + convective snowfall ``PSSFL`` / ``PSSFC``).
 
@@ -1672,7 +2324,7 @@ class LandSurface(nn.Module):
             PRSNM1M  (snow density)      <- self._snow_density(state)
             PTSNM1M  (snow T)            <- state.snow_t (or RTT cold start)
             PTSN     (new snow T)        <- snow_out.ptsn
-            PTSRF    (surface T)         <- state.skin_t grid-mean
+            PTSRF    (lowest-level air T)<- forcing.t
             PUSRF/PVSRF (surface wind)   <- forcing.u / forcing.v
             PSSFL    (large-scale snow)  <- forcing.snow / dt
             PSSFC/PTSFC/PTSFL/PEVAPSNW   <- 0 (cold start)
@@ -1686,11 +2338,10 @@ class LandSurface(nn.Module):
         else:
             ptsnm1m = torch.ones_like(state.snow_w) * rtt
 
-        # Surface skin temperature (PTSRF): grid-mean of the per-tile
-        # skin T at t-1, matching the SRFSN_LWIMP surface-temperature
-        # input.  Equal-weight grid-mean is the cold-start convention
-        # (the port does not carry a separate radiative-skin field).
-        ptsrf = state.skin_t.mean(dim=-1)
+        # SRFSN_LWIMP receives PTSRF as the lowest-level air temperature
+        # from SURFTSTP (PT(:,KLEV)), not a tile-weighted skin temperature.
+        # This controls the density assigned to fresh snowfall.
+        ptsrf = forcing.t
         # No-snow mask: fall back to the snow-fraction test if the snow
         # solve did not populate LLNOSNOW (defensive; the solve always
         # sets it).
@@ -1698,6 +2349,7 @@ class LandSurface(nn.Module):
             llnosnow = snow_out.llnosnow
         else:
             llnosnow = snow_out.zfrsn < float(self.soil_table.consts.rfrsmall)
+        llnosnow = llnosnow | (snow_out.psstar <= 0.0)
 
         ptmst = dt if torch.is_tensor(dt) else torch.tensor(dt, dtype=dtype, device=device)
         zero1d = torch.zeros_like(state.snow_w)
@@ -1783,6 +2435,8 @@ class LandSurface(nn.Module):
         # snow solve exports it already-masked; fall back to zeros if not).
         pmsn = snow_out.pmsn if snow_out.pmsn is not None else \
             torch.zeros_like(state.snow_alb)
+        pmsnint = snow_out.pmsnint if snow_out.pmsnint is not None else \
+            torch.zeros_like(state.snow_alb)
 
         # Glacier-branch fields (only wired when PCIL is supplied -- the
         # sentinel that activates the full SRFSN_ASN scheme).
@@ -1802,6 +2456,7 @@ class LandSurface(nn.Module):
         ainp = SnowAlbedoInputs(
             pasnm1m=state.snow_alb,
             pmsn=pmsn,
+            pmsnint=pmsnint,
             pssflpssfc=pssflpssfc,
             llnosnow=llnosnow,
             ptmst=dt,
@@ -1829,8 +2484,11 @@ class LandSurface(nn.Module):
         Two-tier mapping (a simplification of the SURFRAD tile albedo
         scheme, ``surfrad_ctl_mod.F90`` 527-660):
 
-        * **Snow tiles** (TILE_LOW_VEG_SNOW, TILE_HIGH_VEG_SNOW) take the
-          snow albedo ``PASN`` (t-1 ``state.snow_alb``).
+        * **Low-vegetation snow tile** (TILE_LOW_VEG_SNOW) takes the snow
+          albedo ``PASN`` (t-1 ``state.snow_alb``).
+        * **High-vegetation snow tile** (TILE_HIGH_VEG_SNOW) takes the
+          SURFRAD snow-under-forest albedo table, keyed by high vegetation
+          type, rather than the open-snow ``PASN``.
         * **Wet-skin tile** (TILE_WET_SKIN) takes the wet background
           albedo ``albw``, falling back to the dry ``albd`` then 0.
         * **Dry vegetation / bare-soil tiles** take the dry background
@@ -1840,7 +2498,9 @@ class LandSurface(nn.Module):
           (Masson/Harman/Porson, ``canalb_mod.F90``), blended with the
           roof albedo via the road ratio ``RWRR`` (``surfrad_ctl_mod.F90``
           597-602).
-        * Water / ice tiles (and any unsupplied tile) stay 0.
+        * Water / ice tiles use explicit surface albedo fields when
+          available, otherwise fall back to the supplied background
+          albedo and only then to 0.
 
         **Activation gate**: when ``state.snow_alb`` is ``None`` AND
         ``static.albd`` / ``static.albw`` are both ``None`` AND no urban
@@ -1870,20 +2530,47 @@ class LandSurface(nn.Module):
 
         alpha = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
 
-        # Background albedo fields (broadcast (Ngrid,) -> per-tile).
+        # Background / explicit surface albedo fields (broadcast
+        # (Ngrid,) -> per-tile when present).
         albd = static.albd.to(dtype=dtype, device=device) \
             if static.albd is not None else None
         albw = static.albw.to(dtype=dtype, device=device) \
             if static.albw is not None else None
+        albwater = getattr(static, "water_alb", None)
+        albice = getattr(static, "ice_alb", None)
+        if albwater is not None:
+            albwater = albwater.to(dtype=dtype, device=device)
+        if albice is not None:
+            albice = albice.to(dtype=dtype, device=device)
 
-        # Snow tiles: PASN (t-1).  When snow_alb is unset the snow tiles
-        # fall through to the background (effectively 0 / albd).
+        # Water and ice tiles are physical surfaces in the Fortran
+        # driver, so do not leave them at zero when a dedicated field or
+        # a reasonable background fallback is available.
+        if ntile > TILE_WATER:
+            if albwater is not None:
+                alpha[:, TILE_WATER] = albwater
+            elif albw is not None:
+                alpha[:, TILE_WATER] = albw
+            elif albd is not None:
+                alpha[:, TILE_WATER] = albd
+        if ntile > TILE_ICE:
+            if albice is not None:
+                alpha[:, TILE_ICE] = albice
+            elif albw is not None:
+                alpha[:, TILE_ICE] = albw
+            elif albd is not None:
+                alpha[:, TILE_ICE] = albd
+
+        # Low-vegetation snow: PASN (t-1).  Snow under high vegetation is
+        # a forest-canopy snow albedo from SURFRAD, not the open-snow PASN.
         if has_snow:
             pasn = state.snow_alb.to(dtype=dtype, device=device)
             if ntile > TILE_LOW_VEG_SNOW:
                 alpha[:, TILE_LOW_VEG_SNOW] = pasn
             if ntile > TILE_HIGH_VEG_SNOW:
-                alpha[:, TILE_HIGH_VEG_SNOW] = pasn
+                alpha[:, TILE_HIGH_VEG_SNOW] = self._snow_forest_albedo(
+                    static, dtype, device
+                )
 
         # Background albedo for the non-snow tiles.  The wet-skin tile
         # prefers albw (falls back to albd then 0); the dry vegetation
@@ -1908,6 +2595,39 @@ class LandSurface(nn.Module):
                 forcing, static, dtype, device,
             )
         return alpha
+
+    def _snow_forest_albedo(
+        self,
+        static: Static,
+        dtype: torch.dtype,
+        device,
+    ) -> torch.Tensor:
+        """SURFRAD broadband albedo for snow under high vegetation."""
+        ngrid = static.tile_frac_base.shape[0]
+        # susrad_mod.F90 initialises RALB_SNOW_FOREST(type, uv/nir).
+        # The offline two-band setup uses an effective UV/Vis solar weight
+        # of 0.45976, inferred from the Fortran SURFRAD PALBTI output.
+        uv_weight = 0.45976
+        default_uv = 0.15 * 1.10598
+        default_nir = 0.15 * 0.90981
+        uv = torch.full((21,), default_uv, dtype=dtype, device=device)
+        nir = torch.full((21,), default_nir, dtype=dtype, device=device)
+        for veg_type, uv_val, nir_val in (
+            (3, 0.31, 0.24),
+            (4, 0.39, 0.27),
+            (5, 0.35, 0.27),
+            (6, 0.44, 0.33),
+            (18, 0.32, 0.25),
+            (19, 0.32, 0.25),
+        ):
+            uv[veg_type] = uv_val
+            nir[veg_type] = nir_val
+        if static.veg_type_high is None:
+            idx = torch.zeros((ngrid,), dtype=torch.long, device=device)
+        else:
+            idx = static.veg_type_high.to(device=device, dtype=torch.long)
+        idx = torch.clamp(idx, 0, 20)
+        return uv_weight * uv[idx] + (1.0 - uv_weight) * nir[idx]
 
     def _urban_canyon_albedo(
         self,
@@ -1960,10 +2680,12 @@ class LandSurface(nn.Module):
 
 
     def _cover_fractions(self, static: Static):
-        """Return canonical SURFBC cover inputs (PCVL, PCVH, PCIL, PLAIL, PLAIH).
+        """Return corrected SURFBC cover inputs (PCVL, PCVH, PCIL, PLAIL, PLAIH).
 
-        Activates only when ``static.cvl_frac`` is provided -- the
-        sentinel field for the faithful tile-split path.  Returns a
+        ``Static.cvl_frac`` / ``cvh_frac`` carry the raw climatological
+        covers PCVLC / PCVHC.  SURFBC first applies the PFT-dependent
+        RVCOV correction before it builds PFRTI; doing that here avoids
+        requiring callers to pre-correct cover fractions. Returns a
         5-tuple of ``(Ngrid,)`` tensors (PCIL / PLAIL / PLAIH fall back
         to zero / dominant-LAI when unset, so a caller can set just
         ``cvl_frac`` / ``cvh_frac`` for a minimal split).  Returns
@@ -1982,7 +2704,9 @@ class LandSurface(nn.Module):
             self.veg_table.gather("rvlai", ktvl)
         plaih = static.lai_high if static.lai_high is not None else \
             self.veg_table.gather("rvlai", ktvh)
-        return static.cvl_frac, static.cvh_frac, pcil, plail, plaih
+        pcvl = static.cvl_frac * self.veg_table.gather("rvcov", ktvl)
+        pcvh = static.cvh_frac * self.veg_table.gather("rvcov", ktvh)
+        return pcvl, pcvh, pcil, plail, plaih
 
     def _compute_tile_frac(
         self,
@@ -2028,7 +2752,8 @@ class LandSurface(nn.Module):
             ZPCVH = PCVH * (1 - PCUR - ZFRTIT)
             ZPCVB = 1 - ZPCVL - ZPCVH - PCUR - ZFRTIT
             PFRTI(3)  = ZCVW*(1-ZCVS)*(ZPCVL+ZPCVH+ZPCVB+PCUR)  # +PCUR
-            PFRTI(5)  = ZCVS*(ZPCVB+ZPCVL+PCUR+ZFRTIT)          # +PCUR
+            PFRTI(5)  = ZCVS*(ZPCVB+ZPCVL+ZFRTIT)               # low/bare/ice snow
+            PFRTI(7)  = ZCVS*(ZPCVH+PCUR)                       # urban snow joins high-snow pool
             PFRTI(10) = PCUR*(1-ZCVS)*(1-ZCVW)                  # urban
 
         The sum-to-one invariant is preserved by construction (the PCUR
@@ -2110,13 +2835,13 @@ class LandSurface(nn.Module):
         frac[:, TILE_LOW_VEG_DRY] = zpcvl * one_m_cvs * one_m_cvw
         # PFRTI(5) -- snow on low-veg / bare / ice (port index 4).  The
         # urban branch adds PCUR (surfbc_ctl_mod.F90:391).
-        low_snow_pool = (zpcvb + zpcvl + zfrtit) if pcur is None else \
-            (zpcvb + zpcvl + pcur + zfrtit)
+        low_snow_pool = zpcvb + zpcvl + zfrtit
         frac[:, TILE_LOW_VEG_SNOW] = zcvs * low_snow_pool
         # PFRTI(6) -- high-veg dry (port index 5).
         frac[:, TILE_HIGH_VEG_DRY] = zpcvh * one_m_cvs * one_m_cvw
         # PFRTI(7) -- snow under high veg (port index 6).
-        frac[:, TILE_HIGH_VEG_SNOW] = zcvs * zpcvh
+        high_snow_pool = zpcvh if pcur is None else (zpcvh + pcur)
+        frac[:, TILE_HIGH_VEG_SNOW] = zcvs * high_snow_pool
         # PFRTI(8) -- bare soil (port index 7).
         if ntile > TILE_BARE_SOIL:
             frac[:, TILE_BARE_SOIL] = zpcvb * one_m_cvs * one_m_cvw

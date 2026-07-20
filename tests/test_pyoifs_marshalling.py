@@ -126,7 +126,6 @@ def _build_fortran_buffers(*, N: int = 3, n_tile: int = 8, n_soil: int = 4):
         soil_type=torch.tensor([3, 5, 1][:N], dtype=torch.long),
         veg_type=torch.tensor([3, 7, 13][:N], dtype=torch.long),
         soil_thickness=torch.tensor([0.07, 0.21, 0.72, 1.89], dtype=dtype),
-        emis=torch.full((N,), 0.99, dtype=dtype),
     )
 
     # ---- Materialise as Fortran-order numpy buffers ------------------ #

@@ -222,13 +222,13 @@ class TestSnowScaling:
         for idx in [TILE_WET_SKIN, TILE_LOW_VEG_DRY,
                     TILE_HIGH_VEG_DRY, TILE_BARE_SOIL]:
             assert frac[:, idx].abs().max() < 1e-12
-        # Snow-low = ZCVS*(bare+low+ice) = 1.0*(0.2+0.4+0) = 0.6;
-        # snow-high = ZCVS*high = 1.0*0.4 = 0.4.
+        # SURFBC corrects PCVLC/PCVHC by RVCOV(type 3)=0.9, then the
+        # no-FLake branch uses PFRTI5=ZCVS*(1-PCVH), PFRTI7=ZCVS*PCVH.
         assert torch.allclose(frac[:, TILE_LOW_VEG_SNOW],
-                              torch.full((2,), 0.6, dtype=torch.float64),
+                              torch.full((2,), 0.64, dtype=torch.float64),
                               atol=1e-12)
         assert torch.allclose(frac[:, TILE_HIGH_VEG_SNOW],
-                              torch.full((2,), 0.4, dtype=torch.float64),
+                              torch.full((2,), 0.36, dtype=torch.float64),
                               atol=1e-12)
 
     def test_zero_snow_vanishes_snow_tiles(self):
@@ -298,7 +298,8 @@ class TestAnalyticValues:
     def test_no_snow_dry_skin_hand_values(self):
         """cvl=0.4, cvh=0.4, ice=0, ZCVS=0, ZCVW=0.
 
-        Expected: low-dry 0.4, high-dry 0.4, bare 0.2; everything else 0.
+        Expected after RVCOV(type 3)=0.9 correction: low-dry 0.36,
+        high-dry 0.36, bare 0.28; everything else 0.
         """
         m = _model()
         static = _make_static(cvl=0.4, cvh=0.4, ice_land=0.0)
@@ -306,9 +307,9 @@ class TestAnalyticValues:
         frac = m._tile_frac(static, 8, state=state)
         f = frac[0]
         assert f[TILE_WET_SKIN].item() == pytest.approx(0.0, abs=1e-12)
-        assert f[TILE_LOW_VEG_DRY].item() == pytest.approx(0.4, abs=1e-12)
-        assert f[TILE_HIGH_VEG_DRY].item() == pytest.approx(0.4, abs=1e-12)
-        assert f[TILE_BARE_SOIL].item() == pytest.approx(0.2, abs=1e-12)
+        assert f[TILE_LOW_VEG_DRY].item() == pytest.approx(0.36, abs=1e-12)
+        assert f[TILE_HIGH_VEG_DRY].item() == pytest.approx(0.36, abs=1e-12)
+        assert f[TILE_BARE_SOIL].item() == pytest.approx(0.28, abs=1e-12)
         assert f[TILE_LOW_VEG_SNOW].item() == pytest.approx(0.0, abs=1e-12)
         assert f[TILE_HIGH_VEG_SNOW].item() == pytest.approx(0.0, abs=1e-12)
         assert f[TILE_ICE].item() == pytest.approx(0.0, abs=1e-12)
@@ -320,12 +321,10 @@ class TestAnalyticValues:
         state = _make_state(snow_frac=0.0, skin_water=0.0)
         frac = m._tile_frac(static, 8, state=state)
         f = frac[0]
-        # ZFRTIT = 0.3; ZPCVL = 0.4*0.7 = 0.28; ZPCVH = 0.4*0.7 = 0.28;
-        # ZPCVB = 1 - 0.28 - 0.28 - 0.3 = 0.14.
         assert f[TILE_ICE].item() == pytest.approx(0.3, abs=1e-12)
-        assert f[TILE_LOW_VEG_DRY].item() == pytest.approx(0.28, abs=1e-12)
-        assert f[TILE_HIGH_VEG_DRY].item() == pytest.approx(0.28, abs=1e-12)
-        assert f[TILE_BARE_SOIL].item() == pytest.approx(0.14, abs=1e-12)
+        assert f[TILE_LOW_VEG_DRY].item() == pytest.approx(0.252, abs=1e-12)
+        assert f[TILE_HIGH_VEG_DRY].item() == pytest.approx(0.252, abs=1e-12)
+        assert f[TILE_BARE_SOIL].item() == pytest.approx(0.196, abs=1e-12)
 
 
 # --------------------------------------------------------------------------- #
@@ -359,7 +358,9 @@ class TestInterceptionCapacity:
         ktvl, ktvh = m._dominant_veg_types(static)
         wlmx = m._interception_capacity(static, frac, ktvl, ktvh)
         rwlmax = m.soil_table.consts.rwlmax
-        expected = rwlmax * (1.0 - 0.4 - 0.4 + 0.4 * 3.0 + 0.4 * 5.0)
+        pcvl = 0.4 * 0.9
+        pcvh = 0.4 * 0.9
+        expected = rwlmax * (1.0 - pcvl - pcvh + pcvl * 3.0 + pcvh * 5.0)
         assert torch.allclose(wlmx, torch.full((2,), float(expected),
                                                dtype=torch.float64),
                               atol=1e-12)
@@ -458,7 +459,7 @@ class TestVectorisation:
         frac = m._tile_frac(static, 8, state=state)
         # Column 1 (all bare): bare-soil tile = 1.
         assert frac[1, TILE_BARE_SOIL].item() == pytest.approx(1.0, abs=1e-12)
-        # Column 0 (cvl=cvh=0.4): low-dry = 0.4.
-        assert frac[0, TILE_LOW_VEG_DRY].item() == pytest.approx(0.4, abs=1e-12)
-        # Column 3 (cvl=0.5, cvh=0.3): bare = 0.2.
-        assert frac[3, TILE_BARE_SOIL].item() == pytest.approx(0.2, abs=1e-12)
+        # Column 0 (cvl=cvh=0.4): corrected low-dry = 0.36.
+        assert frac[0, TILE_LOW_VEG_DRY].item() == pytest.approx(0.36, abs=1e-12)
+        # Column 3 (cvl=0.5, cvh=0.3): corrected bare = 1 - 0.45 - 0.27 = 0.28.
+        assert frac[3, TILE_BARE_SOIL].item() == pytest.approx(0.28, abs=1e-12)

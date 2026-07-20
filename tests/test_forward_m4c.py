@@ -104,6 +104,13 @@ def _make_inputs(
 class TestM4cVdfdifhIntegration:
     """Pin the M4c VDFDIFH1S integration invariants."""
 
+    def test_coupled_mode_requires_external_vupdz0_boundary(self):
+        state, forcing, static, cfg = _make_inputs(N=2, with_z0=True)
+        cfg.vup_boundary_mode = "coupled"
+
+        with pytest.raises(ValueError, match="authoritative VUPDZ0"):
+            LandSurface(cfg)(state, forcing, static)
+
     def test_skin_t_is_ptsktip1(self):
         # new_state.skin_t must be the t+1 extrapolation, not the
         # instantaneous SEB skin T.  The offline single-column driver
@@ -178,7 +185,7 @@ class TestM4cVdfdifhIntegration:
             alphal=alphal, alphas=alphas,
             ssrfl_t=ssrfl_t, slrfl_grid=slrfl_grid,
             tskrad_grid=tskrad_grid, emis_grid=emis_grid,
-            plamsk=plamsk, tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
+            plamsk=plamsk, pevapsnw=torch.zeros_like(skin_t_prev), tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
             dt=forcing.dt, ntile=ntile, ngrid=N,
             dtype=cfg.dtype, device=state.skin_t.device,
         )
@@ -285,7 +292,7 @@ class TestM4cVdfdifhIntegration:
             alphal=alphal, alphas=alphas,
             ssrfl_t=ssrfl_t, slrfl_grid=slrfl_grid,
             tskrad_grid=tskrad_grid, emis_grid=emis_grid,
-            plamsk=plamsk, tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
+            plamsk=plamsk, pevapsnw=torch.zeros_like(skin_t_prev), tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
             dt=forcing.dt, ntile=ntile, ngrid=N,
             dtype=cfg.dtype, device=state.skin_t.device,
         )

@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from surf_pytorch import SurfConfig, ConstantBundle, LandSurface
+from surf_pytorch.config import TILE_WET_SKIN
 from surf_pytorch.state import Forcing, Static, SurfState
 from surf_pytorch.physics.seb import _tile_solar_transmission
 
@@ -84,6 +85,99 @@ def _make_inputs(
 class TestLandSurfaceForward:
     """End-to-end checks of the public ``LandSurface.forward`` API."""
 
+    def test_vsurf_uses_dynamic_lai_for_apparent_humidity(self):
+        """VSURF must use the forcing-time LAI, not the table default."""
+        from surf_pytorch.physics.stomata import jarvis_resistance
+        from surf_pytorch.utils import expand_as_tiles, qsat
+
+        state, forcing, static, cfg = _make_inputs(N=1)
+        static = dataclasses.replace(
+            static,
+            lai_low=torch.tensor([0.6], dtype=cfg.dtype),
+            lai_high=torch.tensor([1.4], dtype=cfg.dtype),
+        )
+        model = LandSurface(cfg)
+        frac = model._tile_frac(static, cfg.n_tile, state=state)
+        ktvl, ktvh = model._dominant_veg_types(static)
+        qs_skin = qsat(
+            state.skin_t,
+            expand_as_tiles(forcing.p_surf, cfg.n_tile),
+            model.consts,
+        )
+        praqti = torch.full_like(state.skin_t, 8000.0)
+
+        actual = model._vsurf_apparent_humidity(
+            forcing, static, state, frac, ktvl, ktvh, qs_skin, praqti,
+            cfg.n_tile,
+        )
+        jarvis = jarvis_resistance(
+            soil_t=state.soil_t, soil_w=state.soil_w_liq,
+            soil_type=static.soil_type, ktvl=ktvl, ktvh=ktvh,
+            t_air=forcing.t, q_air=forcing.q, p_surf=forcing.p_surf,
+            sw_down=forcing.fr_so / forcing.dt,
+            veg_table=model.veg_table, soil_table=model.soil_table,
+            root_table=model.root_table, consts=model.consts,
+            tile_frac=frac, n_tile=cfg.n_tile,
+            lai_low=static.lai_low, lai_high=static.lai_high,
+        )
+        expected_low = qs_skin[:, 3] + torch.minimum(
+            torch.zeros_like(forcing.q), forcing.q - qs_skin[:, 3],
+        ) * jarvis["pwetl"] / (jarvis["pwetl"] + praqti[:, 3])
+        expected_high = qs_skin[:, 5] + torch.minimum(
+            torch.zeros_like(forcing.q), forcing.q - qs_skin[:, 5],
+        ) * jarvis["pweth"] / (jarvis["pweth"] + praqti[:, 5])
+
+        assert torch.allclose(actual[:, 3], expected_low)
+        assert torch.allclose(actual[:, 5], expected_high)
+
+    def test_coupled_vup_z0_override_feeds_vexcs(self, monkeypatch):
+        import surf_pytorch.model as model_mod
+        from surf_pytorch.physics.exchange import ExchangeOutputs
+
+        state, forcing, static, cfg = _make_inputs(N=1)
+        cfg = dataclasses.replace(cfg, vup_boundary_mode="coupled")
+        ntile = cfg.n_tile
+        z0m = torch.linspace(0.01, 0.08, ntile, dtype=cfg.dtype).reshape(1, ntile)
+        z0h = torch.linspace(0.02, 0.09, ntile, dtype=cfg.dtype).reshape(1, ntile)
+        z0q = torch.linspace(0.03, 0.10, ntile, dtype=cfg.dtype).reshape(1, ntile)
+        zero_tile = torch.zeros((1, ntile), dtype=cfg.dtype)
+        forcing = dataclasses.replace(
+            forcing,
+            vupdz0_pustrti=zero_tile,
+            vupdz0_pvstrti=zero_tile,
+            vupdz0_pahfsti=zero_tile,
+            vupdz0_pevapti=zero_tile,
+            vupdz0_pbuomti=zero_tile,
+            vupdz0_pzdlti=zero_tile,
+            vupdz0_praqti=torch.ones((1, ntile), dtype=cfg.dtype),
+            vupdz0_z0mti=z0m,
+            vupdz0_z0hti=z0h,
+            vupdz0_z0qti=z0q,
+        )
+        seen = {}
+
+        def fake_vexcs(*args, **kwargs):
+            seen["z0m"] = args[9].reshape(1, ntile).clone()
+            seen["z0h"] = args[10].reshape(1, ntile).clone()
+            seen["z0q"] = args[11].reshape(1, ntile).clone()
+            n = args[0].shape[0]
+            one = torch.ones(n, dtype=cfg.dtype)
+            zero = torch.zeros(n, dtype=cfg.dtype)
+            return ExchangeOutputs(one, one, one, zero, zero, zero)
+
+        monkeypatch.setattr(model_mod, "compute_vexcs", fake_vexcs)
+        model = LandSurface(cfg)
+        model._per_tile_monin_obukhov_coeffs(forcing, static, state)
+
+        frac = model._tile_frac(static, ntile, state=state)
+        zblend = torch.tensor(10.0, dtype=cfg.dtype)
+        expected_z0m = zblend * torch.exp(
+            -1.0 / torch.sqrt((frac / torch.log(zblend / z0m).square()).sum(dim=-1))
+        )
+        assert torch.allclose(seen["z0m"], expected_z0m.unsqueeze(-1).expand_as(z0m))
+        assert torch.equal(seen["z0h"], z0h)
+        assert torch.equal(seen["z0q"], z0q)
+
     def test_output_shapes(self):
         state, forcing, static, cfg = _make_inputs(N=4)
         model = LandSurface(cfg)
@@ -94,6 +188,17 @@ class TestLandSurfaceForward:
         assert diag.e_flux.shape == (4,)
         assert diag.net_rad.shape == (4,)
         assert diag.ground_heat.shape == (4,)
+
+    def test_surfpp_replaces_inactive_tile_temperatures(self):
+        model = LandSurface(SurfConfig(dtype=torch.float64))
+        ptsktip1 = torch.tensor([[280.0, 281.0, 250.0, 282.0]], dtype=torch.float64)
+        frac = torch.tensor([[0.5, 0.0, 0.0, 0.5]], dtype=torch.float64)
+
+        result = model._surfpp_zero_tile_skin_t(ptsktip1, frac)
+
+        # Inactive tiles use the diagnostic mean, including wet skin.
+        assert result[0, 1] == pytest.approx(281.0)
+        assert result[0, TILE_WET_SKIN] == pytest.approx(281.0)
 
     def test_ocean_tile_pins_to_sst(self, atol_loose):
         # lambda_skin=LARGE for the water tile forces the *instantaneous*

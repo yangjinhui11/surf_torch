@@ -137,6 +137,7 @@ class SnowAlbedoInputs:
 
     # ---- Timestep ----
     ptmst: torch.Tensor         # PTMST  coupling interval  [s]   scalar
+    pmsnint: Optional[torch.Tensor] = None  # ZPMSNINT internal phase change [W/m^2]
 
     # ---- Glacier (land-ice) branch fields (optional, SRFSN_ASN) ----
     # When ``pcil`` is None the pure-land-snow legacy path is used; set
@@ -226,7 +227,6 @@ def _legacy_albedo(
     ralfmaxsn = float(sc.ralfmaxsn)   # 0.85  fresh-snow albedo
     rtauf = float(sc.rtauf)           # 0.24  melt decay rate [1/day]
     rtaua = float(sc.rtaua)           # 0.008 cold decay rate [1/day]
-    rsfresh = float(sc.rsfresh)       # 1/3600 fresh-snow reset threshold [kg/m^2/s]
     rday = consts.rday
 
     ptmst = inp.ptmst
@@ -243,6 +243,7 @@ def _legacy_albedo(
     # ------------------------------------------------------------------ #
     pasnm1m = inp.pasnm1m
     pmsn = inp.pmsn
+    pmsnint = inp.pmsnint if inp.pmsnint is not None else torch.zeros_like(pmsn)
     pssflpssfc = inp.pssflpssfc
     llnosnow = inp.llnosnow
 
@@ -255,7 +256,7 @@ def _legacy_albedo(
     # to ZALFMINSN = RALFMINSN in every case (RSNPER is not in the port's
     # constant set), so it is kept inert here.
     # ------------------------------------------------------------------ #
-    melt = pmsn > 0.0
+    melt = (pmsn > 0.0) | (pmsnint > 0.0)
     # Melt branch (line 355): exponential decay toward RALFMINSN.
     pasn_melt = (pasnm1m - zalfminsn) * zexpf + zalfminsn
     # Cold branch (line 357): linear decay, floored at RALFMINSN.
@@ -263,11 +264,13 @@ def _legacy_albedo(
     pasn_with = torch.where(melt, pasn_melt, pasn_cold)
 
     # ------------------------------------------------------------------ #
-    # Fresh-snow reset (SRFSN line 359): a snowfall rate above RSFRESH
-    # resets the albedo to RALFMAXSN.
+    # Fresh-snow brightening. The active offline SURF path calls SRFSN_ASN,
+    # whose land branch uses a linear approach to RALFMAXSN over 10 mm SWE,
+    # not the older SRFSN hard reset at RSFRESH.
     # ------------------------------------------------------------------ #
-    fresh = pssflpssfc > rsfresh
-    pasn_with = torch.where(fresh, zalfmaxsn, pasn_with)
+    snow_amt = torch.clamp(torch.clamp_min(pssflpssfc * ptmst, 0.0) / 10.0, max=1.0)
+    pasn_with = pasn_with + snow_amt * (zalfmaxsn - pasn_with)
+    pasn_with = torch.clamp(pasn_with, min=ralfminsn, max=ralfmaxsn)
 
     # ------------------------------------------------------------------ #
     # No-snow branch (SRFSN line 342): albedo resets to RALFMAXSN.
@@ -319,6 +322,7 @@ def _asn_albedo(
     # ------------------------------------------------------------------ #
     pasnm1m = inp.pasnm1m
     pmsn = inp.pmsn
+    pmsnint = inp.pmsnint if inp.pmsnint is not None else torch.zeros_like(pmsn)
     psnowf = inp.psnowf if inp.psnowf is not None else inp.pssflpssfc
     llnosnow = inp.llnosnow
     pcil = inp.pcil
@@ -335,7 +339,11 @@ def _asn_albedo(
     # ------------------------------------------------------------------ #
     # Land part ZASN_L (srfsn_asn_mod.F90:138-150).
     # ------------------------------------------------------------------ #
-    melt = pmsn > 0.0
+    # SRFSN_LWIMP uses a broader melting-condition proxy than SRFSN_ASN:
+    # PMSN > 0, internal melt/refreeze, or old snow temperature within 2 K
+    # of freezing.  The current port does not carry ZPMSNINT, but the
+    # temperature branch is required for the offline SURF path.
+    melt = (pmsn > 0.0) | (pmsnint > 0.0) | (ptsnm1m_top > (rtt - 2.0))
     pasn_melt = (pasnm1m - zalfminsn) * zexpf + zalfminsn
     pasn_cold = torch.clamp_min(pasnm1m - zlina, min=ralfminsn)
     zasn_l = torch.where(melt, pasn_melt, pasn_cold)

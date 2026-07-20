@@ -75,9 +75,10 @@ from ..tables.ritbl import (
 # --------------------------------------------------------------------------- #
 # Constants from YOS_EXC / YOS_EXCS that are not in PhysicalConstants.
 # --------------------------------------------------------------------------- #
-# Wind-speed floor for ZDU2 (REPDU2 in YOS_EXC).  Tiny value -- only
-# protects against zero wind at the lowest level.
-REPDU2 = 1.0e-12
+# Wind-speed floor for ZDU2 (REPDU2 in YOS_EXC). OpenIFS SURF
+# initialises this as (0.1 m/s)^2 in suvexc_mod.F90; using a much
+# smaller floor over-amplifies stable Richardson numbers in calm cases.
+REPDU2 = 1.0e-2
 
 # von Karman constant (RKAP in YOS_EXC).  48r1 default.
 RKAP = 0.4
@@ -440,3 +441,69 @@ __all__ = [
     "psimu", "psihu", "psims", "psihs",
     "REPDU2", "RKAP", "RPARZI", "RCHBHDL", "DEFAULT_KITT",
 ]
+
+def vexcss(
+    pu: torch.Tensor, pv: torch.Tensor, pt: torch.Tensor, pq: torch.Tensor,
+    paphms: torch.Tensor, pgeomlev: torch.Tensor, pcptgzlev: torch.Tensor,
+    pcpts: torch.Tensor, pqsam: torch.Tensor, pz0mm: torch.Tensor,
+    pz0hm: torch.Tensor, pz0qm: torch.Tensor, pbuom: torch.Tensor,
+    consts: ConstantBundle, ptmst: torch.Tensor, rvdifts: float = 1.0,
+) -> ExchangeOutputs:
+    """Offline OSM ``VEXCSS`` exchange coefficients.
+
+    Fortran ``VEXCSS`` forms C-star coefficients already scaled by
+    ``RG * PTMST * PRVDIFTS`` for the VDF driver.  The public Python
+    exchange contract is instead the physical ``rho*C*|U|`` coefficient,
+    shared with :func:`vexcs`; the VDF scaling is applied once later when
+    building ``DiffusionInputs``.
+    """
+    rlpbb = 5.0
+    rlpcc = 5.0
+    rlpdd = 5.0
+    g = consts.g
+    rd = consts.rd
+    retv = consts.retv
+    rvtmp2 = consts.rvtmp2
+    zdu2 = torch.maximum(
+        pu.square() + pv.square()
+        + torch.where(pbuom > 0.0, (pbuom * RPARZI).clamp_min(0.0).pow(2.0 / 3.0), torch.zeros_like(pbuom)),
+        torch.full_like(pu, REPDU2),
+    )
+    qsam = torch.minimum(pqsam, torch.full_like(pqsam, 0.1))
+    zdiv1 = 1.0 / (pcptgzlev + pcpts - pgeomlev)
+    zdro = 2.0 * (pcptgzlev - pcpts) * zdiv1 - (rvtmp2 - retv) * (pq - qsam)
+    zri = pgeomlev * zdro / zdu2
+    znlev = pgeomlev / g + pz0mm
+    lnm = torch.log(znlev / pz0mm)
+    lnh = torch.log(znlev / pz0hm)
+    lnq = torch.log(znlev / pz0qm)
+    cdnm = 1.0 / lnm.square()
+    cdnh = 1.0 / (lnm * lnh)
+    cdnq = 1.0 / (lnm * lnq)
+    stable = zri > 0.0
+    z2s_st = torch.sqrt(1.0 + rlpdd * zri)
+    fm_st = cdnm * z2s_st / (z2s_st + 2.0 * rlpbb * zri)
+    fh_st = cdnh / (1.0 + 3.0 * rlpbb * zri * z2s_st)
+    fq_st = cdnq / (1.0 + 3.0 * rlpbb * zri * z2s_st)
+    z2s_un = torch.sqrt(torch.maximum(-zri, torch.full_like(zri, 1.0e-3)))
+    zcm = rlpcc * torch.sqrt(znlev / pz0mm)
+    zch = rlpcc * torch.sqrt(znlev / pz0hm)
+    zcq = rlpcc * torch.sqrt(znlev / pz0qm)
+    zrk3b = RKAP**2 * 3.0 * rlpbb
+    fm_un = cdnm * (1.0 - 2.0 * rlpbb * zri / (1.0 + zrk3b * cdnm * zcm * z2s_un))
+    fh_un = cdnh * (1.0 - 3.0 * rlpbb * zri / (1.0 + zrk3b * cdnh * zch * z2s_un))
+    fq_un = cdnq * (1.0 - 3.0 * rlpbb * zri / (1.0 + zrk3b * cdnq * zcq * z2s_un))
+    # Fortran VEXCSS computes
+    #   ZAUX2 = (PRVDIFTS*PTMST*RG) * rho * |U| * RKAP**2
+    # and multiplies PCFM/PCFH/PCFQ by ZAUX2.  The rest of this port
+    # expects physical rho*C*|U| and applies the VDF scaling exactly once
+    # in model.py, so undo the C-star time/gravity scaling here.
+    aux = (rvdifts * ptmst * g / rd * paphms) / (pt * (1.0 + retv * pq))
+    cstar_scale = aux * torch.sqrt(zdu2) * RKAP**2
+    scale = cstar_scale / (rvdifts * ptmst * g)
+    pcfm = scale * torch.where(stable, fm_st, fm_un)
+    pcfh = scale * torch.where(stable, fh_st, fh_un)
+    pcfq = scale * torch.where(stable, fq_st, fq_un)
+    zero = torch.zeros_like(pcfm)
+    return ExchangeOutputs(pcfm=pcfm, pcfh=pcfh, pcfq=pcfq, pkh=zero, pkc=zero, pzdl=zero)
+

@@ -61,6 +61,7 @@ from surf_pytorch import SurfConfig, ConstantBundle, LandSurface
 from surf_pytorch.state import Forcing, Static, SurfState
 from surf_pytorch.utils import qsat, dqsat_dt_ifs, expand_as_tiles, scatter_to_tiles
 from surf_pytorch.tables import VegTable
+from surf_pytorch.config import TILE_BARE_SOIL
 
 try:
     from offline_driver import SurfRef
@@ -203,28 +204,26 @@ def _reference_exchange(
         return g.unsqueeze(-1).expand(ngrid, ntile).reshape(-1)
 
     if cfg.per_tile_exchange:
-        frac = model._tile_frac(static, ntile)
-        ktvl, ktvh = model._dominant_veg_types(static)
-        # Per-tile surface state (kept per-tile -- NOT scattered to grid).
-        pcpts = (cp * state.skin_t).reshape(-1)
-        p_surf_t = expand_as_tiles(forcing.p_surf, ntile)
-        pqsam = qsat(state.skin_t, p_surf_t, consts).reshape(-1)
-        z0m, z0h, z0q = model._per_tile_z0(
-            static, frac, ktvl, ktvh, ntile, dtype, device,
-        )
-        pcptgzlev_g = cp * forcing.t + forcing.geom1
-        out = ref.vexcs(
-            _rep(forcing.u), _rep(forcing.v), _rep(forcing.t), _rep(forcing.q),
-            _rep(forcing.p_surf), _rep(forcing.geom1), _rep(pcptgzlev_g),
-            pcpts, pqsam,
-            z0m.reshape(-1), z0h.reshape(-1), z0q.reshape(-1),
-            _rep(buom), _rep(ucurr), _rep(vcurr), _rep(i10fgcv),
-            consts, kitt=cfg.vexcs_kitt, ldinit=True,
-        )
-        return (
-            out.pcfh.reshape(ngrid, ntile),
-            out.pcfq.reshape(ngrid, ntile),
-        )
+        import surf_pytorch.model as model_mod
+
+        original_compute_vexcs = model_mod.compute_vexcs
+
+        def _ref_compute_vexcs(*args, **kwargs):
+            return ref.vexcs(
+                *args[:12], args[13], args[14], args[15], args[16], args[17],
+                pzdl0=args[12],
+                kitt=kwargs.get("kitt", cfg.vexcs_kitt),
+                ldinit=kwargs.get("ldinit", True),
+            )
+
+        ref_model = LandSurface(cfg)
+        model_mod.compute_vexcs = _ref_compute_vexcs
+        try:
+            return ref_model._per_tile_monin_obukhov_coeffs(
+                forcing, static, state, skin_t=state.skin_t,
+            )
+        finally:
+            model_mod.compute_vexcs = original_compute_vexcs
 
     # Grid-mean legacy path.
     frac = model._tile_frac(static, ntile)
@@ -331,13 +330,39 @@ def _reference_assembly(
 
     # --- Section 5 (radiation glue) ------------------------------------
     dt = forcing.dt
-    ssrfl_grid = forcing.fr_so / dt
+    srfd_grid = forcing.fr_so / dt
     slrfl_grid = forcing.fr_th / dt
-    ssrfl_t = expand_as_tiles(ssrfl_grid, ntile)
-    frac = model._tile_frac(static, ntile)
-    tskrad_grid = scatter_to_tiles(state.skin_t, frac)
-    emis_grid = static.emis if static.emis is not None else \
-        torch.full((ngrid,), 0.99, dtype=dtype, device=device)
+    frac = model._tile_frac(static, ntile, state=state)
+    alpha_t = model._surface_albedo(state, static, forcing, ntile, dtype, device)
+    grid_albedo = (frac * alpha_t).sum(dim=1)
+    ssrfl_grid = srfd_grid * (1.0 - grid_albedo)
+    one_minus_grid_albedo = 1.0 - grid_albedo
+    ssrfl_raw = (
+        ((1.0 - alpha_t) / one_minus_grid_albedo.unsqueeze(1))
+        * ssrfl_grid.unsqueeze(1)
+    )
+    ssrfl_capped = torch.minimum(
+        ssrfl_raw,
+        torch.as_tensor(700.0, dtype=dtype, device=device),
+    )
+    high_ssr = (ssrfl_raw > 700.0).any(dim=1)
+    ssrfl_sum = (frac * ssrfl_capped).sum(dim=1)
+    ssrfl_rescaled = ssrfl_capped * (ssrfl_grid / ssrfl_sum).unsqueeze(1)
+    ssrfl_t = torch.where(high_ssr.unsqueeze(1), ssrfl_rescaled, ssrfl_capped)
+    tskrad_grid = (
+        forcing.radiative_skin_t.to(dtype=dtype, device=device)
+        if forcing.radiative_skin_t is not None
+        else (
+            state.radiative_skin_t.to(dtype=dtype, device=device)
+            if state.radiative_skin_t is not None
+            else scatter_to_tiles(state.skin_t, frac)
+        )
+    )
+    emis_grid = (
+        static.emis.to(dtype=dtype, device=device)
+        if static.emis is not None
+        else model._surface_emissivity(state, static, frac, dtype, device)
+    )
 
     # --- Section 6 (assemble DiffusionInputs; VDFDIFH1S run by caller) -
     # The VDFDIFH1S wrapper builds the Dirichlet forcing internally
@@ -351,6 +376,11 @@ def _reference_assembly(
     # This makes the alpha closure a genuine part of the e2e comparison:
     # the SEB's PCSAT/PCAIR are now independently Fortran-derived, not the
     # same Python build_tile_vevap both sides would otherwise share.
+    from surf_pytorch.config import (
+        TILE_WET_SKIN, TILE_LOW_VEG_DRY, TILE_HIGH_VEG_DRY,
+        TILE_HIGH_VEG_SNOW, TILE_BARE_SOIL, TILE_URBAN,
+    )
+
     jarvis_ref = ref.stomata(
         state.soil_t, state.soil_w_liq, static.soil_type,
         ktvl, ktvh, forcing.t, forcing.q, forcing.p_surf, ssrfl_grid,
@@ -370,7 +400,7 @@ def _reference_assembly(
     # verified against ref.stomata to last ULP (test_stomata_ref.py), so
     # reusing the port value here does not weaken the independence of the
     # Farquhar kernel comparison.
-    if cfg.use_farquhar:
+    if cfg.use_farquhar and cfg.use_ags:
         from surf_pytorch.physics.stomata import jarvis_resistance as _jarvis_port
         jarvis_port = _jarvis_port(
             soil_t=state.soil_t, soil_w=state.soil_w_liq,
@@ -380,38 +410,47 @@ def _reference_assembly(
             soil_table=model.soil_table, root_table=model.root_table,
             consts=consts, tile_frac=frac, n_tile=ntile,
         )
-        fq_ref = ref.farquhar(
-            sw_down=ssrfl_grid, p_surf=forcing.p_surf,
-            qs_skin=qskm1m[:, 0], qsurf=qskm1m[:, 0],
-            q_air=forcing.q, t_air=forcing.t,
-            skin_t=skin_t_prev[:, 0], t_soil=skin_t_prev[:, 0],
-            f2=jarvis_port["f2l"], co2=forcing.co2, lai=jarvis_port["lail"],
-            kvtype=ktvl,
-            kco2typ=veg.gather("nco2typ", ktvl).to(device=device),
-            ldland=(static.land_frac > 0),
-            veg=veg, consts=consts, lskin_temp=True,
-        )
+
+        def _fq_ref(tile, kvtype, lai, f2):
+            return ref.farquhar(
+                sw_down=ssrfl_grid, p_surf=forcing.p_surf,
+                qs_skin=qskm1m[:, tile], qsurf=qskm1m[:, tile],
+                q_air=forcing.q, t_air=forcing.t,
+                skin_t=skin_t_prev[:, tile], t_soil=skin_t_prev[:, tile],
+                f2=f2, co2=forcing.co2, lai=lai,
+                kvtype=kvtype,
+                kco2typ=veg.gather("nco2typ", kvtype).to(device=device),
+                ldland=(static.land_frac > 0),
+                veg=veg, consts=consts, lskin_temp=True,
+            )
+
+        fq_low_ref = _fq_ref(
+            TILE_LOW_VEG_DRY, ktvl, jarvis_port["lail"], jarvis_port["f2l"])
+        fq_high_ref = _fq_ref(
+            TILE_HIGH_VEG_DRY, ktvh, jarvis_port["laih"], jarvis_port["f2h"])
+        fq_high_snow_ref = _fq_ref(
+            TILE_HIGH_VEG_SNOW, ktvh, jarvis_port["laih"], jarvis_port["f2h"])
+
         rcondctmin = veg.farquhar_consts.rcondctmin
-        pwet_fq = 1.0 / torch.clamp(fq_ref["pgstot"], min=rcondctmin)
         resist_ref = {
-            "pwetl": pwet_fq, "pweth": pwet_fq, "pweths": pwet_fq,
+            "pwetl": 1.0 / torch.clamp(fq_low_ref["pgstot"], min=rcondctmin),
+            "pweth": 1.0 / torch.clamp(fq_high_ref["pgstot"], min=rcondctmin),
+            "pweths": 1.0 / torch.clamp(fq_high_snow_ref["pgstot"], min=rcondctmin),
             "pwetb": jarvis_ref["pwetb"],      # upstream vsurf:687 keeps Jarvis
             "pwetlu": jarvis_ref["pwetlu"],
         }
     else:
         resist_ref = jarvis_ref
+
+
     # Mirror the port's _interception_capacity (WLMX per column).
     wlmx_grid = model._interception_capacity(static, frac, ktvl, ktvh)
-    t_sub_grid = tsrf[:, 0]
+    t_sub_grid = tsrf
     vegc = veg.consts
     # Per-tile VEVAP via the Fortran kernel.  We build the (Ngrid, Ntile)
     # PCSAT / PCAIR tensors the same way the port's build_tile_vevap does,
     # but each active tile's values come from ref.vevap instead of the
     # port's vevap().
-    from surf_pytorch.config import (
-        TILE_WET_SKIN, TILE_LOW_VEG_DRY, TILE_HIGH_VEG_DRY,
-        TILE_HIGH_VEG_SNOW, TILE_BARE_SOIL, TILE_URBAN,
-    )
     from surf_pytorch.physics.stomata import (
         KTILE_WET_SKIN, KTILE_LOW_VEG_DRY, KTILE_HIGH_VEG_DRY,
         KTILE_HIGH_VEG_SNOW, KTILE_BARE_SOIL, KTILE_URBAN,
@@ -430,7 +469,8 @@ def _reference_assembly(
             rhocqu=rhoc_q_t[:, jt], p_surf=forcing.p_surf,
             t_air=forcing.t, q_air=forcing.q,
             qs_skin=qskm1m[:, jt], skin_t=skin_t_prev[:, jt],
-            t_sub=t_sub_grid, wlmx=wlmx_grid, consts=consts,
+            t_sub=t_sub_grid[:, jt] if t_sub_grid.dim() == 2 else t_sub_grid,
+            wlmx=wlmx_grid, consts=consts,
             ptmst=ptmst_scalar,
             rlhaero=vegc.rlhaero, rlhaeros=vegc.rlhaeros,
         )
@@ -548,22 +588,15 @@ def test_forward_matches_fortran_assembly(ref, veg, seed):
     inp_ref = _reference_assembly(model, state, forcing, static, ref, veg)
     out_ref = ref.vdfdifh(inp_ref, veg, consts, cfg)
 
-    # (1) Skin-T advance: port new_state.skin_t (PTSKTIP1) vs the
-    #     reference PTSKTIP1, in ULP.
-    #
-    # The threshold is loose (2000 ULP ~= 4e-13 K) because the alpha
-    # closure is now computed independently on each side (port's
-    # jarvis_resistance + build_tile_vevap vs the .so's surf_ref_stomata
-    # + per-tile surf_ref_vevap), and a single-ULP round-off in alpha
-    # (~1e-16) is amplified ~500x by the SEB's iterative implicit solve.
-    # A genuine assembly bug (wrong field wired, missing broadcast, sign
-    # error) produces O(1) ULP errors many orders of magnitude larger, so
-    # this bound still catches them while tolerating the legitimate
-    # alpha-recompute noise.  The flux check below is unaffected: fluxes
-    # are not iterated, so they stay at the ~1e-12 relative level.
-    ulp = (new_state.skin_t - out_ref.ptsktip1).abs().max().item() / np.finfo(np.float64).eps
+    # (1) Skin-T advance: forward() stores the SURFPP-written PTSKTI,
+    #     not the raw VDFDIFH1S PTSKTIP1. SURFPP only changes zero-area
+    #     tiles, replacing their skin temperature with the area-weighted
+    #     mean used by OpenIFS before the next tile-fraction update.
+    frac = model._tile_frac(static, cfg.n_tile, state=state)
+    ref_skin_t = model._surfpp_zero_tile_skin_t(out_ref.ptsktip1, frac)
+    ulp = (new_state.skin_t - ref_skin_t).abs().max().item() / np.finfo(np.float64).eps
     assert ulp < 2000.0, (
-        f"seed={seed}: skin-T |port-ref|max={ulp:.2f} ULP"
+        f"seed={seed}: SURFPP skin-T |port-ref|max={ulp:.2f} ULP"
     )
 
     # (2) Every per-tile diagnostic flux, relative tolerance.
@@ -609,6 +642,7 @@ def test_forward_farquhar_matches_fortran_assembly(ref, veg, seed):
     """
     state, forcing, static, cfg = _make_inputs(N=4, seed=seed)
     cfg.use_farquhar = True
+    cfg.use_ags = True
     model = LandSurface(cfg)
     consts = model.consts
 
@@ -617,9 +651,11 @@ def test_forward_farquhar_matches_fortran_assembly(ref, veg, seed):
     inp_ref = _reference_assembly(model, state, forcing, static, ref, veg)
     out_ref = ref.vdfdifh(inp_ref, veg, consts, cfg)
 
-    ulp = (new_state.skin_t - out_ref.ptsktip1).abs().max().item() / np.finfo(np.float64).eps
+    frac = model._tile_frac(static, cfg.n_tile, state=state)
+    ref_skin_t = model._surfpp_zero_tile_skin_t(out_ref.ptsktip1, frac)
+    ulp = (new_state.skin_t - ref_skin_t).abs().max().item() / np.finfo(np.float64).eps
     assert ulp < 2000.0, (
-        f"farquhar seed={seed}: skin-T |port-ref|max={ulp:.2f} ULP"
+        f"farquhar seed={seed}: SURFPP skin-T |port-ref|max={ulp:.2f} ULP"
     )
 
     for diag_field, seb_field in _DIAG_FROM_SEB.items():

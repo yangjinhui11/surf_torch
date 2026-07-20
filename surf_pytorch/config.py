@@ -106,10 +106,22 @@ class SurfConfig:
     # tile uses a prescribed SST.
     use_kpp: bool = False
 
-    # When True, the Farquhar photosynthesis / stomatal resistance
-    # model is invoked; otherwise the Jarvis scheme is used (rsmin
-    # table + stress functions, default for the offline driver).
+    # When True, run the Farquhar photosynthesis model and expose its
+    # carbon-flux diagnostics.  This mirrors LEFARQUHAR.  Its canopy
+    # conductance affects moisture fluxes only when use_ags is also True.
     use_farquhar: bool = False
+
+    # When True, feed the canopy resistance returned by COTWORESTRESS
+    # into VEVAP (LEAGS).  This is intentionally independent of
+    # use_farquhar: OpenIFS permits LEFARQUHAR=.TRUE., LEAGS=.FALSE.,
+    # which computes carbon diagnostics while retaining Jarvis PWET*.
+    use_ags: bool = False
+
+    # LESN09 selects the cy40+ snow constants in several SURF helper
+    # routines.  OpenIFS 48r1 offline SURF prints LESN09=T by default;
+    # VLAMSK uses it to choose RQSNCR=1/10 m for the forest-snow
+    # stability cap.
+    lesn09: bool = True
 
     # When True, the VDFDIFH1S snow-melt repeat (call #4, LESNML) is
     # invoked whenever a low-veg-snow tile is at melting point; this
@@ -124,6 +136,12 @@ class SurfConfig:
     # the infiltration-limit formulation is used.  The offline-driver
     # default is VIC.
     lessro: bool = True
+
+    # When True, use the OpenIFS offline default LESOILCOND path in SRFT:
+    # temperature-dependent freeze fraction plus the FSOILTCOND statement
+    # function.  Set False only for the older SURF_REF_SOILT regression
+    # helper, which transcribes the legacy ZFF=0 conductivity block.
+    lesoilcond: bool = True
 
     # ----- Differentiability -----
     # When False (default), every physics routine runs under no_grad
@@ -158,6 +176,24 @@ class SurfConfig:
     # scripts/diag_forward_assembly.py).  Set False to fall back to the
     # legacy single grid-mean VEXCS broadcast across tiles.
     per_tile_exchange: bool = True
+
+    # ``offline`` owns the ported OSM VUPDZ0/VDFMAIN1S closure.
+    # ``coupled`` requires authoritative tiled atmospheric-VDF fields.
+    # No approximate VUP boundary mode is retained.
+    vup_boundary_mode: str = "offline"
+    # Optional standalone-stability guard for long offline integrations
+    # from artificial initial states. None preserves the strict Fortran
+    # transcription. A value such as 100 K prevents the single-layer
+    # thin-snow branch from carrying non-physical snow temperatures into
+    # the next VUPDZ0/VSURF step.
+    snow_temperature_floor: Optional[float] = None
+
+    # Longwave-radiation switches mirrored from SURFSEB/SURFTSTP.
+    # LELWDD controls dLW/dT linearisation around the radiation skin
+    # temperature; LELWTL recomputes tiled LW and must also feed tiled
+    # PSLRFLTI into the full SURFTSTP snow path.
+    lelwdd: bool = True
+    lelwtl: bool = False
 
     # ----- Validation -----
     # When True, the model asserts invariants (tile fractions sum to 1,

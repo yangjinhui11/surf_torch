@@ -77,6 +77,9 @@ _ZLAMBDAO = 2.0
 _ZQ = 0.4
 _ZLAMBDASM = _ZLAMBDAQ**_ZQ * _ZLAMBDAO ** (1.0 - _ZQ)
 _ZRCGDRY = 1.6e6
+# SUSSOIL uses ``0.947*ZRHOD`` without a ``_JPRB`` suffix.  That literal is
+# rounded as default real before promotion in the double-precision build.
+_ZDRY_DENOM_COEFF = float(np.float32(0.947))
 
 # class-agnostic soil constants (RLAMBDAICE / RLAMBDAWAT / RKERST*)
 RLAMBDAICE = 2.2
@@ -126,8 +129,10 @@ def _derived_soil(levgen: bool = True) -> Dict[str, np.ndarray]:
     eps = _eps_machine()
 
     # RDMAXM / RDMINM -- mirror the JPRD arithmetic of sussoil (lines 357-371)
-    wfac = np.sign(
-        np.maximum(np.abs(wsat - wrestm), eps), (wsat - wrestm)
+    # Fortran SIGN(MAX(ABS(WSAT-WREST), EPS), WSAT-WREST).
+    # np.sign's second positional argument is ``out``, not a sign source.
+    wfac = np.copysign(
+        np.maximum(np.abs(wsat - wrestm), eps), wsat - wrestm
     )
     zwmax = 0.999 * wsat
     zsemax = (zwmax - wrestm) / wfac
@@ -152,7 +157,7 @@ def _derived_soil(levgen: bool = True) -> Dict[str, np.ndarray]:
 
     # thermal constants (sussoil 426-433)
     rhod = (1.0 - wsat) * _ZRHOSM
-    rlambdadrym = (0.135 * rhod + 64.7) / (_ZRHOSM - 0.947 * rhod)
+    rlambdadrym = (0.135 * rhod + 64.7) / (_ZRHOSM - _ZDRY_DENOM_COEFF * rhod)
     rlamsat1m = _ZLAMBDASM ** (1.0 - wsat)
     rrcsoilm = (1.0 - wsat) * _ZRCGDRY + wcapm * 4.18e6  # RGH2O = 4.18e6
 

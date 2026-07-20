@@ -278,16 +278,15 @@ def _density_core(
     # 3.1 NEW SNOW DENSITY (SRFSN_LWIMP lines 494-527).
     # ------------------------------------------------------------------ #
     # Fresh-snow density (lines 498-500).
-    windspeed = torch.sqrt(pusrf ** 2 + pvsrf ** 2)
+    wind_sq = pusrf ** 2 + pvsrf ** 2
     zrhominsn = rhominsna + rhominsnb * (ptsrf - zt0) \
-        + rhominsnc * windspeed ** 0.25
+        + rhominsnc * wind_sq ** 0.25
     zrhominsn = torch.clamp(zrhominsn, min=rhominsnd)
 
     # Depth-weighted mixing of old pack + fresh snow (lines 506-508).
     zssf = (pssfl + pssfc) * ptmst            # snowfall over the interval
-    zssf_safe = torch.clamp(zssf, min=zeps)
     prsnm1m_safe = torch.clamp(prsnm1m, min=zeps)
-    denom = zssf_safe / torch.clamp(zrhominsn, min=zeps) + pssnm1m / prsnm1m_safe
+    denom = zssf / torch.clamp(zrhominsn, min=zeps) + pssnm1m / prsnm1m_safe
     zrstar = (pssnm1m + zssf) / torch.clamp(denom, min=zeps)
 
     # Overburden compaction (lines 511-512).

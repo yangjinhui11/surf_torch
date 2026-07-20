@@ -63,7 +63,7 @@ def consts() -> ConstantBundle:
 
 @pytest.fixture
 def config() -> SurfConfig:
-    return SurfConfig(dtype=torch.float64)
+    return SurfConfig(dtype=torch.float64, lesoilcond=False)
 
 
 def requires_fortran_ref():

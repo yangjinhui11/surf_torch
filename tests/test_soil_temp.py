@@ -70,6 +70,26 @@ def config() -> SurfConfig:
     return SurfConfig(dtype=torch.float64)
 
 
+def _thermal_conductivity_for_tests(
+    pwsam1m: torch.Tensor,
+    wsat: torch.Tensor,
+    lambdadry: torch.Tensor,
+    lamsat1: torch.Tensor,
+    land: torch.Tensor,
+    soil_consts: SoilConstants,
+    nlevs: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    ptsam1m = torch.full_like(pwsam1m, 285.0)
+    return _thermal_conductivity(
+        pwsam1m, ptsam1m, wsat, lambdadry, lamsat1, land, soil_consts,
+        274.16, 272.16, 273.16, 1.5707963267948966,
+        nlevs, dtype, device,
+        lesoilcond=False,
+    )
+
+
 def _tile_frac(N: int, T: int, *, dtype=torch.float64) -> torch.Tensor:
     """Equal-tile fractions summing to 1 over the T tiles."""
     fr = torch.full((N, T), 1.0 / T, dtype=dtype)
@@ -307,7 +327,7 @@ class TestSoilTempThermalConductivity:
         pwsam1m = torch.full((N, L), rkerst1 * wsat[0].item(), dtype=torch.float64)
         land = torch.ones(N, dtype=torch.bool)
 
-        zdif = _thermal_conductivity(
+        zdif = _thermal_conductivity_for_tests(
             pwsam1m, wsat, lambdadry, lamsat1, land.to(torch.float64),
             soil_table.consts, L, torch.float64, pwsam1m.device,
         )
@@ -325,7 +345,7 @@ class TestSoilTempThermalConductivity:
         pwsam1m = torch.full((N, L), 0.3, dtype=torch.float64)
         land = torch.zeros(N, dtype=torch.bool)
 
-        zdif = _thermal_conductivity(
+        zdif = _thermal_conductivity_for_tests(
             pwsam1m, wsat, lambdadry, lamsat1, land.to(torch.float64),
             soil_table.consts, L, torch.float64, pwsam1m.device,
         )

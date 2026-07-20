@@ -203,6 +203,41 @@ class TestSoilMoistVanGenuchten:
         torch.testing.assert_close(zk, wconsm)
         torch.testing.assert_close(zd, dmax)
 
+    def test_saturated_branch_does_not_evaluate_invalid_mid_powers(
+        self, soil_table: SoilTable,
+    ):
+        """Super-saturated W must follow the Fortran saturated branch.
+
+        PyTorch evaluates torch.where branches eagerly; without guarding the
+        middle-branch Van Genuchten powers, W > WSAT evaluates fractional
+        powers of negative intermediates and produces NaN before selection.
+        """
+        ksoty = torch.tensor([2], dtype=torch.long)
+        wsat = soil_table.gather("wsat", ksoty)
+        wrest = soil_table.gather("wrest", ksoty)
+        wconsm = soil_table.gather("wconsm", ksoty)
+        mvgalpha = soil_table.gather("mvgalpha", ksoty)
+        mfac = soil_table.gather("mfac", ksoty)
+        lam = getattr(soil_table, "lambda")[ksoty]
+        dmax = soil_table.gather("dmax", ksoty)
+        dmin = soil_table.gather("dmin", ksoty)
+
+        w_super_sat = 1.05 * wsat
+        zk, zd = _vg_hydraulics(
+            w_super_sat, wsat, wrest, wconsm, mvgalpha, mfac, lam,
+            dmax, dmin, 1e-14,
+        )
+        zkm, _ = _vg_hydraulics_toponly(
+            w_super_sat, wsat, wrest, wconsm, mvgalpha, mfac, lam, 1e-14,
+        )
+
+        assert bool(torch.isfinite(zk).all())
+        assert bool(torch.isfinite(zd).all())
+        assert bool(torch.isfinite(zkm).all())
+        torch.testing.assert_close(zk, wconsm)
+        torch.testing.assert_close(zd, dmax)
+        torch.testing.assert_close(zkm, wconsm)
+
     def test_midrange_matches_closed_form(
         self, soil_table: SoilTable, consts: ConstantBundle,
     ):

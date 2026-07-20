@@ -205,9 +205,13 @@ class TestFreshSnowReset:
         ptmst = 3600.0
         pasnm1m = 0.80
         zexpf = math.exp(-rtauf * ptmst / rday)
-        expected = (pasnm1m - ralfminsn) * zexpf + ralfminsn
+        base = (pasnm1m - ralfminsn) * zexpf + ralfminsn
+        snowfall = 0.1 * rsfresh
+        snow_amt = min(max(snowfall * ptmst, 0.0) / 10.0, 1.0)
+        _, ralfmaxsn, _, _, _, _ = _consts()
+        expected = base + snow_amt * (ralfmaxsn - base)
         inp = _make_inputs(
-            pasnm1m=pasnm1m, pmsn=1e-4, pssflpssfc=0.1 * rsfresh,
+            pasnm1m=pasnm1m, pmsn=1e-4, pssflpssfc=snowfall,
         )
         pasn = _run(inp)
         assert torch.allclose(pasn, _scalar(expected, 4), atol=1e-12)

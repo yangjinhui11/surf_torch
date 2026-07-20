@@ -76,6 +76,24 @@ class TestSoilTable:
         assert T.RLAMBDAICE > 0
         assert T.RLAMBDAWAT > 0
 
+    def test_saturated_van_genuchten_diffusivity_uses_signed_water_range(self, soil):
+        """RDMAXM must use Fortran SIGN(magnitude, WSAT-WREST)."""
+        js = 3
+        wsat = soil.wsat[js].item()
+        wrest = soil.wrest[js].item()
+        mfac = soil.mfac[js].item()
+        lam = soil.gather("lambda", torch.tensor(js)).item()
+        alpha = soil.mvgalpha[js].item()
+        wconsm = soil.wconsm[js].item()
+        wfac = np.copysign(max(abs(wsat - wrest), np.finfo(float).eps), wsat - wrest)
+        zse = (0.999 * wsat - wrest) / wfac
+        term = 1.0 - zse ** (1.0 / mfac)
+        expected = ((1.0 - mfac) * wconsm / (alpha * mfac * wfac)) * (
+            zse ** (lam - 1.0 / mfac)
+            * (term ** mfac + term ** (-mfac) - 2.0)
+        )
+        assert soil.dmax[js].item() == pytest.approx(expected, rel=1e-12)
+
 
 # --------------------------------------------------------------------------- #
 # VegTable

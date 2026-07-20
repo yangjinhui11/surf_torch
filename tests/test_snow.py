@@ -146,6 +146,23 @@ class TestSnowBranches:
         rtt = float(consts.rtt.item())
         assert torch.allclose(out.ptsn, torch.full_like(out.ptsn, rtt))
         assert torch.allclose(out.pgsn, torch.zeros_like(out.pgsn))
+
+    def test_no_snow_branch_keeps_residual_snow_tile_exchange(
+        self, soil_table, consts, config,
+    ):
+        # SRFSN_LWIMP retains the snow-tile exchange under LEWBSOILFIX
+        # even when ZFRSN is below RFRSMALL and the no-snow branch is used.
+        frac = 1.0e-9
+        evap = 1.0e6
+        inp = _build_inputs(
+            N=1, snow_mass=0.0, snow_frac_low=frac, bare_frac=1.0 - frac,
+            evap=evap, pssfl=0.0,
+        )
+        out = compute_snow(inp, soil_table, consts, config)
+        expected = 3600.0 * frac * evap
+        assert torch.allclose(
+            out.psstar, torch.full_like(out.psstar, expected), rtol=0, atol=1e-12,
+        )
         assert torch.allclose(out.plwc, torch.zeros_like(out.plwc))
 
     def test_no_snow_branch_keeps_snowfall(
@@ -676,6 +693,31 @@ class TestSnowEdgeCases:
 
 # --------------------------------------------------------------------------- #
 # 9. Differentiability
+# --------------------------------------------------------------------------- #
+class TestSnowRainInterception:
+    """Liquid throughfall captured by snow must be available to soil coupling."""
+
+    def test_returns_intercepted_rain_by_precipitation_phase(
+        self, soil_table, consts, config,
+    ):
+        inp = _build_inputs(
+            N=1, snow_mass=10.0, snow_t=270.0, soil_t_top=270.0,
+            snow_frac_low=0.5, bare_frac=0.5,
+            ptsfc=2.0e-5, ptsfl=3.0e-5,
+        )
+        out = compute_snow(inp, soil_table, consts, config)
+
+        assert out.ptsfcin is not None
+        assert out.ptsflin is not None
+        assert out.ptsfcin.item() > 0.0
+        assert out.ptsflin.item() > 0.0
+        assert out.ptsfcin.item() < inp.ptsfc.item()
+        assert out.ptsflin.item() < inp.ptsfl.item()
+        assert out.ptsfcin.item() / out.ptsflin.item() == pytest.approx(2.0 / 3.0)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Differentiability
 # --------------------------------------------------------------------------- #
 class TestSnowDifferentiable:
     """Autograd flows through every branch."""

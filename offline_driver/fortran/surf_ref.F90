@@ -91,7 +91,7 @@ MODULE SURF_REF
   PUBLIC :: SURF_REF_VLAMSK, SURF_REF_SEB, SURF_REF_VEXCS, SURF_REF_DQSDT
   PUBLIC :: SURF_REF_STOMATA, SURF_REF_VEVAP, SURF_REF_VDFDIFH
   PUBLIC :: SURF_REF_SOILT, SURF_REF_SNOW, SURF_REF_SOILW
-  PUBLIC :: SURF_REF_FARQUHAR
+  PUBLIC :: SURF_REF_FARQUHAR, SURF_REF_SRFWL
 
   ! JPRB alias so the transcription reads identically to the upstream.
   INTEGER, PARAMETER :: JPRB = C_DOUBLE
@@ -1913,7 +1913,7 @@ CONTAINS
         ZCOND3 = ZWFLUXRF * PTMST
         ZCOND4 = ZLWC * (1.0_JPRB - ZFUNC)
         ZWFLUXRF = MIN(ZCOND3, ZCOND4)
-        ZCOND5 = ZCONSA*(ZT0 - PTSNM1M(JL))*ZTMST + ZT0*ZRS
+        ZCOND5 = ZCONSA*(ZT0 - PTSNM1M(JL))*ZTMST
         ZCOND6 = RLMLT*ZWFLUXRF*ZTMST
         ZHFLUXRF1 = MIN(ZCOND5, ZCOND6)
         ZHFLUXRF1 = MAX(ZHFLUXRF1, 0.0_JPRB)
@@ -1940,10 +1940,12 @@ CONTAINS
           IF (ZSSTAR1 >= 0.0_JPRB) THEN
             ! Partial melt: snow remains.
             PTSN(JL) = ZT0
+            ZSSTAR = ZSSTAR1
             PGSN(JL) = (ZT0 - PTSAM1M_TOP(JL)) * ZRS
           ELSE
             ! Full melt: all snow melted.
             PTSN(JL) = ZT0
+            ZSSTAR = 0.0_JPRB
             PGSN(JL) = (((ZT0 - PTSAM1M_TOP(JL))*ZRS)*(ZDTM + ZDTH) &
                &      + (ZHFLUX + ZHFLUXRF1)*(PTMST - ZDTM - ZDTH)) * ZTMST
           ENDIF
@@ -3083,5 +3085,134 @@ CONTAINS
     END FUNCTION ARRHENIUS_MOD
 
   END SUBROUTINE SURF_REF_FARQUHAR
+
+
+  !=====================================================================!
+  ! SURF_REF_SRFWL -- skin-reservoir / canopy interception update.
+  !
+  ! Standalone transcription of srfwl_mod.F90.  The derived-type inputs
+  ! reduce to scalar RPSFR, RVINTER and LEWBSOILFIX here so tests can feed
+  ! identical arrays to the Torch SRFWL port.
+  !=====================================================================!
+  SUBROUTINE SURF_REF_SRFWL( &
+      & KLON_C, NTILES_C, &
+      & PTMST, PWLM1M, PCVL, PCVH, PWLMX, &
+      & PFRTI, PEVAPTI, PRSFC, PRSFL, PEVAPSNW, LDLAND, &
+      & RPSFR, RVINTER, LEWBSOILFIX, &
+      & PWL, PFWEL1, PTSFC, PTSFL, PEINTTI &
+      & ) BIND(C, NAME="surf_ref_srfwl")
+
+    INTEGER(C_INT), VALUE, INTENT(IN) :: KLON_C, NTILES_C
+    REAL(JPRB), VALUE, INTENT(IN) :: PTMST, RPSFR, RVINTER
+    LOGICAL(C_BOOL), VALUE, INTENT(IN) :: LEWBSOILFIX
+    REAL(JPRB), INTENT(IN) :: PWLM1M(KLON_C), PCVL(KLON_C), PCVH(KLON_C)
+    REAL(JPRB), INTENT(IN) :: PWLMX(KLON_C)
+    REAL(JPRB), INTENT(IN) :: PFRTI(KLON_C, NTILES_C), PEVAPTI(KLON_C, NTILES_C)
+    REAL(JPRB), INTENT(IN) :: PRSFC(KLON_C), PRSFL(KLON_C), PEVAPSNW(KLON_C)
+    LOGICAL(C_BOOL), INTENT(IN) :: LDLAND(KLON_C)
+    REAL(JPRB), INTENT(OUT) :: PWL(KLON_C), PFWEL1(KLON_C)
+    REAL(JPRB), INTENT(OUT) :: PTSFC(KLON_C), PTSFL(KLON_C)
+    REAL(JPRB), INTENT(OUT) :: PEINTTI(KLON_C, NTILES_C)
+
+    INTEGER(C_INT) :: JL, JTILE
+    REAL(JPRB) :: ZELIQUID, ZEPPRCP, ZEPTINY, ZIPRCP, ZMPRCP
+    REAL(JPRB) :: ZPSFR, ZQHFLW, ZTMST, ZTPRCP, ZVINTER, ZWL
+
+    ZVINTER = RVINTER
+    ZPSFR = 1.0_JPRB / RPSFR
+    ZEPTINY = 10.0_JPRB * TINY(1.0_JPRB)
+    ZEPPRCP = ZEPTINY
+    ZTMST = 1.0_JPRB / PTMST
+
+    DO JTILE = 1, NTILES_C
+      DO JL = 1, KLON_C
+        PEINTTI(JL, JTILE) = 0.0_JPRB
+      ENDDO
+    ENDDO
+
+    DO JL = 1, KLON_C
+      IF (LDLAND(JL)) THEN
+        PWL(JL) = MAX(0.0_JPRB, MIN(PWLMX(JL)-ZEPTINY, PWLM1M(JL)))
+        PEINTTI(JL,3) = PEINTTI(JL,3) + (PWL(JL)-PWLM1M(JL))*ZTMST
+      ELSE
+        PWL(JL) = 0.0_JPRB
+      ENDIF
+    ENDDO
+
+    DO JL = 1, KLON_C
+      IF (LDLAND(JL)) THEN
+        IF (.NOT. LEWBSOILFIX) THEN
+          PWL(JL) = PWLM1M(JL)
+        ENDIF
+        IF (PEVAPTI(JL,3) < 0.0_JPRB) THEN
+          IF (LEWBSOILFIX) THEN
+            ZWL = PWL(JL)
+          ELSE
+            ZWL = PWLM1M(JL)
+          ENDIF
+          ZQHFLW = PTMST * PFRTI(JL,3) * PEVAPTI(JL,3)
+          PWL(JL) = ZWL + ZQHFLW
+          PWL(JL) = MAX(0.0_JPRB, PWL(JL))
+          PEINTTI(JL,3) = PEINTTI(JL,3) + (PWL(JL)-ZWL)*ZTMST
+        ENDIF
+      ENDIF
+    ENDDO
+
+    DO JTILE = 1, NTILES_C
+      IF (JTILE /= 3 .AND. JTILE /= 4 .AND. JTILE /= 6 .AND. &
+          JTILE /= 7 .AND. JTILE /= 8 .AND. JTILE /= 10) CYCLE
+      DO JL = 1, KLON_C
+        IF (LDLAND(JL)) THEN
+          IF (JTILE == 7) THEN
+            ZELIQUID = PFRTI(JL,JTILE) * (PEVAPTI(JL,JTILE)-PEVAPSNW(JL))
+          ELSE
+            ZELIQUID = PFRTI(JL,JTILE) * PEVAPTI(JL,JTILE)
+          ENDIF
+          IF (ZELIQUID > 0.0_JPRB) THEN
+            ZWL = PWL(JL)
+            ZQHFLW = PTMST * ZELIQUID
+            PWL(JL) = ZWL + MIN(PWLMX(JL)-ZEPTINY-ZWL, ZQHFLW)
+            PEINTTI(JL,JTILE) = PEINTTI(JL,JTILE) + (PWL(JL)-ZWL)*ZTMST
+          ENDIF
+        ENDIF
+      ENDDO
+    ENDDO
+
+    DO JL = 1, KLON_C
+      IF (LDLAND(JL)) THEN
+        PFWEL1(JL) = PFWEL1(JL) + (PWL(JL)-PWLM1M(JL))*ZTMST
+      ELSE
+        PFWEL1(JL) = 0.0_JPRB
+      ENDIF
+    ENDDO
+
+    DO JL = 1, KLON_C
+      IF (LDLAND(JL)) THEN
+        IF (PRSFL(JL) > ZEPPRCP) THEN
+          ZTPRCP = PRSFL(JL)
+          ZIPRCP = ZTPRCP * (PCVL(JL)+PCVH(JL)) * ZVINTER
+          ZMPRCP = MIN(PWLMX(JL)-ZEPTINY-PWL(JL), PTMST*ZIPRCP)
+          PWL(JL) = PWL(JL) + ZMPRCP
+          PTSFL(JL) = PRSFL(JL) - ZMPRCP*ZTMST
+        ELSE
+          PTSFL(JL) = 0.0_JPRB
+        ENDIF
+
+        IF (PRSFC(JL) > ZEPPRCP) THEN
+          ZTPRCP = PRSFC(JL) * RPSFR
+          ZIPRCP = ZTPRCP * (PCVL(JL)+PCVH(JL)) * ZVINTER
+          ZMPRCP = MIN(PWLMX(JL)-ZEPTINY-PWL(JL), PTMST*ZIPRCP) * ZPSFR
+          PWL(JL) = PWL(JL) + ZMPRCP
+          PTSFC(JL) = PRSFC(JL) - ZMPRCP*ZTMST
+        ELSE
+          PTSFC(JL) = 0.0_JPRB
+        ENDIF
+      ELSE
+        PTSFC(JL) = PRSFC(JL)
+        PTSFL(JL) = PRSFL(JL)
+      ENDIF
+    ENDDO
+
+  END SUBROUTINE SURF_REF_SRFWL
 
 END MODULE SURF_REF

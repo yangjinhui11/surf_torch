@@ -39,6 +39,7 @@ import pytest
 import torch
 
 from surf_pytorch import ConstantBundle, LandSurface, SurfConfig
+from surf_pytorch.config import TILE_LOW_VEG_DRY
 from surf_pytorch.constants import PhysicalConstants
 from surf_pytorch.state import Forcing, Static, SurfState
 from surf_pytorch.tables import VegTable
@@ -278,11 +279,15 @@ class TestFarquharResistanceMatchesFortran:
             land_mask=static.land_frac > 0,
         )
         # Independent Fortran reference: ref.farquhar + conversion.
+        # The port's PWETL is computed from the low-vegetation dry tile,
+        # so the reference must use the same tile-local skin state and qsat.
+        tile = TILE_LOW_VEG_DRY
         fq_ref = ref.farquhar(
             sw_down=ctx["ssrfl_grid"], p_surf=forcing.p_surf,
-            qs_skin=ctx["qskm1m"][:, 0], qsurf=ctx["qskm1m"][:, 0],
+            qs_skin=ctx["qskm1m"][:, tile], qsurf=ctx["qskm1m"][:, tile],
             q_air=forcing.q, t_air=forcing.t,
-            skin_t=ctx["skin_t_prev"][:, 0], t_soil=ctx["skin_t_prev"][:, 0],
+            skin_t=ctx["skin_t_prev"][:, tile],
+            t_soil=ctx["skin_t_prev"][:, tile],
             f2=ctx["jarvis"]["f2l"], co2=forcing.co2,
             lai=ctx["jarvis"]["lail"],
             kvtype=ctx["ktvl"],
@@ -302,7 +307,7 @@ class TestFarquharResistanceMatchesFortran:
 
 
 # --------------------------------------------------------------------------- #
-# End-to-end closure: forward(use_farquhar=True) completes and produces
+# End-to-end closure: forward(use_farquhar=True, use_ags=True) completes and produces
 # physically sane output.  (The bit-level ULP comparison lives in
 # test_forward_e2e.py::test_forward_farquhar_matches_fortran_assembly.)
 # --------------------------------------------------------------------------- #
@@ -313,6 +318,7 @@ class TestForwardFarquharClosure:
         """forward(use_farquhar=True) must return correctly-shaped outputs."""
         state, forcing, static, cfg, ctx = _make_grid()
         cfg.use_farquhar = True
+        cfg.use_ags = True
         model = LandSurface(cfg)
         new_state, diag = model(state, forcing, static)
         assert new_state.skin_t.shape == state.skin_t.shape
@@ -322,6 +328,7 @@ class TestForwardFarquharClosure:
         """The Farquhar closure must be differentiable (torch.acos/cos path)."""
         state, forcing, static, cfg, ctx = _make_grid()
         cfg.use_farquhar = True
+        cfg.use_ags = True
         cfg.differentiable = True
         model = LandSurface(cfg)
         # Skin T requires grad so backprop reaches the Farquhar path.
@@ -345,6 +352,7 @@ class TestForwardFarquharClosure:
         ns_j, _ = model_j(state, forcing, static)
 
         cfg.use_farquhar = True
+        cfg.use_ags = True
         state2, forcing2, static2, _, _ = _make_grid()  # fresh copy
         model_f = LandSurface(cfg)
         ns_f, _ = model_f(state2, forcing2, static2)
@@ -354,6 +362,20 @@ class TestForwardFarquharClosure:
         assert diff > 1e-6, (
             f"use_farquhar flip did not change skin-T (max diff={diff:.3e})"
         )
+
+    def test_farquhar_without_ags_keeps_jarvis_water_closure(self):
+        """LEFARQUHAR alone is diagnostic; LEAGS controls PWET feedback."""
+        state_j, forcing_j, static_j, cfg_j, _ = _make_grid()
+        cfg_j.use_farquhar = False
+        ns_j, _ = LandSurface(cfg_j)(state_j, forcing_j, static_j)
+
+        state_f, forcing_f, static_f, cfg_f, _ = _make_grid()
+        cfg_f.use_farquhar = True
+        cfg_f.use_ags = False
+        ns_f, diag_f = LandSurface(cfg_f)(state_f, forcing_f, static_f)
+
+        torch.testing.assert_close(ns_f.skin_t, ns_j.skin_t, rtol=0.0, atol=0.0)
+        assert diag_f.farquhar_pgstot is not None
 
     def test_forward_surfaces_carbon_flux_diagnostics(self):
         """use_farquhar=True must populate SurfDiag.farquhar_* carbon fluxes.

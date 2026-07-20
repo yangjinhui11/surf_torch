@@ -97,7 +97,7 @@ def vlamsk(
     config: SurfConfig,
     *,
     ptstep: Optional[torch.Tensor] = None,    # (Ngrid,) VDF sub-step
-    lesn09: bool = False,
+    lesn09: Optional[bool] = None,
     leskti5: bool = False,
     leskti8: bool = False,
     lsicoup: bool = False,
@@ -141,8 +141,8 @@ def vlamsk(
         correction on tile 6 (high-veg snow); may be a 0-d tensor.
     lesn09, leskti5, leskti8:
         Soil-package feature flags from ``YDSOIL%`` -- default to the
-        cy48r1 offline-driver values (all False).  Toggle to reproduce
-        a namelist override.
+        values in ``config`` where available.  Toggle to reproduce a
+        namelist override.
     lsicoup:
         Sea-ice coupling flag from ``YDEXC%LSICOUP``.  When True the
         sea-ice tile is forced to ``LARGE`` (skin pinned to SST).
@@ -158,6 +158,8 @@ def vlamsk(
     ngrid = ptskm1m.shape[0]
     device = ptskm1m.device
     dtype = ptskm1m.dtype
+    if lesn09 is None:
+        lesn09 = bool(getattr(config, "lesn09", False))
 
     plamsk = torch.zeros(ngrid, ntile, dtype=dtype, device=device)
 

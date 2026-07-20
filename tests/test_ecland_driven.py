@@ -430,7 +430,9 @@ def test_ecland_jarvis_vs_farquhar_distinguishable(site):
 
     def _run(use_farquhar: bool) -> torch.Tensor:
         cfg = SurfConfig(dtype=torch.float64,
-                         use_farquhar=use_farquhar, validate=True)
+                         use_farquhar=use_farquhar,
+                         use_ags=use_farquhar,
+                         validate=True)
         model = LandSurface(cfg)
         frac = static.tile_frac_base
         state = state0

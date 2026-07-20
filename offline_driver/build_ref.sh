@@ -82,7 +82,7 @@ fi
 # Sanity-check the symbols the Python wrapper will look up.
 if command -v nm >/dev/null 2>&1; then
   missing=0
-  for sym in surf_ref_vlamsk surf_ref_seb surf_ref_vexcs surf_ref_dqsdt surf_ref_stomata surf_ref_vevap surf_ref_vdfdifh surf_ref_soilt surf_ref_snow surf_ref_soilw surf_ref_farquhar; do
+  for sym in surf_ref_vlamsk surf_ref_seb surf_ref_vexcs surf_ref_dqsdt surf_ref_stomata surf_ref_vevap surf_ref_vdfdifh surf_ref_soilt surf_ref_snow surf_ref_soilw surf_ref_farquhar surf_ref_srfwl; do
     if nm "${OUT}" 2>/dev/null | grep -q "${sym}"; then
       echo "[build_ref] OK -- symbol '${sym}' present"
     else

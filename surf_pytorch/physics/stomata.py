@@ -157,6 +157,8 @@ def jarvis_resistance(
     *,
     tile_frac: Optional[torch.Tensor] = None,  # (Ngrid, Ntile) for ZBARE
     n_tile: Optional[int] = None,
+    lai_low: Optional[torch.Tensor] = None,    # (Ngrid,) PLAIL
+    lai_high: Optional[torch.Tensor] = None,   # (Ngrid,) PLAIH
 ) -> dict:
     """Jarvis canopy resistance (vsurf_mod.F90 294-422).
 
@@ -185,7 +187,7 @@ def jarvis_resistance(
         Downward short-wave radiation at the surface (W/m^2).  Used by
         the Betts radiation-stress factor F1 (vsurf PSRFD).
     veg_table, soil_table, root_table:
-        Lookup tables -- we read RVRSMIN / RVHSTR / RVLAI (veg),
+        Lookup tables -- we read RVRSMIN / RVHSTR / default RVLAI (veg),
         RWPWPM / RWCAPM / RWRESTM / RQWEVAPM (soil), RVROOTSA (roots).
     consts:
         :class:`ConstantBundle` -- needs ``rtt``, ``retv``, ``rd`` and
@@ -194,6 +196,10 @@ def jarvis_resistance(
         Per-tile fractions (used only for the bare-soil weighted average
         ``ZWPBARE``).  When omitted, ``ZBARE`` defaults to zero so the
         bare-soil wilting point equals the soil-class ``RWPWPM``.
+    lai_low, lai_high:
+        Optional climatological tile LAI fields ``PLAIL`` / ``PLAIH``.
+        When supplied they override the vegetation-table defaults, matching
+        the offline driver's monthly LAI interpolation.
 
     Returns
     -------
@@ -244,6 +250,10 @@ def jarvis_resistance(
     hstrh = veg_table.gather("rvhstr", ktvh).to(dtype=dtype)
     lail = veg_table.gather("rvlai", ktvl).to(dtype=dtype)
     laih = veg_table.gather("rvlai", ktvh).to(dtype=dtype)
+    if lai_low is not None:
+        lail = lai_low.to(dtype=dtype, device=device)
+    if lai_high is not None:
+        laih = lai_high.to(dtype=dtype, device=device)
 
     # ----------------------------------------------------------------- #
     # 4. Bare-soil fraction ZBARE (vsurf 333-336).  Optional -- when the
@@ -635,6 +645,8 @@ def vevap(
         # PCSAT couples canopy and snow resistances; PCSNW is the
         # snow-side factor (active when the canopy resistance is real).
         pcsnw_v = torch.zeros((ngrid,), dtype=dtype, device=device)
+        # VEVAP uses a strict PTSKM1M > PTSAM1M selector for the
+        # snow-under-high-vegetation aerodynamic resistance.
         warm = skin_t > t_sub
         zras = torch.where(
             warm,
@@ -806,7 +818,7 @@ def build_tile_vevap(
     t_air: torch.Tensor,             # (Ngrid,) PTMLEV
     q_air: torch.Tensor,             # (Ngrid,) PQMLEV
     skin_t: torch.Tensor,            # (Ngrid, Ntile) PTSKM1M (per-tile skin T)
-    t_sub_grid: torch.Tensor,        # (Ngrid,) sub-surface T (top soil layer)
+    t_sub_grid: torch.Tensor,        # (Ngrid,) or (Ngrid,Ntile) sub-surface T
     qs_skin: torch.Tensor,           # (Ngrid, Ntile) PQS = qsat at skin T
     wlmx_grid: torch.Tensor,         # (Ngrid,) PWLMX interception capacity
     consts: ConstantBundle,
@@ -855,8 +867,9 @@ def build_tile_vevap(
         VEVAP consumes the skin T per tile (the upstream driver calls
         VEVAP once per tile with that tile's PTSKM1M).
     t_sub_grid:
-        Per-grid sub-surface temperature (top soil layer), used by the
-        KTILE=7 stability selector.
+        Per-grid or per-tile sub-surface temperature.  ``SURFEXCDRIVER``
+        passes a tile-local ``ZTSA`` to ``VEVAP``; in particular KTILE=7
+        receives snow temperature rather than the top soil temperature.
     qs_skin:
         Per-tile saturation specific humidity PQS = qsat at skin T,
         shape ``(Ngrid, Ntile)``.
@@ -914,6 +927,7 @@ def build_tile_vevap(
         """Run vevap for one tile and scatter its outputs into the
         per-tile arrays.  Uses the per-tile skin T / qs columns."""
         rhocqu_jt = rhocqu_grid[:, jt] if per_tile_rhocqu else rhocqu_grid
+        t_sub_jt = t_sub_grid[:, jt] if t_sub_grid.dim() == 2 else t_sub_grid
         out = vevap(
             ktile=ktile,
             pwet=pwet_tile,
@@ -924,7 +938,7 @@ def build_tile_vevap(
             q_air=q_air,
             qs_skin=qs_skin[:, jt],
             skin_t=skin_t[:, jt],
-            t_sub=t_sub_grid,
+            t_sub=t_sub_jt,
             wlmx=wlmx_grid,
             consts=consts,
             ptmst=ptmst,
@@ -1059,68 +1073,56 @@ def farquhar_resistance(
     if land_mask is None:
         land_mask = torch.ones((ngrid,), dtype=torch.bool, device=device)
 
-    # Per-column skin T / qsat driving photosynthesis.  Farquhar is a
-    # per-column model (FARQUHAR KLON loop); upstream uses the tile-4
-    # skin state.  We mirror that with the dominant-tile column.
-    skin_col = skin_t_prev[:, ktile_skin]
-    qs_col = qskm1m[:, ktile_skin]
-
-    # Per-PFT photosynthesis pathway: gather the default C3/C4 type from
-    # the VegTable's nco2typ buffer (1=C3, 2=C4 upstream; the port's
-    # FarquharInputs.kco2typ uses 4=C4 sentinel -- both port and Fortran
-    # ref share the same VegTable, so the gather convention is fixed by
-    # the VegTable; we pass it straight through).
-    kco2typ = veg_table.gather("nco2typ", ktvl).to(device=device)
-
-    inp = FarquharInputs(
-        ptskm=skin_col,
-        ptm=forcing.t,
-        ptsoil=skin_col,                 # growth-T proxy: upstream uses PTSOIL;
-                                         # without a separate soil-T column the
-                                         # skin T is the closest cold-start proxy
-        paphm=forcing.p_surf,
-        pqm=forcing.q,
-        pqsurf=qs_col,
-        pqs=qs_col,
-        pco2=forcing.co2,
-        lai=jarvis["lail"],
-        kvtype=ktvl,
-        kco2typ=kco2typ,
-        pf2=jarvis["f2l"],
-        ldland=land_mask,
-        psrfd=ssrfl_grid,
-    )
-    fq = _farquhar(inp, veg_table, consts)
-
-    # cotworestress_mod.F90:427: PWET = 1 / max(RCONDCTMIN, ZXTGS).
-    # RCONDCTMIN is the minimum-conductance floor (prevents divide-by-zero
-    # at nighttime / over bare land where PGSTOT -> 0).
     rcondctmin = veg_table.farquhar_consts.rcondctmin
-    pwet = 1.0 / torch.clamp(fq.pgstot, min=rcondctmin)
 
-    # vsurf 694-717 distributes the single ZWET to PWETL (tile 4) / PWETH
-    # (tile 6) / PWETHS (tile 7).  PWETHS = PWETH upstream (the snow-under-
-    # high-veg aerodynamic term is handled separately inside VEVAP
-    # KTILE==7 via the ZRAS branch).  The cold-start _dominant_veg_types
-    # approximation (ktvl == ktvh) means tile 6 reuses the tile-4 value;
-    # this matches the existing Jarvis path which also uses a single
-    # dominant-type resistance for both low and high veg.
-    #
-    # Carbon-flux diagnostics (PGPP/PRD/PAN) are passed through for the
-    # caller to surface in SurfDiag; the resistance chain itself only
-    # consumes ``pwet``.  PGSTOT is the raw canopy conductance (pre-floor)
-    # so the diag reflects the photosynthesis output, not the clamped
-    # resistance input.
+    def _tile_farquhar(tile: int, kvtype: torch.Tensor, lai: torch.Tensor, pf2: torch.Tensor):
+        # VSURF calls COTWORESTRESS inside the tile loop; use the tile-local
+        # skin temperature and qsat rather than a fixed grid column.
+        skin_col = skin_t_prev[:, tile]
+        qs_col = qskm1m[:, tile]
+        kco2typ = veg_table.gather("nco2typ", kvtype).to(device=device)
+        inp = FarquharInputs(
+            ptskm=skin_col,
+            ptm=forcing.t,
+            ptsoil=skin_col,             # TODO: thread PTSAM1M(:,3) for exact acclimation T.
+            paphm=forcing.p_surf,
+            pqm=forcing.q,
+            pqsurf=qs_col,
+            pqs=qs_col,
+            pco2=forcing.co2,
+            lai=lai,
+            kvtype=kvtype,
+            kco2typ=kco2typ,
+            pf2=pf2,
+            ldland=land_mask,
+            psrfd=ssrfl_grid,
+        )
+        fq = _farquhar(inp, veg_table, consts)
+        pwet = 1.0 / torch.clamp(fq.pgstot, min=rcondctmin)
+        return pwet, fq
+
+    pwetl, fq_low = _tile_farquhar(
+        TILE_LOW_VEG_DRY, ktvl, jarvis["lail"], jarvis["f2l"])
+    pweth, fq_high = _tile_farquhar(
+        TILE_HIGH_VEG_DRY, ktvh, jarvis["laih"], jarvis["f2h"])
+    pweths, fq_high_snow = _tile_farquhar(
+        TILE_HIGH_VEG_SNOW, ktvh, jarvis["laih"], jarvis["f2h"])
+
+    # Bare-soil / urban resistances are not replaced by COTWORESTRESS
+    # (vsurf:687).  Diagnostics keep the low-veg Farquhar fields for
+    # backward compatibility with SurfDiag.
     return {
-        "pwetl": pwet,
-        "pweth": pwet,
-        "pweths": pwet,
-        "pwetb": jarvis["pwetb"],       # upstream vsurf:687 keeps Jarvis
-        "pwetlu": jarvis["pwetlu"],     # unstressed diagnostic, not in Farquhar path
-        "farquhar_pgstot": fq.pgstot,   # canopy conductance [m/s] (pre-floor)
-        "farquhar_pgpp":   fq.pgpp,     # GPP [kgC/m^2/s]
-        "farquhar_prd":    fq.prd,      # dark respiration [kgC/m^2/s]
-        "farquhar_pan":    fq.pan,      # net assimilation [kgC/m^2/s]
+        "pwetl": pwetl,
+        "pweth": pweth,
+        "pweths": pweths,
+        "pwetb": jarvis["pwetb"],
+        "pwetlu": jarvis["pwetlu"],
+        "farquhar_pgstot": fq_low.pgstot,
+        "farquhar_pgpp":   fq_low.pgpp,
+        "farquhar_prd":    fq_low.prd,
+        "farquhar_pan":    fq_low.pan,
+        "farquhar_pgstot_high": fq_high.pgstot,
+        "farquhar_pgstot_high_snow": fq_high_snow.pgstot,
     }
 
 

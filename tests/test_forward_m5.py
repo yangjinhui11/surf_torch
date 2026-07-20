@@ -26,6 +26,8 @@ Invariants pinned:
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -124,6 +126,13 @@ def _rebuild_soiltemp_inputs(
     dtype = cfg.dtype
     device = state.skin_t.device
 
+    model._surf_step_count = state.vupdz0_step
+    model._last_pustrti = state.vupdz0_pustrti
+    model._last_pvstrti = state.vupdz0_pvstrti
+    model._last_pahfsti = state.vupdz0_pahfsti
+    model._last_pevapti = state.vupdz0_pevapti
+    model._last_pzdl = state.vupdz0_pzdl
+
     cp = model.consts.cpd
     sl_lev = cp * forcing.t + forcing.geom1
     q_lev = forcing.q
@@ -155,7 +164,7 @@ def _rebuild_soiltemp_inputs(
         veg_table=model.veg_table, consts=model.consts, config=cfg,
         ptstep=model._broadcast_dt(forcing.dt, state.snow_w.shape),
     )
-    frac = model._tile_frac(static, ntile)
+    frac = model._tile_frac(static, ntile, state=state)
     ssrfl_t = expand_as_tiles(forcing.fr_so / forcing.dt, ntile)
     slrfl_grid = forcing.fr_th / forcing.dt
     tskrad_grid = torch.full((ngrid,), 288.0, dtype=dtype)
@@ -218,11 +227,14 @@ def _rebuild_soiltemp_inputs(
         ssrfl_t=ssrfl_t, slrfl_grid=slrfl_grid,
         tskrad_grid=tskrad_grid, emis_grid=emis_grid,
         plamsk=plamsk, tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
+        pevapsnw=torch.zeros((ngrid,), dtype=dtype, device=device),
         dt=forcing.dt, ntile=ntile, ngrid=ngrid,
         dtype=dtype, device=device,
     )
     from surf_pytorch.physics.diffusion import vdfdifh1s as compute_vdfdifh1s
     diff_out = compute_vdfdifh1s(diff_inp, model.consts, cfg)
+    surfpp_pssh, surfpp_pjq = model._surfpp_zero_tile_fluxes(diff_out.pssh, diff_out.pjq, frac)
+    diff_out = replace(diff_out, pssh=surfpp_pssh, pjq=surfpp_pjq)
 
     # _make_inputs sets snow_w=0 and no snow tiles, so the SRFSN_LWIMPS
     # no-snow branch fires in forward() and yields PGSN exactly zero;
@@ -256,7 +268,8 @@ def _rebuild_soiltemp_inputs(
     soil_inp = SoilTempInputs(
         ptsam1m=state.soil_t, pwsam1m=state.soil_w_liq,
         pfrti=frac, pahfsti=diff_out.pssh, pevapti=diff_out.pjq,
-        pssrflti=ssrfl_t, pslrfl=slrfl_grid, pgsn=pgsn,
+        pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=diff_out.pstr,
+        pgsn=pgsn,
         ksoty=static.soil_type, pcvl=pcvl, pcvh=pcvh,
         ldland=ldland, ptmst=forcing.dt,
     )
@@ -446,6 +459,13 @@ def _rebuild_soilmoist_inputs(
     dtype = cfg.dtype
     device = state.skin_t.device
 
+    model._surf_step_count = state.vupdz0_step
+    model._last_pustrti = state.vupdz0_pustrti
+    model._last_pvstrti = state.vupdz0_pvstrti
+    model._last_pahfsti = state.vupdz0_pahfsti
+    model._last_pevapti = state.vupdz0_pevapti
+    model._last_pzdl = state.vupdz0_pzdl
+
     # Re-run the SEB to get diff_out.pjq.
     cp = model.consts.cpd
     sl_lev = cp * forcing.t + forcing.geom1
@@ -472,7 +492,7 @@ def _rebuild_soilmoist_inputs(
         veg_table=model.veg_table, consts=model.consts, config=cfg,
         ptstep=model._broadcast_dt(forcing.dt, state.snow_w.shape),
     )
-    frac = model._tile_frac(static, ntile)
+    frac = model._tile_frac(static, ntile, state=state)
     ssrfl_t = expand_as_tiles(forcing.fr_so / forcing.dt, ntile)
     slrfl_grid = forcing.fr_th / forcing.dt
     tskrad_grid = torch.full((ngrid,), 288.0, dtype=dtype)
@@ -531,11 +551,14 @@ def _rebuild_soilmoist_inputs(
         ssrfl_t=ssrfl_t, slrfl_grid=slrfl_grid,
         tskrad_grid=tskrad_grid, emis_grid=emis_grid,
         plamsk=plamsk, tsrf=tsrf, frac=frac, ktvl=ktvl, ktvh=ktvh,
+        pevapsnw=torch.zeros((ngrid,), dtype=dtype, device=device),
         dt=forcing.dt, ntile=ntile, ngrid=ngrid,
         dtype=dtype, device=device,
     )
     from surf_pytorch.physics.diffusion import vdfdifh1s as compute_vdfdifh1s
     diff_out = compute_vdfdifh1s(diff_inp, model.consts, cfg)
+    surfpp_pssh, surfpp_pjq = model._surfpp_zero_tile_fluxes(diff_out.pssh, diff_out.pjq, frac)
+    diff_out = replace(diff_out, pssh=surfpp_pssh, pjq=surfpp_pjq)
 
     # Skin-reservoir / canopy interception update (M6, SRFWL) -- mirrors
     # LandSurface.forward section 6.  Produces the rainfall throughfall
@@ -545,6 +568,7 @@ def _rebuild_soilmoist_inputs(
         state=state, static=static, diff_out=diff_out, frac=frac,
         wlmx_grid=wlmx_grid, ktvl=ktvl, ktvh=ktvh,
         forcing=forcing, dt=forcing.dt,
+        pevapsnw=torch.zeros((ngrid,), dtype=dtype, device=device),
         ngrid=ngrid, dtype=dtype, device=device,
     )
 

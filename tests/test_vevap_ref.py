@@ -291,6 +291,32 @@ def test_vevap_interception_clamp_matches_fortran(ref, consts):
     assert _ulp(port.pcsat, f90["pcsat"]) < 4.0
 
 
+@requires_fortran_vevap()
+def test_vevap_interception_clamp_threshold_matches_fortran(ref, consts):
+    """The KTILE=3 branch must agree on both sides of ZEP == ZEMAX."""
+    n = 5
+    # _port_vevap / _ref_vevap use the reference 3600 s coupling step.
+    dt = 3600.0
+    wlmx = torch.full((n,), 0.2972, dtype=torch.float64)
+    rhocqu = torch.full((n,), 0.08200456285647702, dtype=torch.float64)
+    qs_skin = torch.full((n,), 0.002873719377899691, dtype=torch.float64)
+    zep_max = -wlmx / dt
+    perturb = torch.tensor([1e-10, 1e-12, 0.0, -1e-12, -1e-10], dtype=torch.float64)
+    q_air = qs_skin + zep_max / rhocqu + perturb
+    zeros = torch.zeros(n, dtype=torch.float64)
+    p_surf = torch.full((n,), 1.0e5, dtype=torch.float64)
+    t_air = torch.full((n,), 285.0, dtype=torch.float64)
+    inputs = (zeros, zeros, rhocqu, p_surf, t_air, q_air, qs_skin,
+              t_air, t_air, wlmx)
+
+    port = _port_vevap(inputs, 3, consts)
+    f90 = _ref_vevap(inputs, 3, ref, consts)
+
+    assert port.pcair[2] == 1.0
+    assert port.pcair[3] < 1.0
+    assert _ulp(port.pcair, f90["pcair"]) < 4.0
+
+
 # --------------------------------------------------------------------------- #
 # Physics sanity tests -- port behaviour in known regimes.
 # --------------------------------------------------------------------------- #
@@ -560,3 +586,40 @@ def test_build_tile_vevap_matches_fortran_per_tile(ref, consts, seed):
             f"tile {jt} (KTILE {ktile}) seed={seed}: "
             f"PCSAT dispatch diff={ulp:.2f} ULP"
         )
+
+
+def test_vevap_high_snow_temperature_selector_is_strict(consts):
+    """KTILE=7 follows Fortran's strict PTSKM1M > PTSAM1M selector."""
+    n = 1
+    pwet = torch.tensor([1.5e6], dtype=torch.float64)
+    pwetlu = pwet.clone()
+    rhocqu = torch.tensor([0.11144057333986934], dtype=torch.float64)
+    p_surf = torch.tensor([48000.0], dtype=torch.float64)
+    t_air = torch.tensor([250.0], dtype=torch.float64)
+    q_air = torch.tensor([0.001], dtype=torch.float64)
+    qs_skin = torch.tensor([0.004], dtype=torch.float64)
+    t_sub = torch.tensor([265.09578590347405], dtype=torch.float64)
+    skin_t = t_sub - torch.tensor([3.8e-6], dtype=torch.float64)
+    wlmx = torch.tensor([0.2], dtype=torch.float64)
+    base = vevap(
+        ktile=7, pwet=pwet, pwetlu=pwetlu, rhocqu=rhocqu, p_surf=p_surf,
+        t_air=t_air, q_air=q_air, qs_skin=qs_skin, skin_t=skin_t,
+        t_sub=t_sub, wlmx=wlmx, consts=consts,
+        ptmst=torch.full((n,), 10800.0, dtype=torch.float64),
+    )
+    near_tie = vevap(
+        ktile=7, pwet=pwet, pwetlu=pwetlu, rhocqu=rhocqu, p_surf=p_surf,
+        t_air=t_air, q_air=q_air, qs_skin=qs_skin,
+        skin_t=t_sub + torch.tensor([2.8e-5], dtype=torch.float64),
+        t_sub=t_sub, wlmx=wlmx, consts=consts,
+        ptmst=torch.full((n,), 10800.0, dtype=torch.float64),
+    )
+    warm = vevap(
+        ktile=7, pwet=pwet, pwetlu=pwetlu, rhocqu=rhocqu, p_surf=p_surf,
+        t_air=t_air, q_air=q_air, qs_skin=qs_skin,
+        skin_t=t_sub + torch.tensor([1.0e-3], dtype=torch.float64),
+        t_sub=t_sub, wlmx=wlmx, consts=consts,
+        ptmst=torch.full((n,), 10800.0, dtype=torch.float64),
+    )
+    assert not torch.allclose(near_tie.pcsnw, base.pcsnw, rtol=0.0, atol=0.0)
+    assert not torch.allclose(warm.pcsnw, base.pcsnw, rtol=0.0, atol=0.0)

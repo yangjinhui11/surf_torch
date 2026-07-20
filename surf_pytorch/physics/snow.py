@@ -76,7 +76,10 @@ high vegetation) maps to :data:`surf_pytorch.config.TILE_HIGH_VEG_SNOW`
 
 from __future__ import annotations
 
+import csv
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -158,6 +161,7 @@ class SnowInputs:
 
     # ---- Lake ice (FLake stub; zero at cold start) ----
     phlicem1m: Optional[torch.Tensor] = None   # PHLICEM1M lake ice thickness [m] (Ngrid,)
+    pslrflti: Optional[torch.Tensor] = None  # PSLRFLTI tiled net LW [W/m^2] (Ngrid, Ntile)
 
 
 @dataclass
@@ -181,6 +185,10 @@ class SnowOutputs:
     # its melt/cold branches on PMSN > 0 (SRFSN line 354).  Zero at no-melt
     # points; positive only where the melt branch is active.
     pmsn: Optional[torch.Tensor] = None       # PMSN  melt rate [kg/m^2/s] (Ngrid,)
+    pmsnint: Optional[torch.Tensor] = None    # ZPMSNINT internal phase change [W/m^2] (Ngrid,)
+    pemssn: Optional[torch.Tensor] = None     # PEMSSN snow-mass clipping mismatch [kg/m^2/s]
+    ptsfcin: Optional[torch.Tensor] = None    # PTSFCIN snow-intercepted convective rain [kg/m^2/s]
+    ptsflin: Optional[torch.Tensor] = None    # PTSFLIN snow-intercepted large-scale rain [kg/m^2/s]
 
 
 def compute_snow(
@@ -296,13 +304,17 @@ def _snow_core(
     # Per-grid setup (Fortran lines 189-213).
     # ------------------------------------------------------------------ #
     # Snow tile fraction ZFRSN = max(PFRTI(5) + PFRTI(7), RFRTINY).
+    # LLNOSNOW is tested on the raw tile fraction before the RFRTINY clamp;
+    # otherwise an exactly snow-free column can be hidden by the numerical
+    # floor and miss the Fortran no-snow reset path.
     pf_low_snow = _tile_col(inp.pfrti, TILE_LOW_VEG_SNOW, dtype, device)
     pf_high_snow = _tile_col(inp.pfrti, TILE_HIGH_VEG_SNOW, dtype, device)
-    zfrsn = torch.clamp(pf_low_snow + pf_high_snow, min=rfrtiny)
+    zfrsn_raw = pf_low_snow + pf_high_snow
+    zfrsn = torch.clamp(zfrsn_raw, min=rfrtiny)
     zifrsn = 1.0 / zfrsn
 
     # LLNOSNOW: snow tile fraction below RFRSMALL.
-    llnosnow = zfrsn < rfrsmall
+    llnosnow = zfrsn_raw < rfrsmall
 
     # Snowfall interception scaling: grid fraction covered by tiles
     # 3..8 (Fortran) plus lake tile 9 if FLake is on.
@@ -326,6 +338,15 @@ def _snow_core(
     pevapti_7 = _tile_col(inp.pevapti, TILE_HIGH_VEG_SNOW, dtype, device)
     pssrflti_5 = _tile_col(inp.pssrflti, TILE_LOW_VEG_SNOW, dtype, device)
     pssrflti_7 = _tile_col(inp.pssrflti, TILE_HIGH_VEG_SNOW, dtype, device)
+    # SURFTSTPS/SRFSN_LWIMPS supplies only grid-box PSLRFL.  The full
+    # SURFTSTP/SRFSN_LWIMP path first builds ZSLRFLTI; when LELWTL is on
+    # this is the tiled VDF/SURFSEB longwave field PSLRFLTI.
+    if inp.pslrflti is None:
+        pslrflti_5 = inp.pslrfl
+        pslrflti_7 = inp.pslrfl
+    else:
+        pslrflti_5 = _tile_col(inp.pslrflti, TILE_LOW_VEG_SNOW, dtype, device)
+        pslrflti_7 = _tile_col(inp.pslrflti, TILE_HIGH_VEG_SNOW, dtype, device)
 
     ptsnm1m = inp.ptsnm1m
     pssnm1m = inp.pssnm1m
@@ -345,25 +366,35 @@ def _snow_core(
     #                     +RLSTT*PEVAPSNW)
     #         + PFRTI(5)*PSSRFLTI(5)
     #         + PFRTI(7)*PSSRFLTI(7)
-    #         + (PFRTI(5)+PFRTI(7))*PSLRFL
+    #         + PFRTI(5)*PSLRFLTI(5)
+    #         + PFRTI(7)*PSLRFLTI(7)
     # ZHFLUX  = ZIFRSN * ZHFLUXP
     zhfluxp = (
         pf5 * (pahfsti_5 + rlstt * pevapti_5)
         + pf7 * (pahfsti_7 + rlvtt * (pevapti_7 - pevapsnw) + rlstt * pevapsnw)
         + pf5 * pssrflti_5
         + pf7 * pssrflti_7
-        + (pf5 + pf7) * inp.pslrfl
+        + pf5 * pslrflti_5
+        + pf7 * pslrflti_7
     )
     zhflux = zifrsn * zhfluxp
 
     # --- Preliminary snow mass ZSSTAR --------------------------------- #
     # ZSSTAR = PSSNM1M + PTMST*(ZSSFC+ZSSFL+PFRTI(5)*PEVAPTI(5)
     #                          +PFRTI(7)*PEVAPSNW)
-    # Negative snow mass after P-E is clamped to zero (lines 240-243).
-    zsstar = pssnm1m + ptmst * (
+    zsstar_raw = pssnm1m + ptmst * (
         zssfc + zssfl + pf5 * pevapti_5 + pf7 * pevapsnw
     )
-    zsstar = torch.clamp(zsstar, min=0.0)
+    zsstar = torch.clamp(zsstar_raw, min=0.0)
+
+    # Active offline configuration: LESNML=.FALSE., LESN09=.TRUE.
+    # SRFSN_LWIMP sends the negative pre-clipping snow mass as PEMSSN
+    # to SRFWEXC_VG, then clips the snow store to zero.
+    pemssn = torch.where(
+        (~llnosnow) & (zsstar_raw < 0.0),
+        zsstar_raw / ptmst,
+        torch.zeros_like(zsstar_raw),
+    )
 
     # --- Snow liquid water (ZLWC) ------------------------------------- #
     # ZDSNR  = PSSNM1M / (PRSNM1M * ZFRSN)  -- snow depth (real)
@@ -444,7 +475,9 @@ def _snow_core(
     # ZCOND3   = ZWFLUXRF*PTMST
     # ZCOND4   = ZLWC*(1 - ZFUNC)
     # ZWFLUXRF = min(ZCOND3, ZCOND4)
-    # ZCOND5   = ZCONSA*(ZT0 - PTSNM1M)*ZTMST + ZT0*ZRS
+    # ZCOND5   = ZCONSA*(ZT0 - PTSNM1M)*ZTMST
+    #             (SRFSN_LWIMP path used by SURFTSTP; the simplified
+    #              SRFSN_LWIMPS variant adds +ZT0*ZRS here.)
     # ZCOND6   = RLMLT*ZWFLUXRF*ZTMST
     # ZHFLUXRF1= min(ZCOND5, ZCOND6); ZHFLUXRF1 = max(ZHFLUXRF1, 0)
     # ZWFLUXRF = ZHFLUXRF1 / RLMLT                     -- intercepted mass
@@ -453,12 +486,28 @@ def _snow_core(
     zcond3 = zwfluxrf_raw * ptmst
     zcond4 = zlwc * (1.0 - zfunc)
     zwfluxrf = torch.minimum(zcond3, zcond4)
-    zcond5 = zconsa * (zt0 - ptsnm1m) * ztmst + zt0 * zrs
+    zcond5 = zconsa * (zt0 - ptsnm1m) * ztmst
     zcond6 = rlmlt * zwfluxrf * ztmst
     zhfluxrf1 = torch.minimum(zcond5, zcond6)
     zhfluxrf1 = torch.clamp(zhfluxrf1, min=0.0)
     zwfluxrf = zhfluxrf1 / rlmlt
     zsstar = zsstar + zwfluxrf * ptmst
+
+    # SRFSN_LWIMP returns the liquid throughfall captured by the snowpack.
+    # SURFTSTP subtracts these rates before calling SRFWEXC_VG, preventing
+    # rain that froze in the snow from entering the soil-water budget.
+    zptsf = inp.ptsfc + inp.ptsfl
+    valid_rain = (~llnosnow) & (zwfluxrf > 0.0) & (zptsf > 0.0)
+    ptsfcin = torch.where(
+        valid_rain,
+        torch.clamp(zwfluxrf * inp.ptsfc / zptsf, min=0.0),
+        torch.zeros_like(zwfluxrf),
+    )
+    ptsflin = torch.where(
+        valid_rain,
+        torch.clamp(zwfluxrf * inp.ptsfl / zptsf, min=0.0),
+        torch.zeros_like(zwfluxrf),
+    )
 
     # --- Solve implicit temperature equation -------------------------- #
     # ZTSTARI = 1 / (1 + ZCONS2*ZRS)
@@ -487,8 +536,11 @@ def _snow_core(
     # ZMSN  = (ZHFLUX + ZHFLUXRF1 - ZGSN)/RLMLT
     # ZSSTAR1 = ZSSTAR - ZDTM*ZMSN*ZFRSN
     zdthi_denom = zhflux + zhfluxrf1 - (zt0 - ptsam1m_top) * zrs
+    zepsilon = 100.0 * torch.finfo(dtype).tiny
     zdthi_safe = torch.where(
-        zdthi_denom != 0.0, zdthi_denom, torch.ones_like(zdthi_denom)
+        zdthi_denom < 0.0,
+        -torch.clamp(torch.abs(zdthi_denom), min=zepsilon),
+        torch.clamp(torch.abs(zdthi_denom), min=zepsilon),
     )
     zdthi = 1.0 / zdthi_safe
     zdth = (zt0 - ptsnm1m) * (zconsa + zconsb) * zdthi
@@ -504,17 +556,23 @@ def _snow_core(
 
     # Full-melt branch (ZSSTAR1 < 0): all snow melted.
     #   PTSN = ZT0
+    #   ZDTM = ZSSTAR/(ZMSN*ZFRSN)
     #   PGSN = (((ZT0-PTSAM1M(1))*ZRS)*(ZDTM+ZDTH)
     #           + (ZHFLUX+ZHFLUXRF1)*(PTMST-ZDTM-ZDTH)) * ZTMST
+    zdtm_full = torch.where(
+        zmsn * zfrsn != 0.0,
+        zsstar / (zmsn * zfrsn),
+        torch.zeros_like(zsstar),
+    )
     pgsn_full = (
-        ((zt0 - ptsam1m_top) * zrs) * (zdtm + zdth)
-        + (zhflux + zhfluxrf1) * (ptmst - zdtm - zdth)
+        ((zt0 - ptsam1m_top) * zrs) * (zdtm_full + zdth)
+        + (zhflux + zhfluxrf1) * (ptmst - zdtm_full - zdth)
     ) * ztmst
 
     full_melt = zsstar1 < 0.0
     zsstar_melt = torch.where(full_melt, torch.zeros_like(zsstar1), zsstar1)
     pgsn_melt = torch.where(full_melt, pgsn_full, pgsn_partial)
-    ptsn_melt = zt0_t
+    ptsn_melt = torch.full_like(ptsnm1m, zt0)
 
     # Combine the melt / no-melt branches.
     ptsn_with_snow = torch.where(no_melt, ptsn_no_melt, ptsn_melt)
@@ -522,13 +580,27 @@ def _snow_core(
     zsstar_with_snow = torch.where(no_melt, zsstar, zsstar_melt)
 
     # ------------------------------------------------------------------ #
-    # Apply the no-snow branch (Fortran lines 216-220):
-    #   ZSSTAR = PSSNM1M + PTMST*(ZSSFC + ZSSFL)  -- snowfall only
+    # Apply the no-snow branch (Fortran SRFSN_LWIMP lines 276-281).
+    # LEWBSOILFIX retains the residual snow-tile water exchange while the
+    # cover fraction is below RFRSMALL; omitting it creates a mass jump at
+    # the no-snow/snow transition.
     #   PTSN   = ZT0
     #   PGSN   = 0
     #   ZLWC   = 0
     # ------------------------------------------------------------------ #
     zsstar_nosnow = pssnm1m + ptmst * (zssfc + zssfl)
+    if getattr(soil_table.consts, "lewbsoilfix", True):
+        no_snow_exchange = torch.zeros_like(zsstar_nosnow)
+        if ntile > TILE_LOW_VEG_SNOW:
+            no_snow_exchange = no_snow_exchange + (
+                inp.pfrti[:, TILE_LOW_VEG_SNOW]
+                * inp.pevapti[:, TILE_LOW_VEG_SNOW]
+            )
+        if ntile > TILE_HIGH_VEG_SNOW:
+            no_snow_exchange = no_snow_exchange + (
+                inp.pfrti[:, TILE_HIGH_VEG_SNOW] * inp.pevapsnw
+            )
+        zsstar_nosnow = zsstar_nosnow + ptmst * no_snow_exchange
     ptsn = torch.where(llnosnow, zt0_t, ptsn_with_snow)
     pgsn = torch.where(
         llnosnow,
@@ -546,10 +618,71 @@ def _snow_core(
     # ------------------------------------------------------------------ #
     pgsn = zfrsn * pgsn
 
-    # PMSN (melt rate) -- only physically meaningful on the melt branch
-    # (SRFSN line 308-327); zero elsewhere so the snow-albedo aging block's
-    # melt/cold split on PMSN > 0 (line 354) is well-defined everywhere.
-    pmsn_out = torch.where(melt, zmsn, torch.zeros_like(zmsn))
+    # PMSN follows SRFSN_LWIMP: the branch logic first computes the local
+    # snow-tile melt flux, then section 5 normalises it to the grid square
+    # with the same ZFRSN factor used for PGSN before SRFWEXC_VG consumes it.
+    pmsn_partial = zmsn * zdtm * ztmst
+    pmsn_full = zmsn * zdtm_full * ztmst
+    pmsn_melt = torch.where(full_melt, pmsn_full, pmsn_partial)
+    pmsn_out = zfrsn * torch.where(melt, pmsn_melt, torch.zeros_like(zmsn))
+    pmsnint = zconsb * zfrsn * (ptsn - ptsnm1m) / ptmst
+    pmsnint = torch.where(llnosnow, torch.zeros_like(pmsnint), pmsnint)
+
+    _append_snow_debug(
+        pssnm1m=pssnm1m,
+        ptsnm1m=ptsnm1m,
+        prsnm1m=prsnm1m,
+        ptsam1m_top=ptsam1m_top,
+        pf5=pf5,
+        pf7=pf7,
+        pahfsti_5=pahfsti_5,
+        pahfsti_7=pahfsti_7,
+        pevapti_5=pevapti_5,
+        pevapti_7=pevapti_7,
+        pssrflti_5=pssrflti_5,
+        pssrflti_7=pssrflti_7,
+        pslrflti_5=pslrflti_5,
+        pslrflti_7=pslrflti_7,
+        pssfc=inp.pssfc,
+        pssfl=inp.pssfl,
+        ptsfc=inp.ptsfc,
+        ptsfl=inp.ptsfl,
+        pevapsnw=pevapsnw,
+        zfrsn=zfrsn,
+        llnosnow=llnosnow,
+        zhflux=zhflux,
+        zsstar_raw=zsstar_raw,
+        zsstar=zsstar,
+        zdsnr=zdsnr,
+        zlwc=zlwc,
+        zfunc=zfunc,
+        zdfunc=zdfunc,
+        zconsa=zconsa,
+        zconsb=zconsb,
+        zcons2=zcons2,
+        zdsn=zdsn,
+        zrs=zrs,
+        zwfluxrf_raw=zwfluxrf_raw,
+        zcond3=zcond3,
+        zcond4=zcond4,
+        zcond5=zcond5,
+        zcond6=zcond6,
+        zwfluxrf=zwfluxrf,
+        zhfluxrf1=zhfluxrf1,
+        ztstar=ztstar,
+        no_melt=no_melt,
+        zdth=zdth,
+        zdtm=zdtm,
+        zgsn_melt=zgsn_melt,
+        zmsn=zmsn,
+        zsstar1=zsstar1,
+        full_melt=full_melt,
+        ptsn=ptsn,
+        pssn=zsstar_out,
+        pgsn=pgsn,
+        pmsn=pmsn_out,
+        pmsnint=pmsnint,
+    )
 
     return SnowOutputs(
         ptsn=ptsn,
@@ -559,12 +692,44 @@ def _snow_core(
         zfrsn=zfrsn,
         llnosnow=llnosnow,
         pmsn=pmsn_out,
+        pmsnint=pmsnint,
+        pemssn=pemssn,
+        ptsfcin=ptsfcin,
+        ptsflin=ptsflin,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _append_snow_debug(**cols: torch.Tensor) -> None:
+    path = os.environ.get("SURF_TORCH_SNOW_DEBUG_CSV")
+    if not path:
+        return
+
+    step = getattr(_append_snow_debug, "_step", 0)
+    setattr(_append_snow_debug, "_step", step + 1)
+
+    out = Path(path)
+    names = list(cols)
+    header = ["step", "jl"] + names
+    write_header = not out.exists()
+
+    def item(t: torch.Tensor, i: int) -> float:
+        v = t.detach().cpu().reshape(-1)[i]
+        if v.dtype == torch.bool:
+            return int(v.item())
+        return float(v.item())
+
+    ngrid = next(iter(cols.values())).detach().reshape(-1).shape[0]
+    with out.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        for i in range(ngrid):
+            writer.writerow([step, i + 1] + [item(cols[name], i) for name in names])
+
+
 def _tile_col(
     pfrti: torch.Tensor, idx: int, dtype: torch.dtype, device
 ) -> torch.Tensor:
