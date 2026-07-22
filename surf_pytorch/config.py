@@ -123,6 +123,12 @@ class SurfConfig:
     # stability cap.
     lesn09: bool = True
 
+    # LEVGEN selects the Van Genuchten field-capacity suction used while
+    # constructing the soil lookup table.  This must match the calling
+    # OpenIFS/OSM namelist because it affects heat capacity, conductivity,
+    # and the soil-water prognostic coefficients.
+    levgen: bool = True
+
     # When True, the VDFDIFH1S snow-melt repeat (call #4, LESNML) is
     # invoked whenever a low-veg-snow tile is at melting point; this
     # pins TSRF to RTT and LAMSK to 100 W/m^2/K and re-runs SURFSEB.
@@ -193,7 +199,8 @@ class SurfConfig:
     # temperature; LELWTL recomputes tiled LW and must also feed tiled
     # PSLRFLTI into the full SURFTSTP snow path.
     lelwdd: bool = True
-    lelwtl: bool = False
+    # The value is selected by the calling OpenIFS/OSM configuration.
+    lelwtl: bool = True
 
     # ----- Validation -----
     # When True, the model asserts invariants (tile fractions sum to 1,

@@ -187,6 +187,7 @@ class LandSurface(nn.Module):
         self.soil_table = SoilTable(
             dtype=self.config.dtype,
             device=self.config.device,
+            levgen=self.config.levgen,
             learnable=dict.fromkeys(self.config.learnable_soil, True),
         )
         self.veg_table = VegTable(
@@ -627,6 +628,13 @@ class LandSurface(nn.Module):
         land_flux_out = replace(out, pssh=surfpp_pssh, pjq=surfpp_pjq)
         self._last_pahfsti = land_flux_out.pssh.detach().clone()
         self._last_pevapti = land_flux_out.pjq.detach().clone()
+        # SURFTSTP builds ZSLRFLTI from the coupled radiation field.  With
+        # LELWTL disabled, it copies the grid net longwave flux to every
+        # tile; the VDF/SEB tile pstr diagnostic is not that boundary.
+        slrfl_t = (
+            out.pstr if self.config.lelwtl
+            else slrfl_grid.unsqueeze(1).expand_as(out.pstr)
+        )
 
         # ------------------------------------------------------------------ #
         # 6. Skin-reservoir / canopy interception update (M6, SRFWL).
@@ -672,7 +680,7 @@ class LandSurface(nn.Module):
         # same convention used for rainfall in _update_soil_moisture).
         snow_out = self._update_snow(
             state=state, static=static, diff_out=land_flux_out,
-            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=out.pstr, pfrti=frac,
+            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=slrfl_t, pfrti=frac,
             forcing=forcing,
             pevapsnw=pevapsnw,
             ptsfc=canopy_out.ptsfc, ptsfl=canopy_out.ptsfl,
@@ -733,7 +741,7 @@ class LandSurface(nn.Module):
         # flux PGSN flows from the SRFSN_LWIMPS solve above.
         new_soil_t = self._update_soil_temperature(
             state=state, static=static, diff_out=land_flux_out,
-            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pfrti=frac,
+            pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=slrfl_t, pfrti=frac,
             pgsn=snow_out.pgsn,
             dt=dt, ngrid=ngrid, dtype=dtype, device=device,
         )
@@ -793,10 +801,6 @@ class LandSurface(nn.Module):
             else torch.zeros((ngrid,), dtype=dtype, device=device)
         )
         skin_water_tendency = skin_water_prev + dt * canopy_out.pfwel1
-        skin_water_tendency = torch.where(
-            (canopy_out.pwl == 0.0) & (skin_water_tendency > 1.0e-20),
-            torch.zeros_like(skin_water_tendency), skin_water_tendency,
-        )
         stores_intercepted_rain = canopy_out.pwl > skin_water_tendency
         skin_water_out = torch.where(
             stores_intercepted_rain, canopy_out.pwl, skin_water_tendency,
@@ -816,10 +820,11 @@ class LandSurface(nn.Module):
             skin_water=skin_water_out,
         )
         next_frac = self._tile_frac(static, ntile, state=provisional_state)
-        next_tsrf = self._sub_surface_t(provisional_state, ntile)
-        skin_t_out = self._initialise_new_active_tile_skin_t(
-            surfpp_skin_t, frac, next_frac, next_tsrf,
-        )
+        # SURFPPS_CTL already replaces zero-fraction tile temperatures by
+        # the grid-mean skin temperature.  A snow tile that becomes active
+        # at the next SURFBC call must retain that value; replacing it with
+        # TSRF here incorrectly resets the tile to RTT.
+        skin_t_out = surfpp_skin_t
         skin_t_out = self._limit_active_snow_tile_skin_t(skin_t_out, next_frac)
         new_state = state.like(
             skin_t=skin_t_out.clone(),
@@ -907,22 +912,6 @@ class LandSurface(nn.Module):
         )
         zero_frac = frac < frac_floor
         return torch.where(zero_frac, mean_tsk.expand_as(ptsktip1), ptsktip1)
-
-    def _initialise_new_active_tile_skin_t(
-        self,
-        skin_t: torch.Tensor,
-        old_frac: torch.Tensor,
-        new_frac: torch.Tensor,
-        tsrf_next: torch.Tensor,
-    ) -> torch.Tensor:
-        """Initialise tiles that appear after the SURFBC fraction update."""
-        frac_floor = torch.as_tensor(
-            self.soil_table.consts.rthrfri_ti,
-            dtype=skin_t.dtype,
-            device=skin_t.device,
-        )
-        newly_active = (old_frac < frac_floor) & (new_frac >= frac_floor)
-        return torch.where(newly_active, tsrf_next, skin_t)
 
     def _limit_active_snow_tile_skin_t(
         self,
@@ -1092,6 +1081,47 @@ class LandSurface(nn.Module):
         )
         return pzdl.reshape(-1), pbuom.reshape(-1)
 
+    def _vupdz0_cold_start_fluxes(
+        self,
+        forcing: Forcing,
+        z0m: torch.Tensor,
+    ) -> None:
+        """Initialise VUPDZ0's step-zero neutral tile flux estimate.
+
+        ``vupdz0_mod.F90`` performs this calculation internally when
+        ``KSTEP == 0``.  Offline Torch calls must therefore not begin with
+        zero momentum stress simply because no previous VDF call exists.
+        Coupled calls bypass this helper and receive their VUP fields from
+        the atmosphere.
+        """
+        dtype, device = z0m.dtype, z0m.device
+        ngrid, ntile = z0m.shape
+        ucurr = forcing.ucurr if forcing.ucurr is not None else torch.zeros(
+            ngrid, dtype=dtype, device=device
+        )
+        vcurr = forcing.vcurr if forcing.vcurr is not None else torch.zeros(
+            ngrid, dtype=dtype, device=device
+        )
+        zdu2 = torch.clamp(
+            (forcing.u - ucurr).square() + (forcing.v - vcurr).square(),
+            min=REPDU2,
+        )
+        zdua = torch.sqrt(zdu2).unsqueeze(-1)
+        rho = forcing.p_surf / (
+            self.consts.rd * forcing.t * (1.0 + self.consts.retv * forcing.q)
+        )
+        cdn = (RKAP / torch.log(
+            1.0 + forcing.geom1.unsqueeze(-1) / (self.consts.g * z0m)
+        )) ** 2
+        self._last_pustrti = (
+            rho.unsqueeze(-1) * forcing.u.unsqueeze(-1) * zdua * cdn
+        ).detach().clone()
+        self._last_pvstrti = (
+            rho.unsqueeze(-1) * forcing.v.unsqueeze(-1) * zdua * cdn
+        ).detach().clone()
+        self._last_pahfsti = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+        self._last_pevapti = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+
     def _vupdz0_praqti(
         self,
         forcing: Forcing,
@@ -1212,8 +1242,17 @@ class LandSurface(nn.Module):
             ngrid, dtype=dtype, device=device)
         momentum = vdfdifm1s_surface_stress(
             out.pcfm.reshape(ngrid, ntile), frac,
-            forcing.u.to(dtype=dtype, device=device) + (forcing.dt * forcing.u_tendency.to(dtype=dtype, device=device) if forcing.u_tendency is not None else 0.0),
-            forcing.v.to(dtype=dtype, device=device) + (forcing.dt * forcing.v_tendency.to(dtype=dtype, device=device) if forcing.v_tendency is not None else 0.0),
+            # VDFDIFM1S forms PUDIF/PVDIF from the lowest-level state and
+            # atmospheric momentum tendencies before VDFINCR writes the
+            # stress used by the next VUPDZ0 call.
+            forcing.u.to(dtype=dtype, device=device) + (
+                forcing.dt * forcing.u_tendency.to(dtype=dtype, device=device)
+                if forcing.u_tendency is not None else 0.0
+            ),
+            forcing.v.to(dtype=dtype, device=device) + (
+                forcing.dt * forcing.v_tendency.to(dtype=dtype, device=device)
+                if forcing.v_tendency is not None else 0.0
+            ),
             ucurr,
             vcurr,
         )
@@ -1450,6 +1489,8 @@ class LandSurface(nn.Module):
         pcptgzlev_g = cp * forcing.t + forcing.geom1
         ldinit, kitt = self._vexcs_step_controls()
         if boundary_mode == "offline":
+            if self._surf_step_count == 0:
+                self._vupdz0_cold_start_fluxes(forcing, z0m_tile)
             pzdl0, pbuom0 = self._vupdz0_warm_start(forcing, state, ntile)
             praqti = self._vupdz0_praqti(forcing, state, z0m_tile, z0q, pzdl0)
             self._last_vup_pzdl0 = (
@@ -1499,10 +1540,9 @@ class LandSurface(nn.Module):
             forcing, static, state, frac, ktvl, ktvh, qs_skin, praqti, ntile,
         )
         pcpts = skin_t * cp
-        # SURFEXCDRIVER_CTL first uses tile-specific momentum roughness in
-        # VUPDZ0/PRAQTI, then log-blends it to one grid value and writes that
-        # blended PZ0M back to every tile before VEXCS/VEXCSS.  Heat/moisture
-        # roughness lengths remain tile-specific.
+        # After VUPDZ0 computes tile roughness, SURFEXCDRIVER_CTL forms the
+        # grid log blend and writes that PZ0M back to every tile before the
+        # VEXCS calls. Heat and moisture roughness remain tile-specific.
         z0m_fallback = (
             static.z0m.to(dtype=dtype, device=device)
             if static.z0m is not None
@@ -1810,6 +1850,7 @@ class LandSurface(nn.Module):
         diff_out,                       # DiffusionOutputs
         pssrflti: torch.Tensor,
         pslrfl: torch.Tensor,
+        pslrflti: torch.Tensor,
         pfrti: torch.Tensor,
         pgsn: torch.Tensor,
         dt: torch.Tensor,
@@ -1886,9 +1927,9 @@ class LandSurface(nn.Module):
             pevapti=diff_out.pjq,
             pssrflti=pssrflti,
             pslrfl=pslrfl,
-            # SURFTSTP_CTL calls SRFT with tiled net longwave ZSLRFLTI.
-            # VDFDIFH1S/SURFSEB provides the corresponding per-tile PSTR.
-            pslrflti=diff_out.pstr,
+            # SURFTSTP_CTL either copies the grid radiation to all tiles or
+            # uses tiled radiation, according to LELWTL.
+            pslrflti=pslrflti,
             pgsn=pgsn,
             ksoty=static.soil_type,
             pcvl=pcvl, pcvh=pcvh,
