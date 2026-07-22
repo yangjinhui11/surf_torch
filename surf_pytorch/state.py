@@ -122,6 +122,16 @@ class Forcing:
     vupdz0_pzdlti: Optional[torch.Tensor] = None   # (Ngrid, Ntile) [-]
     vupdz0_praqti: Optional[torch.Tensor] = None   # (Ngrid, Ntile) [s/m]
 
+    # Optional authoritative VDFDIFH1S output at the land-atmosphere
+    # coupling point.  A coupled atmospheric model owns these fields;
+    # supplying the complete set lets the land prognostics be verified
+    # independently of a VDF port while retaining its diagnostics.
+    vdf_pfrti: Optional[torch.Tensor] = None       # (Ngrid, Ntile) [-]
+    vdf_pahfsti: Optional[torch.Tensor] = None     # (Ngrid, Ntile) [W/m2]
+    vdf_pevapti: Optional[torch.Tensor] = None     # (Ngrid, Ntile) [kg/m2/s]
+    vdf_pslrflti: Optional[torch.Tensor] = None    # (Ngrid, Ntile) [W/m2]
+    vdf_ptsktip1: Optional[torch.Tensor] = None    # (Ngrid, Ntile) [K]
+
 
     # Optional: atmospheric profiles for explicit diffusion above the
     # surface layer (VDFMAIN1S args PUM1/.../PAPHM1, full KLEV axis).
@@ -158,6 +168,11 @@ class Forcing:
             vupdz0_pbuomti=_mv(self.vupdz0_pbuomti),
             vupdz0_pzdlti=_mv(self.vupdz0_pzdlti),
             vupdz0_praqti=_mv(self.vupdz0_praqti),
+            vdf_pfrti=_mv(self.vdf_pfrti),
+            vdf_pahfsti=_mv(self.vdf_pahfsti),
+            vdf_pevapti=_mv(self.vdf_pevapti),
+            vdf_pslrflti=_mv(self.vdf_pslrflti),
+            vdf_ptsktip1=_mv(self.vdf_ptsktip1),
             u_profile=_mv(self.u_profile), v_profile=_mv(self.v_profile),
             t_profile=_mv(self.t_profile), q_profile=_mv(self.q_profile),
             p_profile=_mv(self.p_profile),

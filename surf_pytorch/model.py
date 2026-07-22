@@ -620,6 +620,25 @@ class LandSurface(nn.Module):
         )
         out = compute_vdfdifh1s(diff_inp, self.consts, self.config)
 
+        vdf_boundary = (
+            forcing.vdf_pfrti, forcing.vdf_pahfsti, forcing.vdf_pevapti,
+            forcing.vdf_pslrflti, forcing.vdf_ptsktip1,
+        )
+        if any(value is not None for value in vdf_boundary):
+            if not all(value is not None for value in vdf_boundary):
+                raise ValueError(
+                    "Authoritative VDF forcing requires pfrti, pahfsti, "
+                    "pevapti, pslrflti, and ptsktip1 together"
+                )
+            frac = forcing.vdf_pfrti.to(dtype=dtype, device=device)
+            out = replace(
+                out,
+                pssh=forcing.vdf_pahfsti.to(dtype=dtype, device=device),
+                pjq=forcing.vdf_pevapti.to(dtype=dtype, device=device),
+                pstr=forcing.vdf_pslrflti.to(dtype=dtype, device=device),
+                ptsktip1=forcing.vdf_ptsktip1.to(dtype=dtype, device=device),
+            )
+
         # SURFPP_CTL post-processes zero-area tile PAHFSTI/PEVAPTI before the
         # land-surface routines consume them. Keep `out` as the raw SEB
         # diagnostic so per-tile energy closure remains inspectable.
