@@ -385,7 +385,6 @@ class LandSurface(nn.Module):
         salinity = self._tile_salinity(ntile, dtype, device)
         qskm1m = qsat(skin_t_prev, p_surf_t, self.consts, salinity=salinity)
         dqsdT = dqsat_dt_ifs(skin_t_prev, p_surf_t, self.consts, salinity=salinity)
-        sskm1m = cp * skin_t_prev
 
         # ------------------------------------------------------------------ #
         # 3. Turbulent exchange coefficients.  When the static descriptor
@@ -582,12 +581,12 @@ class LandSurface(nn.Module):
             ptmst=dt,
             rlhaero=vegc.rlhaero, rlhaeros=vegc.rlhaeros,
         )
-        # SEB consumes PCSAT (-> alpha_s, saturation at skin T) and
-        # PCAIR (-> alpha_l, potential from skin reservoir).  The
-        # other VEVAP outputs (pcsatu/pcairu/pcptsu/pcsnw/pdhvegs)
-        # feed downstream canopy / M5 updates, not the SEB closure.
-        alphas = vevap_out["pcsat"]
-        alphal = vevap_out["pcair"]
+        # VDFDIFH1S calls SURFSEB with VEVAP's *unstressed* fields
+        # PCPTSTIU/PCAIRTIU/PCSATTIU.  The stressed PCPTSTI/PCAIRTI/
+        # PCSATTI fields remain inputs to the canopy and soil closures.
+        sskm1m = vevap_out["pcptsu"]
+        alphas = vevap_out["pcsatu"]
+        alphal = vevap_out["pcairu"]
         pevapsnw = self._snow_under_forest_evap(
             forcing=forcing,
             state=state,
