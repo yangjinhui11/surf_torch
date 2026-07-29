@@ -180,7 +180,10 @@ class SurfConfig:
     vexcs_kitt: int = 3
 
     # ``offline`` owns the ported OSM VUPDZ0/VDFMAIN1S closure.
-    # ``coupled`` requires authoritative tiled atmospheric-VDF fields.
+    # ``external`` consumes a complete authoritative tiled boundary for
+    # controlled Fortran--Torch replay experiments. It is deliberately
+    # not presented as an OpenIFS coupling mode: the current binding does
+    # not marshal that complete atmospheric interface.
     # No approximate VUP boundary mode is retained.
     vup_boundary_mode: str = "offline"
     # Longwave-radiation switches mirrored from SURFSEB/SURFTSTP.

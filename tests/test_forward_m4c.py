@@ -104,9 +104,9 @@ def _make_inputs(
 class TestM4cVdfdifhIntegration:
     """Pin the M4c VDFDIFH1S integration invariants."""
 
-    def test_coupled_mode_requires_external_vupdz0_boundary(self):
+    def test_external_mode_requires_external_vupdz0_boundary(self):
         state, forcing, static, cfg = _make_inputs(N=2, with_z0=True)
-        cfg.vup_boundary_mode = "coupled"
+        cfg.vup_boundary_mode = "external"
 
         with pytest.raises(ValueError, match="authoritative VUPDZ0"):
             LandSurface(cfg)(state, forcing, static)

@@ -131,12 +131,12 @@ class TestLandSurfaceForward:
         assert torch.allclose(actual[:, 3], expected_low)
         assert torch.allclose(actual[:, 5], expected_high)
 
-    def test_coupled_vup_z0_override_feeds_vexcs(self, monkeypatch):
+    def test_external_vup_z0_override_feeds_vexcs(self, monkeypatch):
         import surf_pytorch.model as model_mod
         from surf_pytorch.physics.exchange import ExchangeOutputs
 
         state, forcing, static, cfg = _make_inputs(N=1)
-        cfg = dataclasses.replace(cfg, vup_boundary_mode="coupled")
+        cfg = dataclasses.replace(cfg, vup_boundary_mode="external")
         ntile = cfg.n_tile
         z0m = torch.linspace(0.01, 0.08, ntile, dtype=cfg.dtype).reshape(1, ntile)
         z0h = torch.linspace(0.02, 0.09, ntile, dtype=cfg.dtype).reshape(1, ntile)

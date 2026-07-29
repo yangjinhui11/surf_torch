@@ -303,8 +303,8 @@ class LandSurface(nn.Module):
         Boundary modes
         --------------
         vup_boundary_mode=offline executes the ported tiled VUPDZ0/VDF
-        closure. vup_boundary_mode=coupled requires the complete tiled
-        atmospheric boundary supplied by OpenIFS. No neutral or grid-mean
+        closure. vup_boundary_mode=external requires the complete tiled
+        atmospheric boundary captured for controlled replay. No neutral or grid-mean
         exchange fallback is available through this interface.
 
         Remaining optional physics
@@ -1449,7 +1449,7 @@ class LandSurface(nn.Module):
             static, frac, ktvl, ktvh, ntile, dtype, device, state=state,
         )
         boundary_mode = self.config.vup_boundary_mode
-        if boundary_mode == "coupled":
+        if boundary_mode == "external":
             roughness = {
                 "vupdz0_z0mti": forcing.vupdz0_z0mti,
                 "vupdz0_z0hti": forcing.vupdz0_z0hti,
@@ -1458,7 +1458,7 @@ class LandSurface(nn.Module):
             missing = [name for name, value in roughness.items() if value is None]
             if missing:
                 raise ValueError(
-                    "Coupled mode requires authoritative VUPDZ0 roughness fields: "
+                    "External-boundary mode requires authoritative VUPDZ0 roughness fields: "
                     + ", ".join(missing)
                 )
             for name, value in roughness.items():
@@ -1498,7 +1498,7 @@ class LandSurface(nn.Module):
             )
             self._last_vup_pbuom0 = pbuom0.reshape(ngrid, ntile).detach()
             self._last_vup_praqti = praqti.detach()
-        elif boundary_mode == "coupled":
+        elif boundary_mode == "external":
             external = {
                 "vupdz0_pustrti": forcing.vupdz0_pustrti,
                 "vupdz0_pvstrti": forcing.vupdz0_pvstrti,
@@ -1511,7 +1511,7 @@ class LandSurface(nn.Module):
             missing = [name for name, value in external.items() if value is None]
             if missing:
                 raise ValueError(
-                    "Coupled mode requires "
+                    "External-boundary mode requires "
                     "authoritative VUPDZ0 forcing fields: " + ", ".join(missing)
                 )
             for name, value in external.items():
@@ -1530,7 +1530,7 @@ class LandSurface(nn.Module):
             self._last_vup_praqti = praqti.detach()
         else:
             raise ValueError(
-                "SurfConfig.vup_boundary_mode must be 'offline' or 'coupled', "
+                "SurfConfig.vup_boundary_mode must be 'offline' or 'external', "
                 f"got {boundary_mode!r}"
             )
         # SURFEXCDRIVER_CTL calls VSURF before VEXCS and passes the
@@ -3013,7 +3013,7 @@ class LandSurface(nn.Module):
     ) -> torch.Tensor:
         """Return tile areas for the active surface step.
 
-        A coupled validation caller may supply the complete VDF tile-area
+        An external validation caller may supply the complete VDF tile-area
         boundary.  That boundary must govern radiation, VEXCS and the land
         updates consistently; replacing it only after the radiation call
         permits a different snow-cover branch on the following time step.

@@ -255,6 +255,11 @@ class PyOifsShim:
         if config_overrides:
             for k, v in config_overrides.items():
                 setattr(cfg, k, v)
+        if cfg.vup_boundary_mode != "offline":
+            raise ValueError(
+                "PyOifsShim supports only vup_boundary_mode=offline; "
+                "the external-boundary replay interface is not marshalled by the OpenIFS binding."
+            )
         # Re-derive the active tile count after overrides so a
         # use_lake/use_urban flip is consistent with n_tile.
         cfg.n_active_tiles()
