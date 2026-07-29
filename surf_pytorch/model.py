@@ -751,7 +751,8 @@ class LandSurface(nn.Module):
         # sub-cover-threshold residual mass.  That residual still controls
         # the next step's snow thermal branch; discarding it here causes a
         # spurious transition to the no-snow branch.
-        new_snow_w = torch.clamp(snow_out.psstar, min=0.0)
+        snow_tendency = (snow_out.psstar - state.snow_w) * torch.reciprocal(dt)
+        new_snow_w = state.snow_w + dt * snow_tendency
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
