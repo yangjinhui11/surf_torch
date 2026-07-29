@@ -110,6 +110,7 @@ _RRCSICE = 1.884e6
 _RGH2O = 4.18e6
 
 _SRFT_DEBUG_STEP = 0
+_SRFW_DEBUG_STEP = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -331,7 +332,7 @@ def _soil_temperature_core(
     ztsa = _solve_tridiag(inp.ptsam1m, zlst, zrhs, zcdz, land, rsimp)
 
     _write_srft_debug(
-        inp.ptsam1m, zsurfl, inp.pgsn, zdif, zlst, zcdz, zrhs, ztsa,
+        inp.ptsam1m, inp.pwsam1m, zsurfl, inp.pgsn, zdif, zlst, zcdz, zrhs, ztsa,
         inp.ptsam1m * (1.0 - 1.0 / rsimp) + ztsa,
     )
 
@@ -351,6 +352,7 @@ def _soil_temperature_core(
 
 def _write_srft_debug(
     ptsam1m: torch.Tensor,
+    pwsam1m: torch.Tensor,
     zsurfl: torch.Tensor,
     pgsn: torch.Tensor,
     zdif: torch.Tensor,
@@ -370,10 +372,27 @@ def _write_srft_debug(
     if nlevs != 4:
         return
 
+    column = os.environ.get("SURF_TORCH_SRFT_DEBUG_COLUMN")
+    if column:
+        try:
+            selected = int(column) - 1
+        except ValueError as exc:
+            raise ValueError(
+                "SURF_TORCH_SRFT_DEBUG_COLUMN must be a 1-based integer"
+            ) from exc
+        if not 0 <= selected < ngrid:
+            raise ValueError(
+                "SURF_TORCH_SRFT_DEBUG_COLUMN is outside the current domain"
+            )
+        indices = (selected,)
+    else:
+        indices = range(ngrid)
+
     write_header = not os.path.exists(path)
     rows = []
     arrays = [
         ptsam1m.detach().cpu(),
+        pwsam1m.detach().cpu(),
         zsurfl.detach().cpu(),
         pgsn.detach().cpu(),
         zdif.detach().cpu(),
@@ -383,11 +402,12 @@ def _write_srft_debug(
         ztsa.detach().cpu(),
         ptsa_land.detach().cpu(),
     ]
-    ptsam1m_c, zsurfl_c, pgsn_c, zdif_c, zlst_c, zcdz_c, zrhs_c, ztsa_c, ptsa_c = arrays
-    for jl in range(ngrid):
+    ptsam1m_c, pwsam1m_c, zsurfl_c, pgsn_c, zdif_c, zlst_c, zcdz_c, zrhs_c, ztsa_c, ptsa_c = arrays
+    for jl in indices:
         rows.append([
             _SRFT_DEBUG_STEP, jl + 1,
             *[float(ptsam1m_c[jl, k]) for k in range(4)],
+            *[float(pwsam1m_c[jl, k]) for k in range(4)],
             float(zsurfl_c[jl]), float(pgsn_c[jl]),
             *[float(zdif_c[jl, k]) for k in range(4)],
             *[float(zlst_c[jl, k]) for k in range(4)],
@@ -400,6 +420,7 @@ def _write_srft_debug(
     fieldnames = [
         "step", "jl",
         "ptsa_in1", "ptsa_in2", "ptsa_in3", "ptsa_in4",
+        "pwsa_in1", "pwsa_in2", "pwsa_in3", "pwsa_in4",
         "zsurfl", "pgsn",
         "zdif1", "zdif2", "zdif3", "zdif4",
         "zlst1", "zlst2", "zlst3", "zlst4",
@@ -998,7 +1019,7 @@ def _soil_moisture_core(
     # ------------------------------------------------------------------ #
     # Step 4.4: SRFWINC -- new unfiltered moisture + drainage diagnostic.
     # ------------------------------------------------------------------ #
-    pwsa, psawgfl = _soil_moisture_update(
+    pwsa_pre, psawgfl = _soil_moisture_update(
         inp.pwsam1m, pwsadif, pcfw, psawgfl, inp.ldland, rsimp, ptmst, rho_h2o,
     )
     pwfsd = psawgfl[:, 0].clone()
@@ -1008,8 +1029,13 @@ def _soil_moisture_core(
     # and split saturation excess into surface / sub-surface runoff.
     # ------------------------------------------------------------------ #
     pwsa, pros, prod, pwfsd = _clip_and_redistribute(
-        pwsa, inp.pwsam1m, pros, pwfsd, wsat, wrest, rdaw,
+        pwsa_pre, inp.pwsam1m, pros, pwfsd, wsat, wrest, rdaw,
         land, inp.ldland, ptmst, rho_h2o,
+    )
+
+    _write_srfwater_debug(
+        inp.pwsam1m, pcfw, prhsw, pwsadif, pwsa_pre, pwsa, psawgfl,
+        pros, prod, pwfsd,
     )
 
     # ------------------------------------------------------------------ #
@@ -1023,6 +1049,45 @@ def _soil_moisture_core(
     return SoilMoistOutputs(
         pwsa=pwsa, pros=pros, prod=prod, pwfsd=pwfsd, psawgfl=psawgfl,
     )
+
+
+def _write_srfwater_debug(
+    pwsam1m, pcfw, prhsw, pwsadif, pwsa_pre, pwsa, psawgfl,
+    pros, prod, pwfsd,
+) -> None:
+    """Write an optional SRFWEXC/SRFWDIF/SRFWINC audit for one column."""
+    global _SRFW_DEBUG_STEP
+    path = os.environ.get("SURF_TORCH_SRF_WATER_DEBUG_CSV")
+    column = os.environ.get("SURF_TORCH_SRF_WATER_DEBUG_COLUMN")
+    if not path or not column:
+        return
+    try:
+        jl = int(column) - 1
+    except ValueError as exc:
+        raise ValueError("SURF_TORCH_SRF_WATER_DEBUG_COLUMN must be 1-based") from exc
+    if not 0 <= jl < pwsam1m.shape[0]:
+        raise ValueError("SURF_TORCH_SRF_WATER_DEBUG_COLUMN is outside the domain")
+
+    values = [
+        pwsam1m, pcfw, prhsw, pwsadif, pwsa_pre, pwsa, psawgfl,
+        pros[:, None], prod[:, None], pwfsd[:, None],
+    ]
+    cpu = [value.detach().cpu() for value in values]
+    row = [_SRFW_DEBUG_STEP, jl + 1]
+    for value in cpu[:7]:
+        row.extend(float(x) for x in value[jl])
+    for value in cpu[7:]:
+        row.append(float(value[jl, 0]))
+    header = ["step", "jl"]
+    for prefix in ("pwsa_in", "pcfw", "prhsw", "pwsadif", "pwsa_pre", "pwsa", "psawgfl"):
+        header.extend(f"{prefix}{k}" for k in range(1, 5))
+    header.extend(("pros", "prod", "pwfsd"))
+    with open(path, "a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(header)
+        writer.writerow(row)
+    _SRFW_DEBUG_STEP += 1
 
 
 # --------------------------------------------------------------------------- #

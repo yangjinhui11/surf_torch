@@ -138,14 +138,7 @@ def _rebuild_soiltemp_inputs(
     q_lev = forcing.q
     skin_t_prev = state.skin_t
     rhoc_u, rhoc_q = model._exchange_coeffs(forcing, static, state)
-    # Mirror forward()'s per-tile handling: in per_tile_exchange mode the
-    # helper already returns (Ngrid, ntile); otherwise broadcast the grid-
-    # mean (Ngrid,) tensors across tiles.
-    if cfg.per_tile_exchange:
-        rhoc_u_t, rhoc_q_t = rhoc_u, rhoc_q
-    else:
-        rhoc_u_t = expand_as_tiles(rhoc_u, ntile)
-        rhoc_q_t = expand_as_tiles(rhoc_q, ntile)
+    rhoc_u_t, rhoc_q_t = rhoc_u, rhoc_q
     sskm1m = cp * skin_t_prev
     # Saturation fields -- mirror forward() but don't need to be exact
     # for this comparison (they only affect pssh / pjq, which are taken
@@ -242,7 +235,7 @@ def _rebuild_soiltemp_inputs(
     pgsn_zero = torch.zeros((ngrid,), dtype=dtype, device=device)
     inp = model._update_soil_temperature(
         state=state, static=static, diff_out=diff_out,
-        pssrflti=ssrfl_t, pslrfl=slrfl_grid, pfrti=frac,
+        pssrflti=ssrfl_t, pslrfl=slrfl_grid, pslrflti=diff_out.pstr, pfrti=frac,
         pgsn=pgsn_zero,
         dt=forcing.dt, ngrid=ngrid, dtype=dtype, device=device,
     )
@@ -471,12 +464,7 @@ def _rebuild_soilmoist_inputs(
     sl_lev = cp * forcing.t + forcing.geom1
     skin_t_prev = state.skin_t
     rhoc_u, rhoc_q = model._exchange_coeffs(forcing, static, state)
-    # Mirror forward()'s per-tile handling (see _rebuild_soiltemp_inputs).
-    if cfg.per_tile_exchange:
-        rhoc_u_t, rhoc_q_t = rhoc_u, rhoc_q
-    else:
-        rhoc_u_t = expand_as_tiles(rhoc_u, ntile)
-        rhoc_q_t = expand_as_tiles(rhoc_q, ntile)
+    rhoc_u_t, rhoc_q_t = rhoc_u, rhoc_q
     sskm1m = cp * skin_t_prev
     from surf_pytorch.utils import qsat, dqsat_dt_ifs
     p_surf_t = expand_as_tiles(forcing.p_surf, ntile)

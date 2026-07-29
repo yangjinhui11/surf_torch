@@ -247,7 +247,7 @@ class SoilConstants:
     rsndtdestroi: float = 150.0
     rhomaxsn_new: float = 500.0
 
-    # single-layer snow (SRFSN_LWIMPS) liquid-water-capacity + melt window
+    # single-layer snow (SRFSN_LWIMP) liquid-water-capacity + melt window
     # (sussoil lines 520-523).  RLWCSWEA is the SWE scale above which the
     # liquid-water-capacity fraction collapses toward RLWCSWEC; RLWCSWEB /
     # RLWCSWEC are the low-density / high-density capacity fractions.

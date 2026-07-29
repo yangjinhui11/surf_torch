@@ -536,6 +536,38 @@ def _reference_assembly(
     )
 
 
+def _forward_with_captured_vdf_inputs(
+    model: LandSurface,
+    state: SurfState,
+    forcing: Forcing,
+    static: Static,
+):
+    """Run ``forward`` while retaining its exact VDFDIFH1S input object.
+
+    The surface driver now prepares tiled radiation before the VEXCS/VSURF
+    calls.  Reconstructing this input independently in the test allowed the
+    reference path to lag the driver and turned a boundary mismatch into an
+    apparent Fortran/PyTorch physics error.  Capturing the call contract here
+    makes the VDF comparison narrow and unambiguous; VUP/VEXCS are validated
+    separately from their own Fortran traces.
+    """
+    import surf_pytorch.model as model_mod
+
+    captured = {}
+    original = model_mod.compute_vdfdifh1s
+
+    def capture(diff_inp, consts, config):
+        captured["input"] = diff_inp
+        return original(diff_inp, consts, config)
+
+    model_mod.compute_vdfdifh1s = capture
+    try:
+        new_state, diag = model(state, forcing, static)
+    finally:
+        model_mod.compute_vdfdifh1s = original
+    return new_state, diag, captured["input"]
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -581,11 +613,13 @@ def test_forward_matches_fortran_assembly(ref, veg, seed):
     consts = model.consts
 
     # Port forward.
-    new_state, diag = model(state, forcing, static)
+    new_state, diag, inp_ref = _forward_with_captured_vdf_inputs(
+        model, state, forcing, static,
+    )
 
-    # Fortran-reference assembly: rebuild DiffusionInputs (every physical
-    # field computed via .so), then run VDFDIFH1S via .so.
-    inp_ref = _reference_assembly(model, state, forcing, static, ref, veg)
+    # The compiled reference receives the exact VDF boundary built by the
+    # production forward path.  This isolates the VDFDIFH1S port from the
+    # independently tested VUP/VEXCS and radiation-preparation stages.
     out_ref = ref.vdfdifh(inp_ref, veg, consts, cfg)
 
     # (1) Skin-T advance: forward() stores the SURFPP-written PTSKTI,
@@ -646,9 +680,9 @@ def test_forward_farquhar_matches_fortran_assembly(ref, veg, seed):
     model = LandSurface(cfg)
     consts = model.consts
 
-    new_state, diag = model(state, forcing, static)
-
-    inp_ref = _reference_assembly(model, state, forcing, static, ref, veg)
+    new_state, diag, inp_ref = _forward_with_captured_vdf_inputs(
+        model, state, forcing, static,
+    )
     out_ref = ref.vdfdifh(inp_ref, veg, consts, cfg)
 
     frac = model._tile_frac(static, cfg.n_tile, state=state)

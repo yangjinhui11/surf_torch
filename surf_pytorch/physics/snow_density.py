@@ -4,10 +4,9 @@ This module is the Python port of the snow-density block that lives in
 ``SRFSN_LWIMP`` (``srfsn_lwimp_mod.F90`` lines 357-377 and 494-527) -- the
 single-layer snow scheme with prognostic density.  The simplified single-
 layer path the port's :mod:`surf_pytorch.physics.snow` mirrors is
-``SRFSN_LWIMPS`` (with a trailing ``s``), which *does not* evolve density;
 density evolution is done in the sibling ``SRFSN_LWIMP`` (no ``s``) and in
 the multi-layer ``SRFSN_RSN`` (called from ``SRFSN_DRIVER``).  This module
-supplies the single-layer density evolution that ``SRFSN_LWIMPS`` omits,
+supplies the single-layer density evolution used by ``SRFSN_LWIMP``,
 so the port's snow prognostic advances ``PRSNM1M`` alongside ``PSNM1M``
 and ``PTSNM1M``.
 
@@ -106,7 +105,7 @@ class SnowDensityInputs:
     prsnm1m: torch.Tensor       # PRSNM1M  snow density        [kg/m^3]   (Ngrid,)
     ptsnm1m: torch.Tensor       # PTSNM1M  snow temperature    [K]        (Ngrid,)
 
-    # ---- New snow state at t (from SRFSN_LWIMPS solve) ----
+    # ---- New snow state at t (from SRFSN_LWIMP solve) ----
     ptsn: torch.Tensor          # PTSN  new snow temperature   [K]        (Ngrid,)
 
     # ---- Surface forcing ----
@@ -238,7 +237,7 @@ def _density_core(
     # ------------------------------------------------------------------ #
     # Snow liquid-water analytical functions (SRFSN_LWIMP lines 357-377).
     # These feed the melt-compaction term ZRSNDTMELT below.  They are the
-    # same melt-window functions used by SRFSN_LWIMPS, recomputed here so
+    # same melt-window functions used by SRFSN_LWIMP, recomputed here so
     # the density block is self-contained.
     # ------------------------------------------------------------------ #
     zeps = 1.0e-12

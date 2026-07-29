@@ -132,6 +132,12 @@ class Forcing:
     vdf_pslrflti: Optional[torch.Tensor] = None    # (Ngrid, Ntile) [W/m2]
     vdf_ptsktip1: Optional[torch.Tensor] = None    # (Ngrid, Ntile) [K]
 
+    # Snow-under-forest evaporation is formed by SURFEXCDRIVER outside the
+    # VDFDIFH1S output set.  An atmospheric caller may supply it as an
+    # authoritative boundary for coupled trajectory validation.
+    snow_under_forest_evap: Optional[torch.Tensor] = None  # (Ngrid,) [kg/m2/s]
+    tiled_shortwave: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [W/m2]
+
 
     # Optional: atmospheric profiles for explicit diffusion above the
     # surface layer (VDFMAIN1S args PUM1/.../PAPHM1, full KLEV axis).
@@ -173,6 +179,8 @@ class Forcing:
             vdf_pevapti=_mv(self.vdf_pevapti),
             vdf_pslrflti=_mv(self.vdf_pslrflti),
             vdf_ptsktip1=_mv(self.vdf_ptsktip1),
+            snow_under_forest_evap=_mv(self.snow_under_forest_evap),
+            tiled_shortwave=_mv(self.tiled_shortwave),
             u_profile=_mv(self.u_profile), v_profile=_mv(self.v_profile),
             t_profile=_mv(self.t_profile), q_profile=_mv(self.q_profile),
             p_profile=_mv(self.p_profile),

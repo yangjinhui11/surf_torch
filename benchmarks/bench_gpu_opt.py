@@ -29,7 +29,7 @@ def _sq(a): return np.asarray(a.values).ravel()
 def _ds(p): return xr.open_dataset(p)
 
 
-def build_1col(site="CA-001", dtype=torch.float64, device="cpu"):
+def build_1col(site="CA-001", dtype=torch.float64, device="cpu", *, diagnostics=False):
     """Build model + static + initial state for a single column."""
     cli = _ds(str(INPUT_ROOT / "clim" / "LS-PRACTICALS" / f"surfclim_{site}_2022-2022.nc"))
     c = {v: float(_sq(cli[v])[0]) for v in
@@ -78,7 +78,7 @@ def build_1col(site="CA-001", dtype=torch.float64, device="cpu"):
                "LWdown": _sq(met["LWdown"]), "Rainf": _sq(met["Rainf"]),
                "Snowf": _sq(met["Snowf"])}
 
-    cfg = SurfConfig(dtype=dtype, validate=False)
+    cfg = SurfConfig(dtype=dtype, validate=False, compute_diagnostics=diagnostics)
     model = LandSurface(cfg)
     if device != "cpu":
         model = model.to(device=device)
@@ -138,9 +138,11 @@ def _expand_1to(ncols, state, static):
     return state_b, static_b
 
 
-def benchmark(batch_size: int, nday: int, dtype=torch.float64, device="cuda:2"):
+def benchmark(batch_size: int, nday: int, dtype=torch.float64, device="cuda", *, diagnostics=False):
     """Run batch_size columns for nday days on device."""
-    model, static, state, forcing, c, cli = build_1col("CA-001", dtype, device)
+    model, static, state, forcing, c, cli = build_1col(
+        "CA-001", dtype, device, diagnostics=diagnostics,
+    )
     lat_deg = float(c["lat"]); lon_deg = float(c["lon"])
     g = float(PhysicalConstants().g)
     rsigma = float(PhysicalConstants().rsigma)
@@ -200,12 +202,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--nday", type=int, default=10)
     p.add_argument("--max-batch", type=int, default=1000)
+    p.add_argument("--device", default=None, help="CUDA device visible to this process")
+    p.add_argument("--diagnostics", action="store_true", help="Include per-step diagnostic packing")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
         print("No CUDA device. Exiting.")
         return
-    device = "cuda:2"
+    device = args.device or "cuda"
     dtype = torch.float64
 
     print(f"\n{'='*70}")
@@ -218,7 +222,7 @@ def main():
     # CPU baseline
     print("CPU  single-column  float64 ...", flush=True)
     try:
-        w, r, tp = benchmark(1, args.nday, dtype, "cpu")
+        w, r, tp = benchmark(1, args.nday, dtype, "cpu", diagnostics=args.diagnostics)
         results["CPU-1col"] = tp
         print(f"  {r:.1f} sim-days/s  ({tp:.0f} col-days/s)\n")
     except Exception as e:
@@ -230,7 +234,7 @@ def main():
             break
         print(f"GPU  batch={bs:<5d}  float64 ...", flush=True)
         try:
-            w, r, tp = benchmark(bs, args.nday, dtype, device)
+            w, r, tp = benchmark(bs, args.nday, dtype, device, diagnostics=args.diagnostics)
             results[f"GPU-{bs}col"] = tp
             print(f"  {r:.1f} sim-days/s  ({tp:.0f} col-days/s)")
         except Exception as e:
@@ -242,7 +246,7 @@ def main():
     for bs in [1000]:
         print(f"GPU  batch={bs:<5d}  float32 ...", flush=True)
         try:
-            w, r, tp = benchmark(bs, args.nday, torch.float32, device)
+            w, r, tp = benchmark(bs, args.nday, torch.float32, device, diagnostics=args.diagnostics)
             results[f"GPU-{bs}col-f32"] = tp
             print(f"  {r:.1f} sim-days/s  ({tp:.0f} col-days/s)")
         except Exception as e:

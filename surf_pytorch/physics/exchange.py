@@ -111,6 +111,8 @@ def psimu(eta: torch.Tensor) -> torch.Tensor:
                    - 2 * atan(sqrt(sqrt(1 - 16*eta))) + RCDHPI2``
     """
     z = torch.clamp(1.0 - RCDHALF * eta, min=0.0)   # protect sqrt arg
+    if torch.is_grad_enabled():
+        z = torch.clamp(z, min=torch.finfo(z.dtype).eps)
     sqrt_z = torch.sqrt(z)
     fourth_z = torch.sqrt(sqrt_z)
     # NB: the upstream statement function writes ``sqrt(1-16*eta)`` here,
@@ -137,7 +139,15 @@ def psihu(eta: torch.Tensor) -> torch.Tensor:
 
     ``PSIHU(eta) = 2 * log((1 + sqrt(1 - 16*eta)) / 2)``
     """
-    inner = torch.sqrt(torch.clamp(1.0 - RCDHALF * eta, min=0.0))
+    arg = torch.clamp(1.0 - RCDHALF * eta, min=0.0)
+    # The selected unstable branch has ``arg > 0``. On the unselected
+    # stable branch, autograd still differentiates through this expression
+    # and sqrt(0) has an infinite derivative. The epsilon is used only
+    # while constructing a gradient graph, preserving operational forward
+    # values and the Fortran calculation.
+    if torch.is_grad_enabled():
+        arg = torch.clamp(arg, min=torch.finfo(arg.dtype).eps)
+    inner = torch.sqrt(arg)
     return 2.0 * torch.log((1.0 + inner) * 0.5)
 
 
@@ -273,9 +283,15 @@ def vexcs(
     # (stable/neutral).  Buoyancy flux is *positive* upward in IFS, so a
     # negative PBUOM means stable stratification.
     pos_buom = torch.clamp(pbuom, min=0.0)
+    wstar_base = pos_buom * zipbl
+    if torch.is_grad_enabled():
+        # ``x**(2/3)`` has an undefined derivative at x=0. The Fortran
+        # branch remains exactly zero; this only makes the inactive branch
+        # well-defined for PyTorch autograd.
+        wstar_base = torch.clamp(wstar_base, min=torch.finfo(wstar_base.dtype).eps)
     zwst2 = torch.where(
         pbuom > 0.0,
-        (pos_buom * zipbl) ** zcon2,
+        wstar_base ** zcon2,
         torch.zeros_like(pbuom),
     )
 
@@ -506,4 +522,3 @@ def vexcss(
     pcfq = scale * torch.where(stable, fq_st, fq_un)
     zero = torch.zeros_like(pcfm)
     return ExchangeOutputs(pcfm=pcfm, pcfh=pcfh, pcfq=pcfq, pkh=zero, pkc=zero, pzdl=zero)
-

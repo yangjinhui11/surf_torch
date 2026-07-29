@@ -445,3 +445,17 @@ class TestM6cSnowIntegration:
         )
         # And the snow mass never moves.
         assert torch.equal(new_state.snow_w, state.snow_w)
+
+    def test_diagnostic_free_forward_preserves_prognostic_state(self):
+        """Skipping diagnostic packing does not alter the forecast state."""
+        state, forcing, static, cfg = _make_inputs(N=3)
+        reference, _ = LandSurface(config=cfg)(state, forcing, static)
+        fast_cfg = dataclasses.replace(cfg, compute_diagnostics=False)
+        forecast, diag = LandSurface(config=fast_cfg)(state, forcing, static)
+        for name, value in reference.__dict__.items():
+            candidate = getattr(forecast, name)
+            if torch.is_tensor(value):
+                assert torch.equal(candidate, value), name
+            else:
+                assert candidate == value, name
+        assert diag.h_flux is None

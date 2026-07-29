@@ -129,6 +129,7 @@ def _build_inputs(
         pahfsti=torch.full((N, n_tile), ahfs, dtype=dtype),
         pevapti=torch.full((N, n_tile), evap, dtype=dtype),
         pssrflti=torch.full((N, n_tile), ssrfl, dtype=dtype),
+        pslrflti=torch.full((N, n_tile), slrfl, dtype=dtype),
         pslrfl=torch.full((N,), slrfl, dtype=dtype),
         pssfc=torch.full((N,), pssfc, dtype=dtype),
         pssfl=torch.full((N,), pssfl, dtype=dtype),
@@ -276,6 +277,7 @@ class TestSnowRef:
         # Random tile fractions normalised to sum to 1.
         pfrti = torch.rand(N, T, dtype=torch.float64)
         pfrti = pfrti / pfrti.sum(dim=1, keepdim=True)
+        pslrfl = (torch.rand(N, dtype=torch.float64) - 0.5) * 120.0
         inp = SnowInputs(
             pssnm1m=torch.rand(N, dtype=torch.float64) * 60.0 + 1.0,
             ptsnm1m=torch.rand(N, dtype=torch.float64) * 12.0 + 264.0,
@@ -285,7 +287,11 @@ class TestSnowRef:
             pahfsti=(torch.rand(N, T, dtype=torch.float64) - 0.5) * 80.0,
             pevapti=(torch.rand(N, T, dtype=torch.float64) - 0.5) * 5.0e-6,
             pssrflti=torch.rand(N, T, dtype=torch.float64) * 150.0,
-            pslrfl=(torch.rand(N, dtype=torch.float64) - 0.5) * 120.0,
+            # The legacy test kernel accepts grid-mean longwave only.
+            # Use its tiled-equivalent field while production validation
+            # uses the authoritative SURFTSTP tiled boundary.
+            pslrflti=pslrfl[:, None].expand(-1, T).clone(),
+            pslrfl=pslrfl,
             pssfc=torch.rand(N, dtype=torch.float64) * 2.0e-6,
             pssfl=torch.rand(N, dtype=torch.float64) * 2.0e-6,
             ptsfc=torch.rand(N, dtype=torch.float64) * 2.0e-6,

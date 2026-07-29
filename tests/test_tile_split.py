@@ -119,8 +119,8 @@ def _make_forcing(*, N=2, dtype=torch.float64) -> Forcing:
     )
 
 
-def _model(*, validate=False) -> LandSurface:
-    return LandSurface(SurfConfig(dtype=torch.float64, validate=validate))
+def _model(*, validate=False, lelaiv=False) -> LandSurface:
+    return LandSurface(SurfConfig(dtype=torch.float64, validate=validate, lelaiv=lelaiv))
 
 
 # --------------------------------------------------------------------------- #
@@ -350,9 +350,20 @@ class TestVegTypeSplit:
 # Interception capacity consistency
 # --------------------------------------------------------------------------- #
 class TestInterceptionCapacity:
+    def test_offline_default_uses_lookup_lai_not_climatology(self):
+        """LELAIV=.FALSE. must reproduce SURFBC's RVLAI overwrite."""
+        m = _model()
+        static = _make_static(cvl=0.4, cvh=0.4, lai_low=1.0, lai_high=2.0)
+        pcvl, pcvh, _, plail, plaih = m._cover_fractions(static)
+        ktvl, ktvh = m._dominant_veg_types(static)
+        assert torch.allclose(plail, m.veg_table.gather("rvlai", ktvl))
+        assert torch.allclose(plaih, m.veg_table.gather("rvlai", ktvh))
+        assert not torch.allclose(plail, static.lai_low)
+        assert not torch.allclose(plaih, static.lai_high)
+
     def test_canonical_formula_used_with_covers(self):
         """PWLMX = RWLMAX*(1-cvl-cvh+cvl*LAIL+cvh*LAIH) on the cover path."""
-        m = _model()
+        m = _model(lelaiv=True)
         static = _make_static(cvl=0.4, cvh=0.4, lai_low=3.0, lai_high=5.0)
         frac = m._tile_frac(static, 8, state=_make_state())
         ktvl, ktvh = m._dominant_veg_types(static)
@@ -368,7 +379,7 @@ class TestInterceptionCapacity:
     def test_pwlmx_matches_compute_tile_frac_internal(self):
         """The PWLMX here must equal the one _compute_tile_frac uses for
         ZCVW (same canonical inputs)."""
-        m = _model()
+        m = _model(lelaiv=True)
         static = _make_static(cvl=0.4, cvh=0.4, lai_low=3.0, lai_high=5.0)
         frac = m._tile_frac(static, 8, state=_make_state(skin_water=0.0))
         ktvl, ktvh = m._dominant_veg_types(static)

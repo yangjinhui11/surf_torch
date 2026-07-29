@@ -360,8 +360,7 @@ class TestForwardIntegration:
 
     def test_snow_rho_advances_each_step(self):
         state, forcing, static = self._snowy_setup()
-        cfg = SurfConfig(dtype=torch.float64, validate=False,
-                         per_tile_exchange=False)
+        cfg = SurfConfig(dtype=torch.float64, validate=False)
         model = LandSurface(cfg)
         s = state
         for _ in range(8):
@@ -385,8 +384,7 @@ class TestForwardIntegration:
         evolved density has propagated through VLAMSK -> PTSN -> PGSN ->
         soil-T -> skin_t.
         """
-        cfg = SurfConfig(dtype=torch.float64, validate=False,
-                         per_tile_exchange=False)
+        cfg = SurfConfig(dtype=torch.float64, validate=False)
         model = LandSurface(cfg)
         st_lo, forcing, static = self._snowy_setup(N=1)
         st_hi, _, _ = self._snowy_setup(N=1)
@@ -409,8 +407,7 @@ class TestForwardIntegration:
     def test_no_snow_point_resets_density_to_rhominsn(self):
         """A point with no snow tiles -> density resets to RHOMINSN."""
         N = 2
-        cfg = SurfConfig(dtype=torch.float64, validate=False,
-                         per_tile_exchange=False)
+        cfg = SurfConfig(dtype=torch.float64, validate=False)
         model = LandSurface(cfg)
         state, forcing, _ = self._snowy_setup(N=N)
         # Strip the snow tiles so ZFRSN < RFRSMALL everywhere.

@@ -149,6 +149,12 @@ class SurfConfig:
     # helper, which transcribes the legacy ZFF=0 conductivity block.
     lesoilcond: bool = True
 
+    # LELAIV controls the LAI source used by SURFBC. The supported offline
+    # forcing cases set LELAIV=.TRUE., so the monthly climatology carried by
+    # Static is used by default. Set False only for a Fortran namelist that
+    # explicitly selects the vegetation lookup-table LAI.
+    lelaiv: bool = True
+
     # ----- Differentiability -----
     # When False (default), every physics routine runs under no_grad
     # for speed; the model can still be advanced step-by-step.
@@ -172,28 +178,10 @@ class SurfConfig:
     # port exposes it here so warm-start tests can drop it to 0..1.
     vexcs_kitt: int = 3
 
-    # When True (default), VEXCS runs per-tile with tile-specific roughness
-    # lengths and tile-specific surface state, mirroring the offline
-    # driver's tile loop (surfexcdrivers_ctl_mod.F90:388-398 calling VEXCSS
-    # once per tile with ZZ0MTI(:,JT), PCPTSTI(:,JT), ZQSATI(:,JT)).  The
-    # per-tile z0 follows vupdz0s_mod.F90:330-378 (low/high/bare tiles key
-    # off the dominant veg type, z0q = z0h for every land tile).  This is
-    # the dominant single-step skin-T term (+2.24K -- see
-    # scripts/diag_forward_assembly.py).  Set False to fall back to the
-    # legacy single grid-mean VEXCS broadcast across tiles.
-    per_tile_exchange: bool = True
-
     # ``offline`` owns the ported OSM VUPDZ0/VDFMAIN1S closure.
     # ``coupled`` requires authoritative tiled atmospheric-VDF fields.
     # No approximate VUP boundary mode is retained.
     vup_boundary_mode: str = "offline"
-    # Optional standalone-stability guard for long offline integrations
-    # from artificial initial states. None preserves the strict Fortran
-    # transcription. A value such as 100 K prevents the single-layer
-    # thin-snow branch from carrying non-physical snow temperatures into
-    # the next VUPDZ0/VSURF step.
-    snow_temperature_floor: Optional[float] = None
-
     # Longwave-radiation switches mirrored from SURFSEB/SURFTSTP.
     # LELWDD controls dLW/dT linearisation around the radiation skin
     # temperature; LELWTL recomputes tiled LW and must also feed tiled
@@ -207,6 +195,12 @@ class SurfConfig:
     # moisture within [0, wsat], etc.) at the end of each step.  Cheap
     # and catches porting bugs early; disable for production speed.
     validate: bool = True
+
+    # Pack tile and grid-mean flux diagnostics on every forward step.
+    # Forecast and throughput workflows that consume only the prognostic
+    # state can disable this to avoid duplicate tile-fraction reductions.
+    # The default preserves the public API and diagnostic behaviour.
+    compute_diagnostics: bool = True
 
     def n_active_tiles(self) -> int:
         """Number of active tiles including optional lake/urban."""

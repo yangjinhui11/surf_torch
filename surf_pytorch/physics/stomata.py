@@ -130,6 +130,7 @@ class VevapOutputs:
 
     pcsat: torch.Tensor     # multiplier of qs at the surface        [-]
     pcair: torch.Tensor     # multiplier of q at the lowest level     [-]
+    pcpts: torch.Tensor     # dry static energy (stressed)           [J/kg]
     pcptsu: torch.Tensor    # dry static energy (unstressed)         [J/kg]
     pcsatu: torch.Tensor    # as pcsat, unstressed low veg            [-]
     pcairu: torch.Tensor    # as pcair, unstressed low veg            [-]
@@ -149,7 +150,7 @@ def jarvis_resistance(
     t_air: torch.Tensor,            # (Ngrid,) PTMLEV lowest-model-level T
     q_air: torch.Tensor,            # (Ngrid,) PQMLEV lowest-model-level q
     p_surf: torch.Tensor,           # (Ngrid,) PAPHMS surface pressure
-    sw_down: torch.Tensor,          # (Ngrid,) PSRFD downward SW (W/m^2)
+    sw_down: torch.Tensor,          # (Ngrid,) or (Ngrid,Ntile) downward SW
     veg_table: VegTable,
     soil_table: SoilTable,
     root_table: RootTable,
@@ -184,8 +185,10 @@ def jarvis_resistance(
         Lowest-model-level air temperature, specific humidity and
         surface pressure -- the inputs to the F3 VPD calculation.
     sw_down:
-        Downward short-wave radiation at the surface (W/m^2).  Used by
-        the Betts radiation-stress factor F1 (vsurf PSRFD).
+        Downward short-wave radiation at the surface (W/m^2). A grid field
+        is accepted for legacy callers. The SURF path supplies tile fields,
+        from which VSURF uses low-vegetation tile 4 and high-vegetation tile
+        6 for their respective Betts radiation-stress factors.
     veg_table, soil_table, root_table:
         Lookup tables -- we read RVRSMIN / RVHSTR / default RVLAI (veg),
         RWPWPM / RWCAPM / RWRESTM / RQWEVAPM (soil), RVROOTSA (roots).
@@ -312,9 +315,25 @@ def jarvis_resistance(
     # 8. Radiation stress F1 (Betts; vsurf 378-381).  Identical for low
     #    and high vegetation.
     # ----------------------------------------------------------------- #
-    srfl = sw_down / 250.0
-    f1l = 1.0 / torch.clamp(0.81 * (1.0 + srfl) / (srfl + 0.05), min=1.0)
-    f1h = f1l
+    if sw_down.ndim == 1:
+        sw_low = sw_down
+        sw_high = sw_down
+    elif sw_down.ndim == 2 and sw_down.shape[1] > 5:
+        # Fortran tile indices 4 and 6 are zero-based 3 and 5 here.
+        sw_low = sw_down[:, 3]
+        sw_high = sw_down[:, 5]
+    else:
+        raise ValueError(
+            "sw_down must be (Ngrid,) or a tiled field with at least 6 tiles"
+        )
+    srfl_low = sw_low / 250.0
+    srfl_high = sw_high / 250.0
+    f1l = 1.0 / torch.clamp(
+        0.81 * (1.0 + srfl_low) / (srfl_low + 0.05), min=1.0,
+    )
+    f1h = 1.0 / torch.clamp(
+        0.81 * (1.0 + srfl_high) / (srfl_high + 0.05), min=1.0,
+    )
 
     # ----------------------------------------------------------------- #
     # 9. Vapour-pressure-deficit stress F3 (vsurf 383-392).  ZQSAIR is
@@ -688,18 +707,18 @@ def vevap(
         # evaporation from a free surface.
         pass
 
-    # Section 3 -- PCPTS / PCPTSU moist-static-energy terms (vevap
-    # 260-265).  These feed the SEB's cp*Tsk mapping; here we expose
-    # PCPTSU (unstressed) as a diagnostic.  PCPTSU = Tsk*cpd*(1 +
-    # RVTMP2*(PCSATU*qs + (1-PCAIRU)*q_air)).  Note RVTMP2 in the offline
-    # driver override is 0.0, so this collapses to Tsk*cpd in practice,
-    # but we transcribe the full form for fidelity.
+    # Section 3 -- stressed and unstressed moist-static-energy terms
+    # (vevap 260-265).  The final prognostic SURFSEB call uses PCPTS;
+    # PCPTSU belongs to the separate potential-evaporation diagnostic.
+    pcpts = skin_t * cpd * (
+        1.0 + rvtmp2 * (pcsat * qs_skin + (1.0 - pcair) * q_air)
+    )
     pcptsu = skin_t * cpd * (
         1.0 + rvtmp2 * (pcsatu * qs_skin + (1.0 - pcairu) * q_air)
     )
 
     return VevapOutputs(
-        pcsat=pcsat, pcair=pcair, pcptsu=pcptsu,
+        pcsat=pcsat, pcair=pcair, pcpts=pcpts, pcptsu=pcptsu,
         pcsatu=pcsatu, pcairu=pcairu, pcsnw=pcsnw, pdhvegs=pdhvegs,
     )
 
@@ -915,6 +934,7 @@ def build_tile_vevap(
     pcsatu = torch.ones((ngrid, ntile), dtype=dtype, device=device)
     pcairu = torch.ones((ngrid, ntile), dtype=dtype, device=device)
     pcsnw  = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+    pcpts = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
     pcptsu = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
     pdhvegs = torch.zeros((ngrid, ntile, 2, 4), dtype=dtype, device=device)
 
@@ -947,6 +967,7 @@ def build_tile_vevap(
         )
         pcsat[:, jt]  = out.pcsat
         pcair[:, jt]  = out.pcair
+        pcpts[:, jt]  = out.pcpts
         pcsatu[:, jt] = out.pcsatu
         pcairu[:, jt] = out.pcairu
         pcptsu[:, jt] = out.pcptsu
@@ -968,7 +989,7 @@ def build_tile_vevap(
     if ntile > TILE_URBAN:
         _run_tile(TILE_URBAN, KTILE_URBAN, pwetb)
 
-    # PCPTSU is computed unconditionally per tile in VEVAP (lines
+    # PCPTS / PCPTSU are computed unconditionally per tile in VEVAP (lines
     # 260-265 sit outside the IF-ladder).  Tiles without an alpha
     # branch (water / ice / snow-on-low-veg / lake) keep PCSATU =
     # PCAIRU = 1 but still get PCPTSU = Tsk*cpd*(1 + RVTMP2*(qs +
@@ -980,10 +1001,12 @@ def build_tile_vevap(
     rvtmp2 = consts.rvtmp2
     free_mask = pcptsu == 0.0
     pcptsu_free = skin_t * cpd * (1.0 + rvtmp2 * qs_skin)
+    pcpts = torch.where(free_mask, pcptsu_free, pcpts)
     pcptsu = torch.where(free_mask, pcptsu_free, pcptsu)
 
     return {
         "pcsat": pcsat, "pcair": pcair,
+        "pcpts": pcpts,
         "pcsatu": pcsatu, "pcairu": pcairu,
         "pcptsu": pcptsu, "pcsnw": pcsnw,
         "pdhvegs": pdhvegs,

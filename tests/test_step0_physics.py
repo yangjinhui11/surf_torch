@@ -45,6 +45,7 @@ the verified Fortran net-LW, so they run on every commit.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from surf_pytorch import IdealizedDiurnalConfig, build_idealized_diurnal
@@ -88,13 +89,13 @@ def _matching_config() -> IdealizedDiurnalConfig:
     )
 
 
-def _step0_delta(fr_th_wm2: float, *, per_tile: bool) -> float:
+def _step0_delta(fr_th_wm2: float) -> float:
     """Run one forward() step with a forced net-LW; return grid-mean Δskin.
 
     Rebuilds the idealized-diurnal step-0 forcing, overrides the net
     longwave to the supplied rate (cumulative = rate * dt), runs one
     ``LandSurface.forward`` step, and returns the tile-fraction-weighted
-    grid-mean skin-T delta (K).  ``per_tile`` selects the exchange mode.
+    grid-mean skin-T delta (K) using the Fortran tile loop.
     """
     cfg = _matching_config()
     forcing_list, static, init_state = build_idealized_diurnal(cfg)
@@ -104,10 +105,7 @@ def _step0_delta(fr_th_wm2: float, *, per_tile: bool) -> float:
         **{**f0.__dict__,
            "fr_th": torch.full_like(f0.fr_th, fr_th_wm2 * dt)},
     )
-    surf_cfg = SurfConfig(
-        dtype=torch.float64, device=torch.device("cpu"),
-        per_tile_exchange=per_tile,
-    )
+    surf_cfg = SurfConfig(dtype=torch.float64, device=torch.device("cpu"))
     model = LandSurface(surf_cfg, consts=PhysicalConstants())
     with torch.no_grad():
         new_state, _ = model(init_state, f0_fr, static)
@@ -126,7 +124,7 @@ class TestStep0Physics:
         # -6.038 K to within the documented residual (~0.25 K, the
         # single-step-forward vs full-driver-step gap -- see module
         # docstring + docs/PROGRESS.md P1.6-4c).
-        delta = _step0_delta(FORTRAN_STEP0_FRTH_WM2, per_tile=True)
+        delta = _step0_delta(FORTRAN_STEP0_FRTH_WM2)
         gap = abs(delta - FORTRAN_STEP0_DELTA)
         assert gap < PER_TILE_RESIDUAL_K, (
             f"per-tile step-0 Δskin = {delta:+.4f} K, "
@@ -135,6 +133,7 @@ class TestStep0Physics:
             f"-- a regression in the per-tile exchange."
         )
 
+    @pytest.mark.skip(reason="the grid-mean exchange path was removed")
     def test_per_tile_beats_grid_mean(self):
         # The per-tile exchange must materially improve on the grid-mean
         # path: the grid-mean delta is ~-3.6 K (a >2 K gap), whereas the
@@ -150,6 +149,7 @@ class TestStep0Physics:
             f"the single-step physics as expected."
         )
 
+    @pytest.mark.skip(reason="the grid-mean exchange path was removed")
     def test_grid_mean_legacy_path_is_documented_poor(self):
         # The grid-mean (legacy) path leaves a material single-step gap
         # (~1.9 K under the Fortran-exact net-LW).  Pin it explicitly so

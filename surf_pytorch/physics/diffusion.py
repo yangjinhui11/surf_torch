@@ -313,7 +313,8 @@ def _vdfdifh1s_core(
     # ------------------------------------------------------------------ #
     # PCFHTI / PCFQTI carry the upstream RG*PTSPHY*RVDIFTS rescaling;
     # the SEB consumes the inverted "rho*Ch*|U|" form.
-    zcoef1 = 1.0 / (rg * RVDIFTS * ptmst)
+    ptmst_tile = ptmst.unsqueeze(-1) if ptmst.ndim == 1 else ptmst
+    zcoef1 = 1.0 / (rg * RVDIFTS * ptmst_tile)
     rhochu = inp.pcfhti * zcoef1
     rhocqu = inp.pcfqti * zcoef1
 

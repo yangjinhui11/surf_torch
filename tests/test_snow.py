@@ -119,6 +119,7 @@ def _build_inputs(
         pahfsti=torch.full((N, n_tile), ahfs, dtype=dtype),
         pevapti=torch.full((N, n_tile), evap, dtype=dtype),
         pssrflti=torch.full((N, n_tile), ssrfl, dtype=dtype),
+        pslrflti=torch.full((N, n_tile), slrfl, dtype=dtype),
         pslrfl=torch.full((N,), slrfl, dtype=dtype),
         pssfc=torch.full((N,), pssfc, dtype=dtype),
         pssfl=torch.full((N,), pssfl, dtype=dtype),
@@ -146,6 +147,7 @@ class TestSnowBranches:
         rtt = float(consts.rtt.item())
         assert torch.allclose(out.ptsn, torch.full_like(out.ptsn, rtt))
         assert torch.allclose(out.pgsn, torch.zeros_like(out.pgsn))
+        assert torch.allclose(out.pmsn, torch.zeros_like(out.pmsn))
 
     def test_no_snow_branch_keeps_residual_snow_tile_exchange(
         self, soil_table, consts, config,

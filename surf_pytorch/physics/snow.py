@@ -1,12 +1,9 @@
-"""HTESSEL single-layer snow (``SRFSN_LWIMPS``).
+"""HTESSEL single-layer snow for the ``SURFTSTP_CTL`` path.
 
-This module is the Python port of ``SRFSN_LWIMPS`` -- the simplified
-single-layer snow scheme (with diagnostic liquid water and rainfall
-interception) used by ``SURFTSTPS_CTL`` when ``NCSNEC == 1`` (the
-offline-driver default; ``sudim1s.F90`` line 74).  The richer multi-
-layer ``SRFSN_WEBALS`` is *not* ported -- it is gated behind
-``LESLML = .FALSE.`` which the offline driver never sets, so it never
-runs in our comparison harness.
+This module ports ``SRFSN_LWIMP``, the single-layer snow process called
+by ``SURFTSTP_CTL`` in both the OpenIFS coupled model and its offline
+driver when ``LESNML=.FALSE.`` and ``LESN09=.TRUE.``.  No simplified
+snow solver is available through this interface.
 
 What the scheme does
 --------------------
@@ -99,7 +96,7 @@ from ..tables.soil import SoilTable
 
 
 # --------------------------------------------------------------------------- #
-# Fortran tile indices used by SRFSN_LWIMPS, mapped to the port tile enum.
+# Fortran tile indices used by SRFSN_LWIMP, mapped to the port tile enum.
 # Fortran PFRTI(JL,3..8) -> Python pfrti[:, 2..7]; lake is PFRTI(JL,9) -> 8.
 # --------------------------------------------------------------------------- #
 # Snow tile-fraction indices (1-based in Fortran).
@@ -120,7 +117,7 @@ class SnowInputs:
     """All inputs to the HTESSEL single-layer snow solve.
 
     Each tensor is ``(Ngrid,)`` unless noted.  Per-tile fields are
-    ``(Ngrid, Ntile)``.  Naming mirrors the ``SRFSN_LWIMPS`` dummy list
+    ``(Ngrid, Ntile)``.  Naming mirrors the ``SRFSN_LWIMP`` dummy list
     so a side-by-side audit is easy.
 
     Cold-start note: the snowfall / throughfall / interception-mismatch
@@ -141,6 +138,7 @@ class SnowInputs:
     pahfsti: torch.Tensor             # PAHFSTI  tile sensible heat  [W/m^2]     (Ngrid, Ntile)
     pevapti: torch.Tensor             # PEVAPTI  tile moisture flux  [kg/m^2/s]  (Ngrid, Ntile)
     pssrflti: torch.Tensor            # PSSRFLTI tile net SW         [W/m^2]     (Ngrid, Ntile)
+    pslrflti: torch.Tensor            # PSLRFLTI tile net LW         [W/m^2]     (Ngrid, Ntile)
 
     # ---- Per-grid radiation ----
     pslrfl: torch.Tensor              # PSLRFL   net LW              [W/m^2]     (Ngrid,)
@@ -161,7 +159,6 @@ class SnowInputs:
 
     # ---- Lake ice (FLake stub; zero at cold start) ----
     phlicem1m: Optional[torch.Tensor] = None   # PHLICEM1M lake ice thickness [m] (Ngrid,)
-    pslrflti: Optional[torch.Tensor] = None  # PSLRFLTI tiled net LW [W/m^2] (Ngrid, Ntile)
 
 
 @dataclass
@@ -172,7 +169,7 @@ class SnowOutputs:
     ptsn: torch.Tensor                # PTSN  new snow temperature   [K]         (Ngrid,)
     pgsn: torch.Tensor                # PGSN  ground heat flux from snow -> soil  [W/m^2] (Ngrid,)
 
-    # ---- Diagnostics (mirror the SRFSN_LWIMPS local variables) ----
+    # ---- Diagnostics (mirror the SRFSN_LWIMP local variables) ----
     psstar: torch.Tensor              # ZSSTAR  updated snow mass (SWE) [kg/m^2] (Ngrid,)
     plwc: torch.Tensor                # ZLWC   snow liquid water capacity [kg/m^2] (Ngrid,)
     zfrsn: torch.Tensor               # ZFRSN  snow tile fraction (normaliser) [-] (Ngrid,)
@@ -199,7 +196,7 @@ def compute_snow(
     *,
     differentiable: Optional[bool] = None,
 ) -> SnowOutputs:
-    """Run the HTESSEL single-layer snow solve (``SRFSN_LWIMPS``).
+    """Run the HTESSEL single-layer snow solve (``SRFSN_LWIMP``).
 
     Args
     ----
@@ -207,11 +204,11 @@ def compute_snow(
         :class:`SnowInputs` -- packed snow state, fluxes and masks.
     soil_table:
         :class:`surf_pytorch.tables.soil.SoilTable` -- provides the snow
-        constants (rhoice, rhoci, rlamsn, rlwcswe*, rtempamp, rtauf,
-        rtaua, rfrsmall, rfrtiny, rdsmax).
+        constants (rhoice, rhoci, rlamsn, rlwcswe*, rtempamp, rfrsmall,
+        rfrtiny, rdsmax).
     consts:
         :class:`ConstantBundle` -- provides ``rtt``, ``rlmlt``, ``rlvtt``,
-        ``rlstt``, ``rday`` and ``pi``.
+        ``rlstt`` and ``pi``.
     config:
         :class:`SurfConfig` -- ``use_flake`` selects the lake branch.
     differentiable:
@@ -254,7 +251,6 @@ def _snow_core(
     rlvtt = consts.rlvtt
     rlstt = consts.rlstt
     rpi = consts.pi
-    rday = consts.rday
 
     sc = soil_table.consts
     rhoice = float(sc.rhoice)
@@ -268,14 +264,12 @@ def _snow_core(
     rlwcsweb = float(sc.rlwcsweb)
     rlwcswec = float(sc.rlwcswec)
     rtempamp = float(sc.rtempamp)
-    rtauf = float(sc.rtauf)
-    rtaua = float(sc.rtaua)
 
     ptmst = inp.ptmst
 
     # Soil resistance for heat conduction in the half top soil layer.
     # RVLAMSK(8) is the bare-soil (desert) skin-layer conductivity
-    # (susveg line 175: 15 W/m^2/K); SRFSN_LWIMPS uses its inverse.
+    # (susveg line 175: 15 W/m^2/K); SRFSN_LWIMP uses its inverse.
     # The value is class-agnostic in the snow context (only index 8 is
     # ever used), so we hard-wire the desert value to match the Fortran.
     rvlamsk_8 = 15.0
@@ -287,13 +281,6 @@ def _snow_core(
     zhoice = 1.0 / rhoice
     zt0 = rtt
     ztmst = 1.0 / ptmst
-    zexpf = math_exp(-rtauf * ptmst / rday)   # not used by SRFSN_LWIMPS body
-                                              # (kept for parity; the offline
-                                              # driver computes it but the
-                                              # body never references it).
-    del zexpf  # silence unused-variable warning
-    zlina = rtaua * ptmst / rday              # likewise unused in the body
-    del zlina
     zitempamp = 1.0 / rtempamp
 
     # ZRDSNMAX / ZRDSNRESMAX (Fortran lines 173-174): both 1.0 m.
@@ -338,15 +325,9 @@ def _snow_core(
     pevapti_7 = _tile_col(inp.pevapti, TILE_HIGH_VEG_SNOW, dtype, device)
     pssrflti_5 = _tile_col(inp.pssrflti, TILE_LOW_VEG_SNOW, dtype, device)
     pssrflti_7 = _tile_col(inp.pssrflti, TILE_HIGH_VEG_SNOW, dtype, device)
-    # SURFTSTPS/SRFSN_LWIMPS supplies only grid-box PSLRFL.  The full
-    # SURFTSTP/SRFSN_LWIMP path first builds ZSLRFLTI; when LELWTL is on
-    # this is the tiled VDF/SURFSEB longwave field PSLRFLTI.
-    if inp.pslrflti is None:
-        pslrflti_5 = inp.pslrfl
-        pslrflti_7 = inp.pslrfl
-    else:
-        pslrflti_5 = _tile_col(inp.pslrflti, TILE_LOW_VEG_SNOW, dtype, device)
-        pslrflti_7 = _tile_col(inp.pslrflti, TILE_HIGH_VEG_SNOW, dtype, device)
+    # SRFSN_LWIMP receives the tiled longwave field built by SURFTSTP.
+    pslrflti_5 = _tile_col(inp.pslrflti, TILE_LOW_VEG_SNOW, dtype, device)
+    pslrflti_7 = _tile_col(inp.pslrflti, TILE_HIGH_VEG_SNOW, dtype, device)
 
     ptsnm1m = inp.ptsnm1m
     pssnm1m = inp.pssnm1m
@@ -476,8 +457,7 @@ def _snow_core(
     # ZCOND4   = ZLWC*(1 - ZFUNC)
     # ZWFLUXRF = min(ZCOND3, ZCOND4)
     # ZCOND5   = ZCONSA*(ZT0 - PTSNM1M)*ZTMST
-    #             (SRFSN_LWIMP path used by SURFTSTP; the simplified
-    #              SRFSN_LWIMPS variant adds +ZT0*ZRS here.)
+    # This is the SRFSN_LWIMP formulation.
     # ZCOND6   = RLMLT*ZWFLUXRF*ZTMST
     # ZHFLUXRF1= min(ZCOND5, ZCOND6); ZHFLUXRF1 = max(ZHFLUXRF1, 0)
     # ZWFLUXRF = ZHFLUXRF1 / RLMLT                     -- intercepted mass
@@ -510,13 +490,12 @@ def _snow_core(
     )
 
     # --- Solve implicit temperature equation -------------------------- #
-    # ZTSTARI = 1 / (1 + ZCONS2*ZRS)
-    # ZTSTAR  = (PTSNM1M + ZCONS2*(ZHFLUX + ZHFLUXRF1 + PTSAM1M(1)*ZRS))
-    #           * ZTSTARI
-    ztstari = 1.0 / (1.0 + zcons2 * zrs)
+    # Keep the Fortran division order.  Computing a reciprocal first and
+    # multiplying is algebraically equivalent but drifts by ULPs in PGSN,
+    # which can later alter a melt/no-melt threshold.
     ztstar = (
         ptsnm1m + zcons2 * (zhflux + zhfluxrf1 + ptsam1m_top * zrs)
-    ) * ztstari
+    ) / (1.0 + zcons2 * zrs)
 
     # --- Branches (no-melt vs melt) ----------------------------------- #
     no_melt = ztstar <= zt0
@@ -616,7 +595,10 @@ def _snow_core(
     # Normalise PGSN to the grid-square (Fortran lines 336-338):
     #   PGSN = ZFRSN * PGSN
     # ------------------------------------------------------------------ #
-    pgsn = zfrsn * pgsn
+    # Retain the local snow-tile flux for trace alignment: the Fortran
+    # SRFSN_LWIMP debug hook writes before this grid-area normalization.
+    pgsn_local = pgsn
+    pgsn = zfrsn * pgsn_local
 
     # PMSN follows SRFSN_LWIMP: the branch logic first computes the local
     # snow-tile melt flux, then section 5 normalises it to the grid square
@@ -625,6 +607,11 @@ def _snow_core(
     pmsn_full = zmsn * zdtm_full * ztmst
     pmsn_melt = torch.where(full_melt, pmsn_full, pmsn_partial)
     pmsn_out = zfrsn * torch.where(melt, pmsn_melt, torch.zeros_like(zmsn))
+    # SRFSN_LWIMP's LLNOSNOW branch explicitly resets both PGSN and PMSN.
+    # PMSN is consumed by the soil-water budget in the same surface step;
+    # retaining a provisional melt flux here injects spurious water when
+    # the snow tile drops below RFRSMALL.
+    pmsn_out = torch.where(llnosnow, torch.zeros_like(pmsn_out), pmsn_out)
     pmsnint = zconsb * zfrsn * (ptsn - ptsnm1m) / ptmst
     pmsnint = torch.where(llnosnow, torch.zeros_like(pmsnint), pmsnint)
 
@@ -679,6 +666,7 @@ def _snow_core(
         full_melt=full_melt,
         ptsn=ptsn,
         pssn=zsstar_out,
+        pgsn_local=pgsn_local,
         pgsn=pgsn,
         pmsn=pmsn_out,
         pmsnint=pmsnint,
@@ -722,11 +710,18 @@ def _append_snow_debug(**cols: torch.Tensor) -> None:
         return float(v.item())
 
     ngrid = next(iter(cols.values())).detach().reshape(-1).shape[0]
+    column_text = os.environ.get("SURF_TORCH_SNOW_DEBUG_COLUMN", "")
+    indices = range(ngrid)
+    if column_text:
+        column = int(column_text) - 1
+        if not 0 <= column < ngrid:
+            raise ValueError(f"SURF_TORCH_SNOW_DEBUG_COLUMN out of range: {column + 1}")
+        indices = (column,)
     with out.open("a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
             writer.writerow(header)
-        for i in range(ngrid):
+        for i in indices:
             writer.writerow([step, i + 1] + [item(cols[name], i) for name in names])
 
 
@@ -772,13 +767,6 @@ def _interception_gridfrac(
             full_lake, torch.zeros_like(zgridfrac), zgridfrac + lake_frac
         )
     return zgridfrac
-
-
-def math_exp(x: float) -> float:
-    """``math.exp`` indirection so the import lives at module top."""
-    import math
-    return math.exp(x)
-
 
 __all__ = [
     "SnowInputs",

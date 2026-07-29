@@ -20,10 +20,10 @@ fraction ``PCIL`` is supplied on the inputs:
   ZRTAUF_GL=0.085, ZALBMAX_GL=RALFMINPSN=0.82) and a hemisphere-
   dependent snowfall reset threshold (5 mm NH / 4 mm SH).
 
-The newer ``SRFSN_LWIMPS`` path that :mod:`surf_pytorch.physics.snow`
+The ``SRFSN_LWIMP`` path that :mod:`surf_pytorch.physics.snow`
 mirrors *does not* update the snow albedo ``PASN`` -- its signature only
 outputs ``PTSN``/``PGSN`` -- so this module supplies the aging that
-``SRFSN_LWIMPS`` omits, advancing ``PASNM1M`` alongside ``PSNM1M``,
+advances ``PASNM1M`` alongside ``PSNM1M``,
 ``PTSNM1M`` and ``PRSNM1M``.
 
 What the legacy scheme does
@@ -126,7 +126,7 @@ class SnowAlbedoInputs:
     # ---- Snow albedo at t-1 ----
     pasnm1m: torch.Tensor       # PASNM1M  snow albedo   [-]        (Ngrid,)
 
-    # ---- Melt rate at t (from SRFSN_LWIMPS solve) ----
+    # ---- Melt rate at t (from SRFSN_LWIMP solve) ----
     pmsn: torch.Tensor          # PMSN  melt rate        [kg/m^2/s] (Ngrid,)
 
     # ---- Snowfall throughfall (per grid, large-scale + convective) ----
