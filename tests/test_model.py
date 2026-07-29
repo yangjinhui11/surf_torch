@@ -96,6 +96,7 @@ class TestLandSurfaceForward:
             lai_low=torch.tensor([0.6], dtype=cfg.dtype),
             lai_high=torch.tensor([1.4], dtype=cfg.dtype),
         )
+        cfg = dataclasses.replace(cfg, lelaiv=True)
         model = LandSurface(cfg)
         frac = model._tile_frac(static, cfg.n_tile, state=state)
         ktvl, ktvh = model._dominant_veg_types(static)

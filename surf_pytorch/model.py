@@ -22,10 +22,8 @@ Currently implemented:
   SEB step and returns the updated skin temperature, the turbulent fluxes
   and grid-mean lowest-level (Sl, Ql).
 * **M4.1** -- the Beljaars Monin-Obukhov surface-layer exchange
-  coefficients (:func:`surf_pytorch.physics.exchange.vexcs`).  When the
-  :class:`Static` descriptor carries roughness lengths (``z0m`` /
-  ``z0h`` / ``z0q``) the model uses the full stability-dependent
-  scheme; otherwise it falls back to a neutral ``Cd = 1e-3`` placeholder.
+  coefficients (surf_pytorch.physics.exchange.vexcs) with the
+  tiled VUPDZ0 roughness and stability closure.
 * **M4.2** -- the offline-driver VDFDIFH1S SURFSEB wrapper
   (:func:`surf_pytorch.physics.diffusion.vdfdifh1s`).  ``forward``
   dispatches through this wrapper so the snow-under-forest evaporation,
@@ -302,16 +300,18 @@ class LandSurface(nn.Module):
         ``ZCOEF1 = 1/(RG*RVDIFTS*PTMST)`` so the SEB receives the
         physical exchange coefficients.
 
-        Placeholders active in this step (replaced in later milestones)
-        ----------------------------------------------------------------
-        * :meth:`_exchange_coeffs` -- when ``Static`` lacks roughness
-          lengths the model uses a neutral ``Cd = 1e-3`` placeholder
-          with ``Ch = Cq = Cd`` instead of the full Louis/Beljaars
-          Monin-Obukhov scheme.  When z0 is populated the full VEXCS
-          path runs (M4.1).
-        * :meth:`_sub_surface_t` -- broadcasts the top soil-layer T to
-          every tile; proper sea-ice / lake skin stubs come with the
-          snow (M6) / lake modules.
+        Boundary modes
+        --------------
+        vup_boundary_mode=offline executes the ported tiled VUPDZ0/VDF
+        closure. vup_boundary_mode=coupled requires the complete tiled
+        atmospheric boundary supplied by OpenIFS. No neutral or grid-mean
+        exchange fallback is available through this interface.
+
+        Remaining optional physics
+        --------------------------
+        * _sub_surface_t broadcasts the top soil-layer T to every tile;
+          proper sea-ice / lake skin stubs come with the snow (M6) / lake
+          modules.
         * :meth:`_snow_density` -- t-1 reader (PRSNM1M): prefers the
           prognostic ``state.snow_rho``, else the 300 kg/m^3 fresh-snow
           cold-start.  The *evolved* density is produced by

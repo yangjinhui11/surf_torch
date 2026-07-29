@@ -149,11 +149,12 @@ class SurfConfig:
     # helper, which transcribes the legacy ZFF=0 conductivity block.
     lesoilcond: bool = True
 
-    # LELAIV controls the LAI source used by SURFBC. The supported offline
-    # forcing cases set LELAIV=.TRUE., so the monthly climatology carried by
-    # Static is used by default. Set False only for a Fortran namelist that
-    # explicitly selects the vegetation lookup-table LAI.
-    lelaiv: bool = True
+    # LELAIV controls the LAI source used by SURFBC.  The OpenIFS offline
+    # driver configuration used by this package sets LELAIV=.FALSE.; SURFBC
+    # therefore overwrites ancillary LAI with the vegetation-table values.
+    # Enable this only when the corresponding Fortran namelist explicitly
+    # requests climatological LAI from Static.
+    lelaiv: bool = False
 
     # ----- Differentiability -----
     # When False (default), every physics routine runs under no_grad
