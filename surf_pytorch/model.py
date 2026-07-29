@@ -815,14 +815,26 @@ class LandSurface(nn.Module):
         # through the SRFSN_LWIMP section-3.1 density-evolution port
         # (_update_snow_density).  The skin-reservoir water advances
         # through SRFWL: PWL <- canopy_out.pwl.
-        # A snow store can melt to zero during a step whose input snow tile
-        # is active.  SURFTSTP still carries that step's PTSN/PRSN values
-        # into the restart state; resetting them to RTT here changes the
-        # next snow-onset trajectory relative to Fortran.
+        # When an active snow tile is exhausted within this step, OSM's
+        # restart packing resets the diagnostic snow temperature and density
+        # to their no-snow reference values. Retaining the provisional
+        # cold-snow solution causes a spurious tens-of-kelvin SnowT mismatch
+        # while SWE is exactly zero, and provides the wrong t-1 state at the
+        # next snow onset.
+        new_snow_t = snow_out.ptsn
+        snow_exhausted = new_snow_w <= 0.0
+        new_snow_t = torch.where(
+            snow_exhausted,
+            torch.full_like(new_snow_t, self.consts.rtt),
+            new_snow_t,
+        )
+        new_snow_rho = torch.where(
+            snow_exhausted,
+            torch.full_like(new_snow_rho, self.soil_table.consts.rhominsn),
+            new_snow_rho,
+        )
         skin_water_tendency = (canopy_out.pwl - state.skin_water) / dt
         skin_water_out = state.skin_water + dt * skin_water_tendency
-
-        new_snow_t = snow_out.ptsn
         provisional_state = state.like(
             skin_t=surfpp_skin_t,
             soil_t=new_soil_t,
