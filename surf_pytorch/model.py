@@ -752,23 +752,6 @@ class LandSurface(nn.Module):
         # the next step's snow thermal branch; discarding it here causes a
         # spurious transition to the no-snow branch.
         new_snow_w = torch.clamp(snow_out.psstar, min=0.0)
-        # The offline Fortran state is advanced as the old value plus a
-        # tendency.  When an active snowpack melts exactly to zero, that
-        # operation retains a positive round-off residual.  SURFPPS tests
-        # PFRTI == 0 exactly, so the residual deliberately keeps the snow
-        # tiles out of its zero-area replacement branch on the next step.
-        # Preserve the same branch state without inventing snow mass.
-        exhausted_snow_cover = (
-            (state.snow_frac > 0.0)
-            & (new_snow_w == 0.0)
-            & (new_snow_frac == 0.0)
-        )
-        residual_cover = torch.full_like(
-            new_snow_frac, torch.finfo(dtype).tiny,
-        )
-        new_snow_frac = torch.where(
-            exhausted_snow_cover, residual_cover, new_snow_frac,
-        )
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
