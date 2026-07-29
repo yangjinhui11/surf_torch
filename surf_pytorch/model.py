@@ -747,12 +747,14 @@ class LandSurface(nn.Module):
         # SURFBC/SURFPPS path tests exact zero; dropping sub-threshold cover
         # while retaining its snow mass resets that tile's skin temperature.
         new_snow_frac = torch.clamp(snow_frac_raw, 0.0, 1.0)
-        # SRFSN_LWIMP clips the physical snow store itself but retains a
-        # sub-cover-threshold residual mass.  That residual still controls
-        # the next step's snow thermal branch; discarding it here causes a
-        # spurious transition to the no-snow branch.
-        snow_tendency = (snow_out.psstar - state.snow_w) * torch.reciprocal(dt)
-        new_snow_w = state.snow_w + dt * snow_tendency
+        # ``snow_out.psstar`` is SURFTSTP's t+1 snow store (ZSN).  The
+        # Fortran offline driver writes this state through its tendency
+        # machinery without preserving a numerical remainder.  Rebuilding
+        # it as ``old + dt * ((new - old) / dt)`` leaves a positive
+        # ~1e-17 kg m-2 residue when the physical store is exhausted.  That
+        # residue makes a snow tile non-zero at the next SURFBC call and
+        # prevents SURFPP's required zero-area skin-temperature reset.
+        new_snow_w = snow_out.psstar
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
