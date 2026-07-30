@@ -747,14 +747,13 @@ class LandSurface(nn.Module):
         # SURFBC/SURFPPS path tests exact zero; dropping sub-threshold cover
         # while retaining its snow mass resets that tile's skin temperature.
         new_snow_frac = torch.clamp(snow_frac_raw, 0.0, 1.0)
-        # ``snow_out.psstar`` is SURFTSTP's t+1 snow store (ZSN).  The
-        # Fortran offline driver writes this state through its tendency
-        # machinery without preserving a numerical remainder.  Rebuilding
-        # it as ``old + dt * ((new - old) / dt)`` leaves a positive
-        # ~1e-17 kg m-2 residue when the physical store is exhausted.  That
-        # residue makes a snow tile non-zero at the next SURFBC call and
-        # prevents SURFPP's required zero-area skin-temperature reset.
-        new_snow_w = snow_out.psstar
+        # CPG1S writes the SURFTSTP snow result through the common GP
+        # tendency update: ZSNSE1=(ZSN-old)/dt followed by
+        # GP1=GP0+dt*ZGPE.  Preserve that operation order.  Its final-bit
+        # residual is physically relevant because SURFBC/SURFPP branch on
+        # an exact zero tile fraction at the next coupling step.
+        snow_tendency = (snow_out.psstar - state.snow_w) * torch.reciprocal(dt)
+        new_snow_w = state.snow_w + dt * snow_tendency
 
         # ------------------------------------------------------------------ #
         # 6b. HTESSEL soil-temperature update (M5d-soilt).
@@ -2941,9 +2940,18 @@ class LandSurface(nn.Module):
 
         # Snow cover fraction ZCVS <- state.snow_frac (already clamped
         # 0..1 by the snow solve; fall back to zero on a fresh state).
+        # Match SURFBC's machine-precision no-snow branch: a round-off
+        # residue from the CPG tendency update is not physical snow cover
+        # and must not select a separate snow-tile thermal trajectory.
         zcvs = state.snow_frac if state.snow_frac is not None else \
             torch.zeros(ngrid, dtype=dtype, device=device)
         zcvs = torch.clamp(zcvs, 0.0, 1.0)
+        if state.snow_w is not None:
+            snow_w = state.snow_w.to(dtype=dtype, device=device)
+            snow_zero = snow_w.abs() <= torch.finfo(dtype).eps * torch.maximum(
+                torch.ones_like(snow_w), snow_w.abs()
+            )
+            zcvs = torch.where(snow_zero, torch.zeros_like(zcvs), zcvs)
 
         # Interception capacity PWLMX (surfbc_ctl_mod.F90:308-310) and
         # wet-skin fraction ZCVW <- PWLM1M / PWLMX (:311).
