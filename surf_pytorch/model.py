@@ -2961,6 +2961,14 @@ class LandSurface(nn.Module):
         pwlm1m = state.skin_water if state.skin_water is not None else \
             torch.zeros(ngrid, dtype=dtype, device=device)
         zcvw = torch.clamp(pwlm1m / pwlmx, 0.0, 1.0)
+        # Apply the same CPG round-off treatment as ZCVS above. A residual
+        # wet-skin store at machine precision has no physical area, and a
+        # CPU/GPU disagreement on its exact sign must not retain a separate
+        # wet-skin exchange trajectory on only one platform.
+        skin_zero = pwlm1m.abs() <= torch.finfo(dtype).eps * torch.maximum(
+            torch.ones_like(pwlm1m), pwlm1m.abs()
+        )
+        zcvw = torch.where(skin_zero, torch.zeros_like(zcvw), zcvw)
 
         # Land-ice tile fraction ZFRTIT and the residual cover split
         # (surfbc_ctl_mod.F90:349,369-371).
