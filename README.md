@@ -66,12 +66,6 @@ surf_pytorch/
 │       └── snow_albedo.py     # SRFSN 传统路径 + SRFSN_ASN 冰川分支
 ├── coupling/                  # PyTorch↔OpenIFS 离线驱动器桥接（方案 A）
 │   ├── build_offline_coupled.sh   # 构建 osmMASTER_coupled 可执行文件
-│   ├── run_offline_coupled.sh     # 启动耦合可执行文件（LD_PRELOAD libpython）
-│   ├── make_offline_run_dir.py    # 构建运行目录（namelist + 强迫 NetCDF）
-│   ├── generate_offline_forcing.py # 从日变化生成器生成强迫 NetCDF
-│   └── bindings/              # libpyoifs.so + pyoifs_shim（CPython 内嵌）
-├── offline_driver/            # 独立 Fortran 参考（libsurf_ref.so）+ ctypes 桥接
-├── examples/                  # run_idealized_diurnal.py（M2c）+ run_ecland.py（ERA5 站点）
 └── tests/                     # 单元 + Fortran 对比（ULP）+ ecland + 耦合测试
 ```
 
@@ -365,72 +359,6 @@ python examples/run_ecland.py --out /tmp/run               # 自定义输出目�
 代码乘 `dt=3600` 转累积量；`LWdown` 是**向下**长波，代码自己减 `emis·σ·T⁴` 重构净长波；
 类型索引是 **1 基**，直接喂 LUT 不要 `-1`；`time` 维按 UTC 中间时刻戳用于算 μ0。
 
-### PyTorch 耦合离线驱动器（Fortran `o_gg` 对比）
-
-`tests/test_offline_coupled.py` 是端到端检查：经进程内 CPython 桥接（方案 A）**内嵌进**
-OpenIFS 离线驱动器的 PyTorch 移植，是否与相同理想化强迫的纯 Python `PyOifsShim`
-重放一致。Fortran 侧权威：耦合驱动器把预报状态写入 `o_gg`（由 `wrtp1s.F90` 输出的 ASCII
-时间序列），测试解析并与垫片重放逐场对比。
-
-耦合链路为：
-
-```
-osmMASTER_coupled
-   |  callpar1s (LEPYOIFS branch) -> PYOIFS_SURFTSTP
-   v
-pyoifs_f.F90  (MODULE PYOIFS_F)
-   |  BIND(C) -> pyoifs_init/step/finalize
-   v
-libpyoifs.so  (coupling/bindings/)
-   |  PyGILState_Ensure / PyObject_CallObject
-   v
-surf_pytorch.LandSurface.forward
-```
-
-**构建 + 运行耦合可执行文件**（一次性设置）：
-
-```bash
-cd surf_pytorch
-
-# 1. 构建独立 Fortran 参考（gfortran）——基线 osmMASTER。
-offline_driver/build_ref.sh
-
-# 2. 构建 Python↔Fortran 桥接（libpyoifs.so）。
-coupling/bindings/build_pyoifs.sh
-
-# 3. 构建耦合离线可执行文件（osmMASTER_coupled）。
-coupling/build_offline_coupled.sh
-
-# 4. 铺设运行目录：master namelist（`input`）+ 强迫 NetCDF。
-#    默认：48 个逐时步、lat=45、解析日变化、LEPYOIFS=.TRUE.
-python coupling/make_offline_run_dir.py --dir run_pyoifs --steps 48
-
-# 5. 启动耦合可执行文件（设置 LD_PRELOAD libpython、PYTHONPATH、OMP=1）。
-RUN_DIR=$(pwd)/run_pyoifs bash coupling/run_offline_coupled.sh
-#    -> 写入 run_pyoifs/o_gg（预报时间序列）
-```
-
-如需产出**纯 Fortran 参考** `o_gg`（PyTorch 分支死代码化、原生 `SURFTSTP` 运行），
-改用 `--no-pyoifs` 重新生成运行目录：
-
-```bash
-python coupling/make_offline_run_dir.py --dir run_fortran --no-pyoifs
-RUN_DIR=$(pwd)/run_fortran bash coupling/run_offline_coupled.sh
-```
-
-**运行对比**：将 `OIFS_OGG_PATH` 指向所得 `o_gg`；当变量未设置或文件缺失时模块中每个测试
-均跳过，对齐 `requires_fortran_ref` 约定：
-
-```bash
-OIFS_OGG_PATH=run_pyoifs/o_gg \
-  python -m pytest -m coupled_ref tests/test_offline_coupled.py -v
-```
-
-当前检查内容（`TestOGgSanity` / `TestShimReplaySanity`）：`o_gg` 有限、已步进、在 namelist
-初值处冷启动、并呈现物理日变化；垫片重放有限且土壤温度推进。当前耦合成熟度是**刻画**
-测试，而非 bit 精确——单步 `forward()` 与 `SURFTSTP` 肤温差（约 1.4 K/步，是
-`docs/PROGRESS.md` P1.6 追踪的物理移植保真差异）与 `o_gg` 土壤温度冻结（一处耦合路径
-缺陷）被量化而非忽略。收紧容差是后续工作的回归目标。
 
 `make_offline_run_dir.py` 统一两个世界的单位/符号约定：它从 PyTorch 侧使用的同一个
 `build_idealized_diurnal` 生成器发出强迫 NetCDF 模式（`sufcdf.F90` / `rdfvar.F90`），
