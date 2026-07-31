@@ -662,6 +662,8 @@ class LandSurface(nn.Module):
             surfpp_pssh, surfpp_pjq = self._surfpp_zero_tile_fluxes(out.pssh, out.pjq, frac)
             surfpp_skin_t = self._surfpp_zero_tile_skin_t(out.ptsktip1, frac)
         land_flux_out = replace(out, pssh=surfpp_pssh, pjq=surfpp_pjq)
+        # SURFPP persists these post-processed fluxes for the next VUPDZ0
+        # call. Its zero-area handling uses this VDF step's partition.
         self._last_pahfsti = land_flux_out.pssh.detach().clone()
         self._last_pevapti = land_flux_out.pjq.detach().clone()
         # SURFTSTP builds ZSLRFLTI from the coupled radiation field.  With
@@ -1237,9 +1239,10 @@ class LandSurface(nn.Module):
             ngrid, dtype=dtype, device=device)
         momentum = vdfdifm1s_surface_stress(
             out.pcfm.reshape(ngrid, ntile), frac,
-            # VDFDIFM1S forms PUDIF/PVDIF from the lowest-level state and
-            # atmospheric momentum tendencies before VDFINCR writes the
-            # stress used by the next VUPDZ0 call.
+            # VDFDIFM1S/VDFINCR form PUDIF/PVDIF from the lowest-level
+            # state plus the atmospheric momentum tendency.  The resulting
+            # updated velocity is what SURFPP returns to the next VUPDZ0
+            # call as PUSTRTI/PVSTRTI.
             forcing.u.to(dtype=dtype, device=device) + (
                 forcing.dt * forcing.u_tendency.to(dtype=dtype, device=device)
                 if forcing.u_tendency is not None else 0.0
