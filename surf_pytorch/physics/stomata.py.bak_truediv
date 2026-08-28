@@ -1,0 +1,1141 @@
+"""Jarvis 气孔阻抗（Fortran ``VSURF`` §2.3 + ``VEVAP``）。
+
+对从阻抗到 alpha 的链条的直译：将 Jarvis 冠层阻抗 ``PWET*`` 数组转换
+为 :mod:`surf_pytorch.physics.seb` 所消费的逐瓦片水汽通量闭合系数
+``alpha``。该链条为::
+
+    VSURF  (阻抗)  -> PWETL / PWETH / PWETHS / PWETB / PWETLU
+    VEVAP  (alpha) -> PCSAT = PCAIR = 1 / (1 + PCFQ * PWET/rho)
+
+在离线单柱驱动中，阻抗例程只在瓦片 4（低植被无雪）上运行；瓦片
+6/7/8 复用在瓦片 4 上算出的值（见 ``vsurf_mod.F90`` 294-422）。本移植
+遵循同一模式——:func:`jarvis_resistance` 返回 *网格平均* 阻抗，
+:func:`build_tile_alpha` 将其分发到活动的瓦片集合上。
+
+瓦片 -> 阻抗映射（移植的 0 基索引，见 :mod:`surf_pytorch.config`）：
+::
+
+    0 水面          -> alpha = 1.0   （潜在蒸发）
+    1 海冰          -> alpha = 1.0
+    2 湿表皮        -> alpha = 1.0   （表皮水库）
+    3 低植被干      -> PWETL
+    4 低植被雪      -> 1.0           （被雪覆盖）
+    5 高植被干      -> PWETH
+    6 高植被雪      -> PWETHS
+    7 裸土          -> PWETB
+    8 湖泊          -> 1.0
+    9 城市          -> PWETB         （城市使用裸土阻抗）
+
+"alpha = 1.0" 的瓦片对应自由水面（海洋、冰、湿表皮、雪）或阻抗在结构
+上不适用的瓦片；它们完全绕过 VEVAP 公式。
+
+Notes
+-----
+* 饱和度：上游 ``ZQSAIR`` 使用 ``FOEEW(PTMLEV)/PAPHMS`` 并带有
+  ``ZCOR = 1/(1-RETV*q)`` 因子——与无盐度的 :func:`utils.qsat`
+  完全相同。我们调用 :func:`utils.qsat`，使饱和度表达式与移植的其余
+  部分保持同步。
+* 冻结关停：当上层土壤 ``PTSAM1M(:,1) <= RTT`` 时，蒸腾胁迫因子 F2
+  塌缩为 ``RCEPSW``（vsurf 365-372）——我们用冻结掩码上的
+  ``torch.where`` 复现这一点。
+* 所有分支都用 ``torch.where`` / ``torch.clamp`` 编写，因此在
+  ``enable_grad`` 下例程可按需可微（梯度是局部分支导数，与 Fortran
+  的分段情形一致）。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+from ..config import (
+    N_BASE_TILES,
+    TILE_WATER,
+    TILE_ICE,
+    TILE_WET_SKIN,
+    TILE_LOW_VEG_DRY,
+    TILE_LOW_VEG_SNOW,
+    TILE_HIGH_VEG_DRY,
+    TILE_HIGH_VEG_SNOW,
+    TILE_BARE_SOIL,
+    TILE_LAKE,
+    TILE_URBAN,
+    SurfConfig,
+)
+from ..constants import ConstantBundle
+from ..tables import SoilTable, VegTable, RootTable
+from ..utils import qsat
+
+
+# --------------------------------------------------------------------------- #
+# Module-level scalars (vsurf_mod.F90 module-level + SUSVEG defaults).
+# Kept here rather than in ConstantBundle because they are Jarvis-specific
+# tuning constants that have no other consumer in the port.
+# --------------------------------------------------------------------------- #
+# Minimum VPD stress floor (vsurf ZEPSF3 = 1.0E-5).  Caps F3 away from
+# the singular EXP(0)=1 limit at saturated air, where the VPD-driven
+# stress would otherwise vanish identically.
+ZEPSF3 = 1.0e-5
+
+# Canopy unstressed resistance scale (vsurf ZRCLU = 50).  Used only for
+# the diagnostic PWETLU; kept here for parity with vsurf.
+RCLU = 50.0
+
+# Minimum stomatal resistance over bare soil (vsurf ZRSMINB = 50 s/m).
+# Bare soil has no stomata; this is a bulk-surface resistance scaling
+# F2B into an absolute resistance for the bare-soil tile.
+RSMIN_B = 50.0
+
+# LAI -> resistance sentinel.  When LAI is identically zero the
+# transpiring surface has no area; the upstream resistance is set to a
+# very large number to switch the tile off.  vsurf uses 1.0E+6.
+PWET_INF = 1.0e6
+
+# Humidity-stress floor (susveg RCEPSW = 1.0E-3).  Caps the F2 stress
+# factor away from zero so a shut-down canopy still leaks a tiny flux
+# (numerical conditioning more than a physical effect).
+RCEPSW = 1.0e-3
+
+
+# --------------------------------------------------------------------------- #
+# VEVAP tile-index dispatch (vevap_mod.F90 KTILE values, 1-based upstream).
+# The driver calls VEVAP once per tile with KTILE selecting the branch.
+# We map the port's 0-based tile indices to the upstream KTILE codes so
+# the dispatch table reads in the same order as the Fortran IF-ladder.
+# --------------------------------------------------------------------------- #
+# Upstream KTILE (1-based) -> port tile index (0-based).
+KTILE_WET_SKIN        = 3   # interception reservoir (port TILE_WET_SKIN=2)
+KTILE_LOW_VEG_DRY     = 4   # low vegetation, snow-free (port 3)
+KTILE_HIGH_VEG_DRY    = 6   # high vegetation, snow-free (port 5)
+KTILE_HIGH_VEG_SNOW   = 7   # high vegetation with underlying snow (port 6)
+KTILE_BARE_SOIL       = 8   # bare soil (port 7)
+KTILE_URBAN           = 10  # urban (port 9)
+
+
+@dataclass
+class VevapOutputs:
+    """单个瓦片的逐网格 VEVAP 输出（vevap_mod.F90）。
+
+    所有字段形状为 ``(Ngrid,)``。``pcsat`` / ``pcair`` 是 SEB 消费的
+    水汽通量闭合系数（``alphas = pcsat``，``alphal = pcair``）；其余
+    字段是下游模块的诊断量 / 输入（无胁迫冠层、冠层下雪、湿静力能）。
+    """
+
+    pcsat: torch.Tensor     # multiplier of qs at the surface        [-]
+    pcair: torch.Tensor     # multiplier of q at the lowest level     [-]
+    pcpts: torch.Tensor     # dry static energy (stressed)           [J/kg]
+    pcptsu: torch.Tensor    # dry static energy (unstressed)         [J/kg]
+    pcsatu: torch.Tensor    # as pcsat, unstressed low veg            [-]
+    pcairu: torch.Tensor    # as pcair, unstressed low veg            [-]
+    pcsnw: torch.Tensor     # snow-through-canopy moisture factor    [-]
+    pdhvegs: torch.Tensor   # canopy diagnostics (Ngrid, 2, 4)       [various]
+
+
+# --------------------------------------------------------------------------- #
+# Step 1: the Jarvis three-factor resistance.
+# --------------------------------------------------------------------------- #
+def jarvis_resistance(
+    soil_t: torch.Tensor,           # (Ngrid, Nsoil) soil temperature
+    soil_w: torch.Tensor,           # (Ngrid, Nsoil) total soil moisture
+    soil_type: torch.Tensor,        # (Ngrid,) long, KSOTY
+    ktvl: torch.Tensor,             # (Ngrid,) long, dominant low veg type
+    ktvh: torch.Tensor,             # (Ngrid,) long, dominant high veg type
+    t_air: torch.Tensor,            # (Ngrid,) PTMLEV lowest-model-level T
+    q_air: torch.Tensor,            # (Ngrid,) PQMLEV lowest-model-level q
+    p_surf: torch.Tensor,           # (Ngrid,) PAPHMS surface pressure
+    sw_down: torch.Tensor,          # (Ngrid,) or (Ngrid,Ntile) downward SW
+    veg_table: VegTable,
+    soil_table: SoilTable,
+    root_table: RootTable,
+    consts: ConstantBundle,
+    *,
+    tile_frac: Optional[torch.Tensor] = None,  # (Ngrid, Ntile) for ZBARE
+    n_tile: Optional[int] = None,
+    lai_low: Optional[torch.Tensor] = None,    # (Ngrid,) PLAIL
+    lai_high: Optional[torch.Tensor] = None,   # (Ngrid,) PLAIH
+) -> dict:
+    """Jarvis 冠层阻抗（vsurf_mod.F90 294-422）。
+
+    计算逐柱阻抗数组 ``PWETL`` / ``PWETH`` / ``PWETHS`` / ``PWETB`` /
+    ``PWETLU``，以及低、高植被的三个胁迫因子 ``F1`` / ``F2`` / ``F3``。
+    所有分支遵循 Fortran 的 ``IF (KTILE == 4)`` 块，该块产生瓦片 6/7/8
+    复用的值（见模块文档字符串）。
+
+    Args
+    ----
+    soil_t, soil_w:
+        分层土壤温度（K）与总（液态 + 冰）含水量。形状
+        ``(Ngrid, Nsoil)``。``soil_w`` 的单位与 ``PWSAM1M`` 相同
+        （体积分数 0..wsat）。
+    soil_type:
+        逐柱土壤质地类别（long，0..7）。用于索引
+        :class:`SoilTable` 中逐类别的标量 ``RWPWPM`` / ``RWCAPM`` /
+        ``RWRESTM`` / ``RQWEVAPM``。
+    ktvl, ktvh:
+        逐柱优势低 / 高植被类型（long，1..20）。
+    t_air, q_air, p_surf:
+        最低模式层的气温、比湿与地面气压——F3 VPD 计算的输入。
+    sw_down:
+        地表向下短波辐射（W/m^2）。接受网格场以兼容旧调用方。SURF
+        路径提供瓦片场，VSURF 从中取低植被瓦片 4 与高植被瓦片 6 分别
+        用于各自的 Betts 辐射胁迫因子。
+    veg_table, soil_table, root_table:
+        查找表——我们读取 RVRSMIN / RVHSTR / 默认 RVLAI（植被）、
+        RWPWPM / RWCAPM / RWRESTM / RQWEVAPM（土壤）、RVROOTSA（根）。
+    consts:
+        :class:`ConstantBundle`——需要 ``rtt``、``retv``、``rd``
+        以及冻结斜坡端点 ``rtf1..rtf4``。
+    tile_frac, n_tile:
+        逐瓦片覆盖率（仅用于裸土加权平均 ``ZWPBARE``）。省略时
+        ``ZBARE`` 默认为零，此时裸土萎蔫点等于土壤类别的
+        ``RWPWPM``。
+    lai_low, lai_high:
+        可选的气候学逐瓦片 LAI 场 ``PLAIL`` / ``PLAIH``。提供时它们
+        覆盖植被表的默认值，与离线驱动的逐月 LAI 插值一致。
+
+    Returns
+    -------
+    dict，键为 ``pwetl``/``pweth``/``pweths``/``pwetb``/``pwetlu``
+    （各为 ``(Ngrid,)``），外加诊断胁迫因子
+    ``f1l``/``f2l``/``f3l``/``lail`` 与 ``f1h``/``f2h``/``f3h``/``laih``。
+    """
+    dtype = soil_t.dtype
+    device = soil_t.device
+
+    # ----------------------------------------------------------------- #
+    # 1. Soil-water liquid fraction (vsurf 301-319): the apparent energy
+    #    correction that takes freezing / melting into account.  ZF is
+    #    the liquid-water fraction ramp from 1 (T <= RTF2) to 0 (T >= RTF1).
+    # ----------------------------------------------------------------- #
+    t_soil = soil_t                                   # (Ngrid, Nsoil)
+    inside_window = (t_soil > consts.rtf2) & (t_soil < consts.rtf1)
+    below_window = t_soil <= consts.rtf2
+    zf_inside = 0.5 * (1.0 - torch.sin(consts.rtf4 * (t_soil - consts.rtf3)))
+    zf = torch.where(
+        inside_window, zf_inside,
+        torch.where(below_window, torch.ones_like(t_soil), torch.zeros_like(t_soil)),
+    )
+
+    # ----------------------------------------------------------------- #
+    # 2. Liquid-equivalent moisture (vsurf 310-313).  Per-class scalars
+    #    come from the SoilTable; gather once and broadcast over layers.
+    # ----------------------------------------------------------------- #
+    wpwp = soil_table.gather("wpwp", soil_type)        # (Ngrid,)
+    wcap = soil_table.gather("wcap", soil_type)        # (Ngrid,)
+    wrest = soil_table.gather("wrest", soil_type)      # (Ngrid,)
+    qwevap = soil_table.gather("qwevap", soil_type)    # (Ngrid,)
+
+    wliq_raw = soil_w * (1.0 - zf)                     # (Ngrid, Nsoil)
+    # Broadcast the (Ngrid,) bounds to (Ngrid, Nsoil) via unsqueeze.
+    wpwp_b = wpwp.unsqueeze(-1)
+    wcap_b = wcap.unsqueeze(-1)
+    wrest_b = wrest.unsqueeze(-1)
+    zliq = torch.clamp(wliq_raw, min=wpwp_b, max=wcap_b)
+    zliqr = torch.clamp(wliq_raw, min=wrest_b, max=wcap_b)
+
+    # ----------------------------------------------------------------- #
+    # 3. Per-veg-type table lookups (vsurf 325-330, 384-385).
+    # ----------------------------------------------------------------- #
+    rsminl = veg_table.gather("rvrsmin", ktvl).to(dtype=dtype)
+    rsminh = veg_table.gather("rvrsmin", ktvh).to(dtype=dtype)
+    hstrl = veg_table.gather("rvhstr", ktvl).to(dtype=dtype)
+    hstrh = veg_table.gather("rvhstr", ktvh).to(dtype=dtype)
+    lail = veg_table.gather("rvlai", ktvl).to(dtype=dtype)
+    laih = veg_table.gather("rvlai", ktvh).to(dtype=dtype)
+    if lai_low is not None:
+        lail = lai_low.to(dtype=dtype, device=device)
+    if lai_high is not None:
+        laih = lai_high.to(dtype=dtype, device=device)
+
+    # ----------------------------------------------------------------- #
+    # 4. Bare-soil fraction ZBARE (vsurf 333-336).  Optional -- when the
+    #    caller does not supply tile fractions we fall back to zero so
+    #    the bare-soil wilting point is the per-class RWPWPM.
+    # ----------------------------------------------------------------- #
+    if tile_frac is not None and n_tile is not None and n_tile > TILE_BARE_SOIL:
+        zbare = tile_frac[..., TILE_BARE_SOIL].to(dtype=dtype).clone()
+        if n_tile > TILE_URBAN:
+            zbare = zbare + tile_frac[..., TILE_URBAN].to(dtype=dtype)
+    else:
+        zbare = torch.zeros_like(ktvl, dtype=dtype)
+
+    # ----------------------------------------------------------------- #
+    # 5. Root-weighted soil moisture ZWROOT (vsurf 338-343).
+    #    RootTable.gather returns (Ngrid, Nsoil); sum over the soil axis.
+    # ----------------------------------------------------------------- #
+    rootsl = root_table.gather(ktvl).to(dtype=dtype)   # (Ngrid, Nsoil)
+    rootsh = root_table.gather(ktvh).to(dtype=dtype)   # (Ngrid, Nsoil)
+    # vsurf_mod.F90 340-344: ZWROOTL/ZWROOTH accumulate layers JK=1..KLEVS
+    # sequentially (ZLIQ(JK)*RVROOTSA(JK,ITYPE)).
+    zwrootl = torch.zeros(zliq.shape[:-1], dtype=zliq.dtype, device=zliq.device)
+    zwrooth = torch.zeros_like(zwrootl)
+    for jk in range(zliq.shape[-1]):
+        zwrootl = zwrootl + zliq[:, jk] * rootsl[:, jk]
+        zwrooth = zwrooth + zliq[:, jk] * rootsh[:, jk]
+
+    # ----------------------------------------------------------------- #
+    # 6. Bare-soil F2 (vsurf 344-363, LEVGEN branch).  ZWPBARE is the
+    #    wilting-point weighted by the bare fraction; ZQWEVAPBARE its
+    #    inverse difference against RWCAPM.  F2B clamps to [RCEPSW, 1].
+    # ----------------------------------------------------------------- #
+    zwpbare = wpwp * (1.0 - zbare) + wrest * zbare
+    # vsurf guards JS >= 1 (real soil classes); index 0 ("water") would
+    # divide by zero.  We replicate via a where that uses 0 in the
+    # denominator -- the clamp on F2B keeps the result finite.
+    denom_bare = torch.where(
+        soil_type >= 1,
+        wcap - zwpbare,
+        torch.full_like(zwpbare, 1.0),                  # placeholder; masked below
+    )
+    qwevapbare = torch.where(
+        soil_type >= 1,
+        1.0 / denom_bare,
+        torch.zeros_like(denom_bare),
+    )
+    f2b_raw = (zliqr[..., 0] - zwpbare) * qwevapbare
+    f2b = torch.clamp(f2b_raw, min=RCEPSW, max=1.0)
+
+    # ----------------------------------------------------------------- #
+    # 7. Transpiration F2 (vsurf 365-372).  Freeze shutdown: if the top
+    #    soil layer is at/below freezing the canopy is shut (F2 = RCEPSW).
+    # ----------------------------------------------------------------- #
+    frozen_top = t_soil[..., 0] <= consts.rtt
+    f2l_active = torch.clamp((zwrootl - wpwp) * qwevap, min=RCEPSW, max=1.0)
+    f2h_active = torch.clamp((zwrooth - wpwp) * qwevap, min=RCEPSW, max=1.0)
+    f2l = torch.where(frozen_top, torch.full_like(f2l_active, RCEPSW), f2l_active)
+    f2h = torch.where(frozen_top, torch.full_like(f2h_active, RCEPSW), f2h_active)
+
+    # ----------------------------------------------------------------- #
+    # 8. Radiation stress F1 (Betts; vsurf 378-381).  Identical for low
+    #    and high vegetation.
+    # ----------------------------------------------------------------- #
+    if sw_down.ndim == 1:
+        sw_low = sw_down
+        sw_high = sw_down
+    elif sw_down.ndim == 2 and sw_down.shape[1] > 5:
+        # Fortran tile indices 4 and 6 are zero-based 3 and 5 here.
+        sw_low = sw_down[:, 3]
+        sw_high = sw_down[:, 5]
+    else:
+        raise ValueError(
+            "sw_down must be (Ngrid,) or a tiled field with at least 6 tiles"
+        )
+    srfl_low = sw_low / 250.0
+    srfl_high = sw_high / 250.0
+    f1l = 1.0 / torch.clamp(
+        0.81 * (1.0 + srfl_low) / (srfl_low + 0.05), min=1.0,
+    )
+    f1h = 1.0 / torch.clamp(
+        0.81 * (1.0 + srfl_high) / (srfl_high + 0.05), min=1.0,
+    )
+
+    # ----------------------------------------------------------------- #
+    # 9. Vapour-pressure-deficit stress F3 (vsurf 383-392).  ZQSAIR is
+    #    the saturation specific humidity at the lowest-model-level air
+    #    temperature, evaluated with FOEEW + the RETV correction (i.e.
+    #    utils.qsat with no salinity).
+    # ----------------------------------------------------------------- #
+    qsat_air = qsat(t_air, p_surf, consts)              # (Ngrid,)
+    f3l_raw = torch.exp(-hstrl * (qsat_air - q_air))
+    f3h_raw = torch.exp(-hstrh * (qsat_air - q_air))
+    f3l = torch.clamp(f3l_raw, min=ZEPSF3, max=1.0)
+    f3h = torch.clamp(f3h_raw, min=ZEPSF3, max=1.0)
+
+    # ----------------------------------------------------------------- #
+    # 10. Resistances (vsurf 394-410).  PWETL/PWETH use the LAI-weighted
+    #     product of the three stress factors; PWETLU is the unstressed
+    #     canopy diagnostic; PWETHS = PWETH (snow under high veg reuses
+    #     the snow-free high-veg resistance for the canopy term); the
+    #     snow-aerodynamic term in VEVAP KTILE==7 is handled separately
+    #     inside build_tile_alpha).
+    # ----------------------------------------------------------------- #
+    pwetl_active = rsminl / (lail * f1l * f2l * f3l)
+    pwetl = torch.where(
+        lail != 0.0, pwetl_active, torch.full_like(pwetl_active, PWET_INF)
+    )
+    pwetlu = RCLU / (f1l * f3l)
+    pweth_active = rsminh / (laih * f1h * f2h * f3h)
+    pweth = torch.where(
+        laih != 0.0, pweth_active, torch.full_like(pweth_active, PWET_INF)
+    )
+    pweths = pweth
+    pwetb = RSMIN_B / f2b
+
+    return {
+        "pwetl": pwetl, "pweth": pweth, "pweths": pweths,
+        "pwetb": pwetb, "pwetlu": pwetlu,
+        "f1l": f1l, "f2l": f2l, "f3l": f3l, "lail": lail,
+        "f1h": f1h, "f2h": f2h, "f3h": f3h, "laih": laih,
+        "f2b": f2b,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: VEVAP alpha conversion.
+# --------------------------------------------------------------------------- #
+def resistance_to_alpha(
+    pwet: torch.Tensor,             # (Ngrid,) or (Ngrid, Ntile) canopy resistance
+    rhocqu: torch.Tensor,           # (Ngrid,) or (Ngrid, Ntile) PCFQ*rho (kg/m^2/s)
+    p_surf: torch.Tensor,           # surface pressure [Pa]
+    t_air: torch.Tensor,            # lowest-model-level air temperature [K]
+    q_air: torch.Tensor,            # lowest-model-level specific humidity
+    consts: ConstantBundle,
+    *,
+    snow_aero_resistance: Optional[torch.Tensor] = None,  # ZRAS (high-veg snow)
+) -> torch.Tensor:
+    """将冠层阻抗转换为水汽通量 ``alpha``（VEVAP）。
+
+    对 ``vevap_mod.F90`` 169-242（瓦片 4、6、7、8——有植被 / 裸土的
+    瓦片）的忠实转写。上游代码计算::
+
+        ZRHO  = PAPHMS / (RD * PTMLEV * (1 + RETV*PQMLEV))
+        ZZWET = PWET / ZRHO
+        PCSAT = PCAIR = 1 / (1 + PCFQ * ZZWET)
+
+    其中 ``PCFQ`` 是湍流交换系数 ``rhocqu / ZRHO``（注意：VEVAP 接收的
+    ``PCFQ`` 是 ``rhocqu / rho``；我们直接接受 *乘积* ``rhocqu``，因为
+    那正是 SEB 所使用的）。等价地
+    ``alpha = 1 / (1 + rhocqu * PWET / rho**2)``；但 VEVAP 形式
+    ``1/(1 + (rhocqu/rho) * (PWET/rho))`` 让中间量 ``ZZWET`` 保持物理
+    意义（一个导度比）。我们采用后者，以便冠层下雪分支（KTILE==7）能
+    干净地加入额外的空气动力项。
+
+    凝结分支（``PQMLEV > PQS``）保持 ``alpha = 1``——VEVAP 仅在
+    ``PQMLEV <= PQS`` 时重新赋值 ``PCSAT``/``PCAIR``。我们通过随
+    alpha 一起返回的 ``cond_mask`` 暴露这一点，使调用方可以路由正确的
+    瓦片值。
+
+    Args
+    ----
+    pwet:
+        冠层阻抗，单位 s/m（PWETL / PWETH / PWETHS / PWETB）。
+        形状 ``(Ngrid,)`` 或可广播到 alpha 的形状。
+    rhocqu:
+        湍流水汽交换系数 ``rho * CH * |V|``，单位 kg/m^2/s。与
+        ``pwet`` 形状相同。
+    p_surf, t_air, q_air:
+        地面气压、最低模式层气温与比湿。用于计算空气密度 ``ZRHO``
+        和凝结掩码 ``q_air > qsat(t_air)``。
+    snow_aero_resistance:
+        可选的冠层下雪（KTILE==7）分支的雪面空气动力阻抗 ``ZRAS``
+        （s/m）。提供时 VEVAP PCSAT 公式变为
+        ``1/(1 + ZZWET*PCFQ + ZZWET/ZZWETS)``，其中
+        ``ZZWETS = ZRAS/ZRHO``；冠层下雪阻抗
+        ``PCSNW = 1/(1 + ZZWETS*PCFQ + ZZWETS/ZZWET)`` 也通过结果
+        字典的 ``snow_alpha`` 字段返回。省略时例程使用简单的
+        ``1/(1 + PCFQ*ZZWET)`` 形式。
+
+    Returns
+    -------
+    alpha : ``(Ngrid,)`` 张量。空气凝结处（``q_air > qsat``）等于 1，
+        否则为阻抗修正后的值。
+    """
+    rho = p_surf / (consts.rd * t_air * (1.0 + consts.retv * q_air))
+    rho = rho.to(dtype=pwet.dtype)
+
+    # Conductance ratio ZZWET = PWET / rho (and ZZWETS for the snow branch).
+    zwet = pwet / rho
+    pcfq = rhocqu / rho                            # vsurf PCFQ = rho*CH*V / rho
+
+    if snow_aero_resistance is not None:
+        zwets = snow_aero_resistance / rho
+        denom = 1.0 + zwet * pcfq + zwet / zwets
+        alpha = 1.0 / denom
+    else:
+        alpha = 1.0 / (1.0 + pcfq * zwet)
+
+    # Condensation: where q_air > qsat(t_air), VEVAP leaves PCSAT=1.
+    qsat_air = qsat(t_air, p_surf, consts)
+    cond_mask = q_air > qsat_air
+    alpha = torch.where(cond_mask, torch.ones_like(alpha), alpha)
+    return alpha
+
+
+# --------------------------------------------------------------------------- #
+# Step 2b: faithful VEVAP transcription (vevap_mod.F90 138-269).
+# --------------------------------------------------------------------------- #
+def vevap(
+    ktile: int,
+    pwet: torch.Tensor,              # (Ngrid,) tile-appropriate resistance
+    pwetlu: Optional[torch.Tensor],  # (Ngrid,) unstressed low-veg resistance
+    rhocqu: torch.Tensor,            # (Ngrid,) PCFQ = rho*Cq*|U|  [kg/m^2/s]
+    p_surf: torch.Tensor,            # (Ngrid,) PAPHMS              [Pa]
+    t_air: torch.Tensor,             # (Ngrid,) PTMLEV              [K]
+    q_air: torch.Tensor,             # (Ngrid,) PQMLEV
+    qs_skin: torch.Tensor,           # (Ngrid,) PQS = qsat at skin T
+    skin_t: torch.Tensor,            # (Ngrid,) PTSKM1M             [K]
+    t_sub: torch.Tensor,             # (Ngrid,) PTSAM1M (sub-surface T) [K]
+    wlmx: torch.Tensor,              # (Ngrid,) PWLMX interception capacity [m]
+    consts: ConstantBundle,
+    *,
+    ptmst: torch.Tensor,             # (Ngrid,) time step (for interception clamp)
+    rlhaero: float = 15.0,           # aerodynamic skin conductivity (unstable)
+    rlhaeros: float = 10.0,          # aerodynamic skin conductivity (stable)
+) -> "VevapOutputs":
+    """计算等效蒸散效率（VEVAP）。
+
+    对 ``vevap_mod.F90`` 第 138-269 行的忠实转写。上游代码按瓦片调用
+    一次（``KTILE`` 选择分支）；本函数镜像该行为——传入上游的
+    ``KTILE``（1 基）与逐网格输入，返回逐网格的 VEVAP 输出。
+
+    水汽通量闭合为::
+
+        ZRHO = PAPHMS / (RD * PTMLEV * (1 + RETV * PQMLEV))
+        ZZWET = PWET / ZRHO
+        PCSAT = PCAIR = 1 / (1 + PCFQ * ZZWET)
+
+    其中 ``PCFQ`` 是按 rho 标度的水汽交换系数（``rho * Cq * |U|``，
+    单位 kg/m^2/s）——即正是 SEB 的 ``rhocqu``。注意它**不再**除以
+    rho：之前的 ``resistance_to_alpha`` 重新计算了
+    ``pcf q = rhocqu / rho``，再乘以 ``zwet = pwet / rho``，在分母中
+    多出了一个 ``1/rho``。与 VEVAP 的这一偏离曾被测试结构掩盖（两侧
+    使用相同的 Python 公式）；本例程是忠实的参考实现，之前那个仅作为
+    弃用别名保留。
+
+    瓦片分支（vevap_mod.F90 的 IF 阶梯）
+    ---------------------------------------
+    * KTILE=3（湿表皮）：截留水库的截断
+      ``PCAIR = MIN(1, ZEMAX/ZEP)``，当 ``ZEP < 0 < ZEP - ZEMAX`` 时，
+      其中 ``ZEP = PCFQ*(q_air - qs)``，``ZEMAX = -WLMX/dt``。
+    * KTILE=4（低植被干）：``1/(1 + PCFQ*ZZWET)``，另加无胁迫的
+      ``1/(1 + PCFQ*ZZWETU)``（``ZZWETU = PWETLU/rho``）；填充
+      ``PDHVEGS(1, 3..4)`` 冠层诊断。
+    * KTILE=6（高植被干）：``1/(1 + PCFQ*ZZWET)``；填充
+      ``PDHVEGS(2, 3..4)``。
+    * KTILE=7（高植被雪）：冠层-雪耦合，空气动力阻抗
+      ``ZRAS = 1200/RLHAEROS``（表皮温度高于次表层温度）或
+      ``1200/RLHAERO``（其他情况），给出
+      ``PCSAT = 1/(1 + ZZWET*PCFQ + ZZWET/ZZWETS)``，以及当冠层阻抗
+      起作用时的雪侧因子
+      ``PCSNW = 1/(1 + ZZWETS*PCFQ + ZZWETS/ZZWET)``。
+    * KTILE=8（裸土）/ KTILE=10（城市）：``1/(1 + PCFQ*ZZWET)``。
+
+    凝结掩码 ``PQMLEV > PQS`` 使 PCSAT/PCAIR 保持其初始化值 1（VEVAP
+    只在 ``PQMLEV <= PQS`` 分支内重新赋值）。
+
+    Args
+    ----
+    ktile:
+        上游瓦片索引（1 基），用于选择分支（3、4、6、7、8 或 10）。
+    pwet:
+        该瓦片适用的 Jarvis 阻抗，单位 s/m（PWETL / PWETH / PWETHS /
+        PWETB）。形状 ``(Ngrid,)``。
+    pwetlu:
+        无胁迫低植被阻抗 PWETLU（仅 KTILE=4 使用）。其他瓦片可为
+        ``None``。
+    rhocqu:
+        按 rho 标度的水汽交换系数 PCFQ（kg/m^2/s）。这直接就是 SEB
+        的 ``rhocqu``——请勿预先除以 rho。
+    p_surf, t_air, q_air:
+        最低模式层气压（Pa）、温度（K）与比湿；用于计算空气密度
+        ZRHO 以及（隐式地通过调用方提供的凝结掩码）饱和检查。
+    qs_skin:
+        表皮温度下的饱和比湿（PQS）。
+    skin_t:
+        表皮温度 PTSKM1M（K）；KTILE=7（Tsk 与 Tsub 比较）以及
+        PCPTS 湿静力能项使用。
+    t_sub:
+        次表层温度 PTSAM1M（K）；KTILE=7 的稳定性选择器使用。
+    wlmx:
+        最大截留水库容量 PWLMX（m）；KTILE=3 的截断使用。
+    ptmst:
+        耦合时间步长（s）；KTILE=3 的 ``ZEMAX = -WLMX/dt`` 使用。
+    rlhaero, rlhaeros:
+        KTILE=7 ZRAS 选择器的空气动力表皮电导率（susveg 默认值
+        15.0 / 10.0）。
+
+    Returns
+    -------
+    :class:`VevapOutputs`，包含逐网格的 PCSAT / PCAIR / PCSATU /
+    PCAIRU / PCPTSU / PCSNW / PDHVEGS 张量。
+    """
+    ngrid = rhocqu.shape[0]
+    dtype = rhocqu.dtype
+    device = rhocqu.device
+
+    # Section 1 -- initialise all outputs to 1.0 (VEVAP 147-151).  PCSAT
+    # / PCSATU / PCAIR / PCAIRU default to 1.0; PCSNW defaults to 0.0
+    # but VEVAP only zeroes it inside the KTILE==7 branch, so we start
+    # at 0 here and let each branch set what it owns.
+    pcsat   = torch.ones((ngrid,), dtype=dtype, device=device)
+    pcsatu  = torch.ones((ngrid,), dtype=dtype, device=device)
+    pcair   = torch.ones((ngrid,), dtype=dtype, device=device)
+    pcairu  = torch.ones((ngrid,), dtype=dtype, device=device)
+    pcsnw   = torch.zeros((ngrid,), dtype=dtype, device=device)
+    # PDHVEGS(Ngrid, 2, 4) -- only KTILE=4/6 write columns 3..4 of rows
+    # 1..2; the rest stays at the VEVAP default (0).
+    pdhvegs = torch.zeros((ngrid, 2, 4), dtype=dtype, device=device)
+
+    # Air density ZRHO (vevap 172).  Identical across every branch that
+    # needs it, so compute once.  rho = P / (RD*T*(1+RETV*q)).
+    rho = p_surf / (consts.rd * t_air * (1.0 + consts.retv * q_air))
+    rho = rho.to(dtype=dtype)
+
+    # PCFQ is the rho-scaled exchange coefficient the caller passes
+    # directly (rho*Cq*|U|).  VEVAP multiplies ZZWET by PCFQ without any
+    # further rho scaling.
+    pcfq = rhocqu
+
+    # Condensation mask: VEVAP only reassigns PCSAT/PCAIR inside the
+    # PQMLEV <= PQS branch.  We compute the evaporation mask once and
+    # gate every branch with it so off-mask columns stay at 1.0.
+    evap_mask = q_air <= qs_skin
+
+    cpd = consts.cpd
+    rvtmp2 = consts.rvtmp2
+
+    if ktile == KTILE_WET_SKIN:
+        # Interception reservoir (vevap 153-164).  Clamp the
+        # evaporation so it cannot drain more than the reservoir holds
+        # in one step: ZEP = PCFQ*(q_air - qs), ZEMAX = -WLMX/dt; when
+        # both are negative and ZEP < ZEMAX, scale PCAIR down.
+        zep = pcfq * (q_air - qs_skin)
+        zemax = -wlmx / ptmst
+        clamp_mask = (zep < 0.0) & (zemax < 0.0) & (zep < zemax)
+        # PCAIR = MIN(1, ZEMAX/ZEP) only where the clamp fires and we
+        # are evaporating (evap_mask).  Guard the division: where the
+        # clamp does not fire we keep PCAIR=1 (use a safe denominator).
+        safe_zep = torch.where(clamp_mask, zep, torch.ones_like(zep))
+        ratio = zemax / safe_zep
+        pcair_new = torch.clamp(ratio, max=1.0)
+        pcair = torch.where(clamp_mask & evap_mask, pcair_new, pcair)
+        pcsat = pcair
+        pcairu = pcair
+        pcsatu = pcsat
+
+    elif ktile == KTILE_LOW_VEG_DRY:
+        # Low vegetation (vevap 169-185).  PCSAT = PCAIR use PWETL,
+        # PCSATU = PCAIRU use PWETLU.  PDHVEGS(:,1,3)=PWETL,
+        # PDHVEGS(:,1,4)=rho/PCFQ.
+        zwet = pwet / rho
+        pcsat_v = 1.0 / (1.0 + pcfq * zwet)
+        pcair_v = pcsat_v
+        pcsat = torch.where(evap_mask, pcsat_v, pcsat)
+        pcair = torch.where(evap_mask, pcair_v, pcair)
+        if pwetlu is not None:
+            zwetu = pwetlu / rho
+            pcsatu_v = 1.0 / (1.0 + pcfq * zwetu)
+            pcairu_v = pcsatu_v
+            pcsatu = torch.where(evap_mask, pcsatu_v, pcsatu)
+            pcairu = torch.where(evap_mask, pcairu_v, pcairu)
+        pdhvegs[:, 0, 2] = torch.where(
+            evap_mask, pwet, pdhvegs[:, 0, 2])
+        # rho/PCFQ -- guard PCFQ==0 (would be a zero-turbulence column).
+        safe_pcfq = torch.where(
+            pcfq != 0.0, pcfq, torch.ones_like(pcfq))
+        pdhvegs[:, 0, 3] = torch.where(
+            evap_mask, rho / safe_pcfq, pdhvegs[:, 0, 3])
+
+    elif ktile == KTILE_HIGH_VEG_DRY:
+        # High vegetation, snow-free (vevap 189-204).  PCSAT = PCAIR =
+        # PCSATU = PCAIRU = 1/(1+PCFQ*ZZWET).  PDHVEGS(:,2,3..4).
+        zwet = pwet / rho
+        pcsat_v = 1.0 / (1.0 + pcfq * zwet)
+        pcsat = torch.where(evap_mask, pcsat_v, pcsat)
+        pcair = pcsat
+        pcairu = pcair
+        pcsatu = pcsat
+        pdhvegs[:, 1, 2] = torch.where(
+            evap_mask, pwet, pdhvegs[:, 1, 2])
+        safe_pcfq = torch.where(
+            pcfq != 0.0, pcfq, torch.ones_like(pcfq))
+        pdhvegs[:, 1, 3] = torch.where(
+            evap_mask, rho / safe_pcfq, pdhvegs[:, 1, 3])
+
+    elif ktile == KTILE_HIGH_VEG_SNOW:
+        # High vegetation with underlying snow (vevap 208-230).  ZRAS
+        # depends on the skin vs sub-surface temperature contrast;
+        # PCSAT couples canopy and snow resistances; PCSNW is the
+        # snow-side factor (active when the canopy resistance is real).
+        pcsnw_v = torch.zeros((ngrid,), dtype=dtype, device=device)
+        # VEVAP uses a strict PTSKM1M > PTSAM1M selector for the
+        # snow-under-high-vegetation aerodynamic resistance.
+        warm = skin_t > t_sub
+        zras = torch.where(
+            warm,
+            torch.full_like(rho, 1200.0 / rlhaeros),
+            torch.full_like(rho, 1200.0 / rlhaero),
+        )
+        zwet = pwet / rho
+        zwets = zras / rho
+        denom = 1.0 + zwet * pcfq + zwet / zwets
+        pcsat_v = 1.0 / denom
+        pcsat = torch.where(evap_mask, pcsat_v, pcsat)
+        pcair = pcsat
+        # PCSNW only when PWETHS > 1 (real canopy resistance).  Guard
+        # zwet==0 (would divide by zero).
+        snow_active = evap_mask & (pwet > 1.0)
+        safe_zwet = torch.where(
+            snow_active, zwet, torch.ones_like(zwet))
+        pcsnw_denom = 1.0 + zwets * pcfq + zwets / safe_zwet
+        pcsnw_active = 1.0 / pcsnw_denom
+        pcsnw_v = torch.where(snow_active, pcsnw_active, pcsnw_v)
+        pcsnw = pcsnw_v
+        pcairu = pcair
+        pcsatu = pcsat
+
+    elif ktile in (KTILE_BARE_SOIL, KTILE_URBAN):
+        # Bare soil / urban (vevap 234-256).  Simple PCSAT = PCAIR =
+        # PCSATU = PCAIRU = 1/(1+PCFQ*ZZWET).  Urban comment notes
+        # RURBRES is not currently used -> reuses PWETB.
+        zwet = pwet / rho
+        pcsat_v = 1.0 / (1.0 + pcfq * zwet)
+        pcsat = torch.where(evap_mask, pcsat_v, pcsat)
+        pcair = pcsat
+        pcairu = pcair
+        pcsatu = pcsat
+
+    else:
+        # Tiles without a VEVAP branch (water / ice / snow on low veg /
+        # lake) keep the initialised PCSAT=PCAIR=...=1 -- potential
+        # evaporation from a free surface.
+        pass
+
+    # Section 3 -- stressed and unstressed moist-static-energy terms
+    # (vevap 260-265).  The final prognostic SURFSEB call uses PCPTS;
+    # PCPTSU belongs to the separate potential-evaporation diagnostic.
+    pcpts = skin_t * cpd * (
+        1.0 + rvtmp2 * (pcsat * qs_skin + (1.0 - pcair) * q_air)
+    )
+    pcptsu = skin_t * cpd * (
+        1.0 + rvtmp2 * (pcsatu * qs_skin + (1.0 - pcairu) * q_air)
+    )
+
+    return VevapOutputs(
+        pcsat=pcsat, pcair=pcair, pcpts=pcpts, pcptsu=pcptsu,
+        pcsatu=pcsatu, pcairu=pcairu, pcsnw=pcsnw, pdhvegs=pdhvegs,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Step 3: per-tile alpha dispatch.
+# --------------------------------------------------------------------------- #
+def build_tile_alpha(
+    pwetl: torch.Tensor,             # (Ngrid,) low-veg resistance
+    pweth: torch.Tensor,             # (Ngrid,) high-veg resistance
+    pwetb: torch.Tensor,             # (Ngrid,) bare-soil resistance
+    rhocqu_grid: torch.Tensor,       # (Ngrid,) or (Ngrid, Ntile) PCFQ*rho
+    p_surf: torch.Tensor,            # (Ngrid,)
+    t_air: torch.Tensor,            # (Ngrid,)
+    q_air: torch.Tensor,            # (Ngrid,)
+    consts: ConstantBundle,
+    config: SurfConfig,
+    *,
+    pweths: Optional[torch.Tensor] = None,
+    snow_aero_resistance: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """构建逐瓦片的 ``alpha`` 张量 ``(Ngrid, Ntile)``。
+
+    将逐柱 Jarvis 阻抗分发到各活动瓦片，并将每个阻抗转换为 VEVAP
+    ``alpha``。瓦片 0/1/2（水面 / 海冰 / 湿表皮）以及瓦片 4（低植被
+    雪）、8（湖泊）携带 ``alpha=1``（自由水面的潜在蒸发）；瓦片
+    3/5/6/7/9 使用 Jarvis 导出的阻抗。
+
+    由于离线驱动中 ``alpha_l == alpha_s``（VEVAP 对每个有植被瓦片都设
+    ``PCSAT = PCAIR``——见 ``vevap_mod.F90`` 175-176、194-197），单个
+    逐瓦片 alpha 张量即可满足 SEB 闭合。
+
+    Args
+    ----
+    pwetl, pweth, pwetb:
+        来自 :func:`jarvis_resistance` 的逐柱冠层 / 裸土阻抗。
+        形状 ``(Ngrid,)``。
+    rhocqu_grid:
+        逐柱湍流水汽交换系数（SEB 的 ``rhocqu``）。广播到每个活动
+        瓦片。
+    p_surf, t_air, q_air:
+        :func:`resistance_to_alpha` 使用的最低模式层状态。
+    pweths:
+        冠层下雪瓦片的可选阻抗（默认为 ``pweth``——与 vsurf 第 409
+        行一致）。
+    snow_aero_resistance:
+        KTILE==7 分支的可选 ``ZRAS``（见
+        :func:`resistance_to_alpha`）。
+
+    Returns
+    -------
+    alpha : 水汽通量闭合因子的 ``(Ngrid, Ntile)`` 张量。
+    """
+    ntile = config.n_tile
+    ngrid = rhocqu_grid.shape[0]
+    dtype = pwetl.dtype
+    device = pwetl.device
+    if pweths is None:
+        pweths = pweth
+
+    alpha = torch.ones((ngrid, ntile), dtype=dtype, device=device)
+
+    # Accept either a grid-mean (Ngrid,) PCFQ (broadcast across tiles,
+    # legacy) or a per-tile (Ngrid, Ntile) PCFQ (per_tile_exchange path,
+    # matching the upstream VEVAPS tile loop).
+    if rhocqu_grid.dim() == 1:
+        rhocqu_t = rhocqu_grid.unsqueeze(-1).expand(ngrid, ntile)
+    else:
+        rhocqu_t = rhocqu_grid
+
+    # Helper: tile-local resistance -> alpha via VEVAP.  We pull the
+    # per-tile slice of pwet/rhocqu, run resistance_to_alpha, and write
+    # back into alpha[..., jt].  resistance_to_alpha handles the
+    # condensation mask (alpha=1 where q_air > qsat) for us.
+    def _set(jt: int, pwet_tile: torch.Tensor, *, snow_res: Optional[torch.Tensor] = None) -> None:
+        a = resistance_to_alpha(
+            pwet_tile, rhocqu_t[..., jt], p_surf, t_air, q_air, consts,
+            snow_aero_resistance=snow_res,
+        )
+        alpha[..., jt] = a
+
+    # Tile 3 (low-veg dry, JT=4): PWETL.
+    if ntile > TILE_LOW_VEG_DRY:
+        _set(TILE_LOW_VEG_DRY, pwetl)
+
+    # Tile 5 (high-veg dry, JT=6): PWETH.
+    if ntile > TILE_HIGH_VEG_DRY:
+        _set(TILE_HIGH_VEG_DRY, pweth)
+
+    # Tile 6 (high-veg snow, JT=7): PWETHS with the snow aerodynamic term.
+    if ntile > TILE_HIGH_VEG_SNOW:
+        _set(TILE_HIGH_VEG_SNOW, pweths, snow_res=snow_aero_resistance)
+
+    # Tile 7 (bare soil, JT=8): PWETB.
+    if ntile > TILE_BARE_SOIL:
+        _set(TILE_BARE_SOIL, pwetb)
+
+    # Tile 9 (urban, JT=10): PWETB (vsurf/vevap reuse bare-soil resistance).
+    if ntile > TILE_URBAN:
+        _set(TILE_URBAN, pwetb)
+
+    return alpha
+
+
+# --------------------------------------------------------------------------- #
+# Step 3b: full per-tile VEVAP assembly (the faithful, complete closure).
+# --------------------------------------------------------------------------- #
+def build_tile_vevap(
+    pwetl: torch.Tensor,             # (Ngrid,) low-veg resistance
+    pweth: torch.Tensor,             # (Ngrid,) high-veg resistance
+    pwetb: torch.Tensor,             # (Ngrid,) bare-soil resistance
+    rhocqu_grid: torch.Tensor,       # (Ngrid,) or (Ngrid, Ntile) PCFQ = rho*Cq*|U|
+    p_surf: torch.Tensor,            # (Ngrid,)
+    t_air: torch.Tensor,             # (Ngrid,) PTMLEV
+    q_air: torch.Tensor,             # (Ngrid,) PQMLEV
+    skin_t: torch.Tensor,            # (Ngrid, Ntile) PTSKM1M (per-tile skin T)
+    t_sub_grid: torch.Tensor,        # (Ngrid,) or (Ngrid,Ntile) sub-surface T
+    qs_skin: torch.Tensor,           # (Ngrid, Ntile) PQS = qsat at skin T
+    wlmx_grid: torch.Tensor,         # (Ngrid,) PWLMX interception capacity
+    consts: ConstantBundle,
+    config: SurfConfig,
+    *,
+    pwetlu: Optional[torch.Tensor] = None,   # (Ngrid,) unstressed low-veg
+    pweths: Optional[torch.Tensor] = None,   # (Ngrid,) snow-under-high-veg
+    ptmst: Optional[torch.Tensor] = None,    # (Ngrid,) coupling time step
+    rlhaero: float = 15.0,
+    rlhaeros: float = 10.0,
+) -> dict:
+    """构建逐瓦片的 VEVAP 闭合张量 ``(Ngrid, Ntile)``。
+
+    将逐柱 Jarvis 阻抗分发到各活动瓦片，并对每个瓦片运行忠实的
+    :func:`vevap`，产生 SEB 及下游模块消费的整套逐瓦片 VEVAP 输出。
+    这是 :func:`build_tile_alpha` 的 rho 约定修正版继任者（后者使用
+    了带有多余 ``1/rho`` 的简化 ``resistance_to_alpha`` 公式）。
+
+    逐瓦片分发（移植的 0 基瓦片索引 -> 上游 KTILE）：
+    ::
+
+        0 水面 / 1 海冰 / 4 低植被雪 / 8 湖泊 -> alpha = 1
+            （无 VEVAP 分支；自由水面潜在蒸发）
+        2 湿表皮       -> KTILE=3 （截留水库截断）
+        3 低植被       -> KTILE=4 （PWETL，无胁迫 PWETLU）
+        5 高植被       -> KTILE=6 （PWETH）
+        6 高植被雪     -> KTILE=7 （PWETHS + ZRAS，PCSNW）
+        7 裸土         -> KTILE=8 （PWETB）
+        9 城市         -> KTILE=10 （PWETB）
+
+    Args
+    ----
+    pwetl, pweth, pwetb:
+        来自 :func:`jarvis_resistance` 的逐柱 Jarvis 阻抗，
+        形状 ``(Ngrid,)``。
+    rhocqu_grid:
+        逐柱按 rho 标度的水汽交换系数 PCFQ（``rho*Cq*|U|``，单位
+        kg/m^2/s）。跨瓦片广播。
+    p_surf, t_air, q_air:
+        逐网格最低模式层气压（Pa）、温度（K）与比湿。
+    skin_t:
+        逐瓦片表皮温度 PTSKM1M，形状 ``(Ngrid, Ntile)``。VEVAP 按
+        瓦片消费表皮温度（上游驱动对每个瓦片调用 VEVAP 一次，传入
+        该瓦片的 PTSKM1M）。
+    t_sub_grid:
+        逐网格或逐瓦片的次表层温度。``SURFEXCDRIVER`` 向 ``VEVAP``
+        传入瓦片局部的 ``ZTSA``；特别是 KTILE=7 接收的是雪温而非
+        上层土壤温度。
+    qs_skin:
+        逐瓦片表皮温度下的饱和比湿 PQS = qsat，形状
+        ``(Ngrid, Ntile)``。
+    wlmx_grid:
+        逐网格截留水库容量 PWLMX（m），KTILE=3 的截断使用。
+    pwetlu:
+        可选的无胁迫低植被阻抗（省略时默认为 ``pwetl``——合理的
+        占位值，因为无胁迫诊断不被 SEB 消费）。
+    pweths:
+        可选的冠层下雪阻抗（默认为 ``pweth``）。
+    ptmst:
+        逐网格耦合时间步长（s）；省略时默认为标量 3600 s（仅供
+        KTILE=3 的 ``ZEMAX`` 截断使用）。
+    rlhaero, rlhaeros:
+        KTILE=7 ZRAS 选择器的空气动力表皮电导率。
+
+    Returns
+    -------
+    dict，键为 ``pcsat`` / ``pcair`` / ``pcsatu`` / ``pcairu`` /
+    ``pcptsu`` / ``pcsnw`` / ``pdhvegs``——每个都是形状
+    ``(Ngrid, Ntile)`` 的逐瓦片张量（pdhvegs 为
+    ``(Ngrid, Ntile, 2, 4)``）。SEB 消费 ``pcsat``（-> alphas）和
+    ``pcair``（-> alphal）；其余为诊断及 M5 冠层更新而暴露。
+    """
+    ntile = config.n_tile
+    ngrid = rhocqu_grid.shape[0]
+    dtype = pwetl.dtype
+    device = pwetl.device
+    if pweths is None:
+        pweths = pweth
+    if pwetlu is None:
+        pwetlu = pwetl
+    if ptmst is None:
+        ptmst = torch.full((ngrid,), 3600.0, dtype=dtype, device=device)
+
+    # Per-tile output accumulators.  Initialised to the VEVAP defaults
+    # (1.0 for the alpha coefficients, 0.0 for PCSNW, zero for PDHVEGS);
+    # tiles without a VEVAP branch keep these defaults.
+    pcsat  = torch.ones((ngrid, ntile), dtype=dtype, device=device)
+    pcair  = torch.ones((ngrid, ntile), dtype=dtype, device=device)
+    pcsatu = torch.ones((ngrid, ntile), dtype=dtype, device=device)
+    pcairu = torch.ones((ngrid, ntile), dtype=dtype, device=device)
+    pcsnw  = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+    pcpts = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+    pcptsu = torch.zeros((ngrid, ntile), dtype=dtype, device=device)
+    pdhvegs = torch.zeros((ngrid, ntile, 2, 4), dtype=dtype, device=device)
+
+    # Accept either a grid-mean (Ngrid,) PCFQ (broadcast across tiles,
+    # legacy) or a per-tile (Ngrid, Ntile) PCFQ (per_tile_exchange path,
+    # matching the upstream VEVAPS tile loop which receives PCFQTI(:,JT)).
+    per_tile_rhocqu = rhocqu_grid.dim() == 2
+
+    def _run_tile(jt: int, ktile: int, pwet_tile: torch.Tensor) -> None:
+        """对单个瓦片运行 vevap 并将其输出散布到逐瓦片数组中。
+        使用逐瓦片的表皮温度 / qs 列。"""
+        rhocqu_jt = rhocqu_grid[:, jt] if per_tile_rhocqu else rhocqu_grid
+        t_sub_jt = t_sub_grid[:, jt] if t_sub_grid.dim() == 2 else t_sub_grid
+        out = vevap(
+            ktile=ktile,
+            pwet=pwet_tile,
+            pwetlu=pwetlu,
+            rhocqu=rhocqu_jt,
+            p_surf=p_surf,
+            t_air=t_air,
+            q_air=q_air,
+            qs_skin=qs_skin[:, jt],
+            skin_t=skin_t[:, jt],
+            t_sub=t_sub_jt,
+            wlmx=wlmx_grid,
+            consts=consts,
+            ptmst=ptmst,
+            rlhaero=rlhaero,
+            rlhaeros=rlhaeros,
+        )
+        pcsat[:, jt]  = out.pcsat
+        pcair[:, jt]  = out.pcair
+        pcpts[:, jt]  = out.pcpts
+        pcsatu[:, jt] = out.pcsatu
+        pcairu[:, jt] = out.pcairu
+        pcptsu[:, jt] = out.pcptsu
+        pcsnw[:, jt]  = out.pcsnw
+        pdhvegs[:, jt] = out.pdhvegs
+
+    # Dispatch each active tile.  The KTILE codes are the upstream
+    # 1-based indices from vevap_mod.F90's IF-ladder.
+    if ntile > TILE_WET_SKIN:
+        _run_tile(TILE_WET_SKIN, KTILE_WET_SKIN, pwetl)   # PWET unused here
+    if ntile > TILE_LOW_VEG_DRY:
+        _run_tile(TILE_LOW_VEG_DRY, KTILE_LOW_VEG_DRY, pwetl)
+    if ntile > TILE_HIGH_VEG_DRY:
+        _run_tile(TILE_HIGH_VEG_DRY, KTILE_HIGH_VEG_DRY, pweth)
+    if ntile > TILE_HIGH_VEG_SNOW:
+        _run_tile(TILE_HIGH_VEG_SNOW, KTILE_HIGH_VEG_SNOW, pweths)
+    if ntile > TILE_BARE_SOIL:
+        _run_tile(TILE_BARE_SOIL, KTILE_BARE_SOIL, pwetb)
+    if ntile > TILE_URBAN:
+        _run_tile(TILE_URBAN, KTILE_URBAN, pwetb)
+
+    # PCPTS / PCPTSU are computed unconditionally per tile in VEVAP (lines
+    # 260-265 sit outside the IF-ladder).  Tiles without an alpha
+    # branch (water / ice / snow-on-low-veg / lake) keep PCSATU =
+    # PCAIRU = 1 but still get PCPTSU = Tsk*cpd*(1 + RVTMP2*(qs +
+    # (1-1)*q_air)) = Tsk*cpd*(1 + RVTMP2*qs).  Fill the tiles we did
+    # not run above so every tile carries a valid PCPTSU.  Vectorised:
+    # where pcptsu is still 0, apply the free-surface form with
+    # PCSATU=PCAIRU=1.
+    cpd = consts.cpd
+    rvtmp2 = consts.rvtmp2
+    free_mask = pcptsu == 0.0
+    pcptsu_free = skin_t * cpd * (1.0 + rvtmp2 * qs_skin)
+    pcpts = torch.where(free_mask, pcptsu_free, pcpts)
+    pcptsu = torch.where(free_mask, pcptsu_free, pcptsu)
+
+    return {
+        "pcsat": pcsat, "pcair": pcair,
+        "pcpts": pcpts,
+        "pcsatu": pcsatu, "pcairu": pcairu,
+        "pcptsu": pcptsu, "pcsnw": pcsnw,
+        "pdhvegs": pdhvegs,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Step 4: Farquhar canopy resistance (cotworestress_mod.F90:412-431).
+# --------------------------------------------------------------------------- #
+def farquhar_resistance(
+    forcing,
+    skin_t_prev: torch.Tensor,        # (Ngrid, Ntile) per-tile skin T at t-1
+    qskm1m: torch.Tensor,             # (Ngrid, Ntile) qsat at skin T
+    ssrfl_grid: torch.Tensor,         # (Ngrid,) mean SW radiation [W/m^2]
+    ktvl: torch.Tensor,               # (Ngrid,) dominant low-veg type (long)
+    ktvh: torch.Tensor,               # (Ngrid,) dominant high-veg type (long)
+    jarvis: dict,                     # output of jarvis_resistance (f2*, lai*, pwetb)
+    veg_table: VegTable,
+    consts: ConstantBundle,
+    *,
+    land_mask: Optional[torch.Tensor] = None,   # (Ngrid,) bool; defaults all land
+    ktile_skin: int = 0,              # which tile's skin T drives photosynthesis
+) -> dict:
+    """Farquhar 冠层阻抗，镜像 ``cotworestress_mod.F90`` 412-431。
+
+    上游 ``LEFARQUHAR`` 分支：Farquhar 光合作用模型
+    （``farquhar_mod.F90``）按柱调用一次，得到冠层导度 ``PGSTOT``
+    （m/s，对 H2O）；``cotworestress`` 随后将其转换为总体阻抗
+    ``PWET = 1/max(RCONDCTMIN, PGSTOT)``（s/m），``vsurf`` 694-717 将
+    ``PWET`` 分配到瓦片 4/6/7 的 ``PWETL``/``PWETH``/``PWETHS``。下游
+    VEVAP 链与 Jarvis 路径 *完全相同*——只有阻抗来源改变。
+
+    裸土 / 城市阻抗（``PWETB``，瓦片 8/10）**不**被替换：上游
+    ``vsurf`` 687 对裸土保留 Jarvis 公式 ``ZRSMINB/ZF2B``，因为
+    ``COTWORESTRESS`` 只计算冠层（植被）导度。因此我们对 ``pwetb`` /
+    ``pwetlu`` 原样传递 ``jarvis``。
+
+    Args
+    ----
+    forcing:
+        :class:`Forcing`，携带 ``co2`` 与最低层状态。
+    skin_t_prev:
+        逐瓦片表皮温度 ``(Ngrid, Ntile)``；第 ``ktile_skin`` 列驱动
+        光合作用（优势瓦片表皮，默认瓦片 0）。
+    qskm1m:
+        逐瓦片表皮温度下的 qsat ``(Ngrid, Ntile)``；第 ``ktile_skin``
+        列供给 ``pqsurf``/``pqs``（陆面柱不带盐度因子，因此
+        ``pqsurf == pqs``）。
+    ssrfl_grid:
+        逐柱平均短波辐射 ``(Ngrid,)`` [W/m^2]。
+    ktvl, ktvh:
+        逐柱优势植被类型 ``(Ngrid,)`` long。``ktvl`` 索引逐 PFT 表
+        （KVTYPE）；``ktvh`` 为与 Jarvis 调用方保持一致而接受，但
+        Farquhar 调用使用低/优势类型（与现有的
+        ``_dominant_veg_types`` 冷启动近似一致，其中 ktvl == ktvh）。
+    jarvis:
+        :func:`jarvis_resistance` 的输出字典。为 Farquhar 输入提供
+        ``f2l``（土壤水分胁迫函数）和 ``lail``（LAI），外加原样返回
+        的 ``pwetb`` / ``pwetlu``。
+    veg_table:
+        :class:`VegTable`，携带 Farquhar 逐 PFT 表与
+        ``farquhar_consts`` 包（含 ``rcondctmin``）。
+    consts:
+        :class:`ConstantBundle`。
+    land_mask:
+        可选的 ``(Ngrid,)`` 布尔陆地掩码；默认为全陆地（调用方是
+        陆面模块）。
+    ktile_skin:
+        ``skin_t_prev`` / ``qskm1m`` 的哪一列瓦片驱动光合作用
+        （默认 0 = 优势/第一个瓦片）。
+
+    Returns
+    -------
+    dict，键与 :func:`build_tile_vevap` 所消费的相同：
+    ``pwetl`` / ``pweth`` / ``pweths``（Farquhar 导出），``pwetb`` /
+    ``pwetlu``（Jarvis 原样传递，上游 vsurf:687）。均为 ``(Ngrid,)``。
+    """
+    from .farquhar import farquhar as _farquhar, FarquharInputs
+
+    ngrid = ssrfl_grid.shape[0]
+    dtype = ssrfl_grid.dtype
+    device = ssrfl_grid.device
+
+    if land_mask is None:
+        land_mask = torch.ones((ngrid,), dtype=torch.bool, device=device)
+
+    rcondctmin = veg_table.farquhar_consts.rcondctmin
+
+    def _tile_farquhar(tile: int, kvtype: torch.Tensor, lai: torch.Tensor, pf2: torch.Tensor):
+        # VSURF calls COTWORESTRESS inside the tile loop; use the tile-local
+        # skin temperature and qsat rather than a fixed grid column.
+        skin_col = skin_t_prev[:, tile]
+        qs_col = qskm1m[:, tile]
+        kco2typ = veg_table.gather("nco2typ", kvtype).to(device=device)
+        inp = FarquharInputs(
+            ptskm=skin_col,
+            ptm=forcing.t,
+            ptsoil=skin_col,             # TODO: thread PTSAM1M(:,3) for exact acclimation T.
+            paphm=forcing.p_surf,
+            pqm=forcing.q,
+            pqsurf=qs_col,
+            pqs=qs_col,
+            pco2=forcing.co2,
+            lai=lai,
+            kvtype=kvtype,
+            kco2typ=kco2typ,
+            pf2=pf2,
+            ldland=land_mask,
+            psrfd=ssrfl_grid,
+        )
+        fq = _farquhar(inp, veg_table, consts)
+        pwet = 1.0 / torch.clamp(fq.pgstot, min=rcondctmin)
+        return pwet, fq
+
+    pwetl, fq_low = _tile_farquhar(
+        TILE_LOW_VEG_DRY, ktvl, jarvis["lail"], jarvis["f2l"])
+    pweth, fq_high = _tile_farquhar(
+        TILE_HIGH_VEG_DRY, ktvh, jarvis["laih"], jarvis["f2h"])
+    pweths, fq_high_snow = _tile_farquhar(
+        TILE_HIGH_VEG_SNOW, ktvh, jarvis["laih"], jarvis["f2h"])
+
+    # Bare-soil / urban resistances are not replaced by COTWORESTRESS
+    # (vsurf:687).  Diagnostics keep the low-veg Farquhar fields for
+    # backward compatibility with SurfDiag.
+    return {
+        "pwetl": pwetl,
+        "pweth": pweth,
+        "pweths": pweths,
+        "pwetb": jarvis["pwetb"],
+        "pwetlu": jarvis["pwetlu"],
+        "farquhar_pgstot": fq_low.pgstot,
+        "farquhar_pgpp":   fq_low.pgpp,
+        "farquhar_prd":    fq_low.prd,
+        "farquhar_pan":    fq_low.pan,
+        "farquhar_pgstot_high": fq_high.pgstot,
+        "farquhar_pgstot_high_snow": fq_high_snow.pgstot,
+    }
+
+
+__all__ = [
+    "jarvis_resistance",
+    "resistance_to_alpha",
+    "vevap",
+    "VevapOutputs",
+    "build_tile_alpha",
+    "build_tile_vevap",
+    "farquhar_resistance",
+    "ZEPSF3",
+    "RCLU",
+    "RSMIN_B",
+    "PWET_INF",
+    "RCEPSW",
+]

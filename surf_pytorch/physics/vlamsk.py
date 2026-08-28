@@ -1,29 +1,29 @@
-"""Tiled skin layer conductivity ``lambda_skin`` (Fortran ``VLAMSK``).
+"""逐瓦片的皮肤层热导率 ``lambda_skin``（Fortran ``VLAMSK``）。
 
-Direct translation of ``surf/module/vlamsk_mod.F90``.  This routine is
-called *before* ``SURFSEB`` (see ``surf/module/surfexcdriver_ctl_mod.F90``
-778-789) and produces the ``PLAMSK`` array that ``SURFSEB_CTL`` consumes
-verbatim (line 384 of ``surfseb_ctl_mod.F90``: ``ZLAMSK = PLAMSK``).
+``surf/module/vlamsk_mod.F90`` 的直接移植。本例程在 ``SURFSEB`` *之前*
+被调用（见 ``surf/module/surfexcdriver_ctl_mod.F90`` 第 778-789 行），
+并生成 ``SURFSEB_CTL`` 原样消费的 ``PLAMSK`` 数组
+（``surfseb_ctl_mod.F90`` 第 384 行：``ZLAMSK = PLAMSK``）。
 
-Tile ordering (1-based in Fortran, 0-based in this port -- see
-:mod:`surf_pytorch.config`, in particular :data:`F90_TILE_OF` which is the
-single authoritative port_idx -> Fortran JT map)
+瓦片顺序（Fortran 中为 1 基，本移植版中为 0 基——见
+:mod:`surf_pytorch.config`，尤其是 :data:`F90_TILE_OF`，它是唯一
+权威的 port_idx -> Fortran JT 映射）
 ::
 
-    0 ocean                | 5  vegetation high / snow-free
-    1 sea-ice              | 6  snow under high vegetation
-    2 wet skin             | 7  bare soil
-    3 vegetation low / dry | 8  lake        (optional)
-    4 snow on low veg      | 9  urban       (optional)
+    0 海洋          | 5  高植被/无雪
+    1 海冰          | 6  高植被下的雪
+    2 湿皮肤        | 7  裸土
+    3 低植被/干     | 8  湖泊      （可选）
+    4 低植被上的雪  | 9  城镇      （可选）
 
-The per-CASE comments below cite the Fortran JT directly; the Python
-slice index is always ``JT - 1`` (see ``F90_TILE_OF``).
+下方逐 CASE 的注释直接引用 Fortran JT；Python 切片索引始终为
+``JT - 1``（见 ``F90_TILE_OF``）。
 
-Layout
-------
-All inputs/outputs are ``(Ngrid, Ntile)`` with the tile axis last so the
-Penman-Monteith elimination in :mod:`surf_pytorch.physics.seb` can
-vectorise over columns and tiles at once.
+数据布局
+--------
+所有输入/输出均为 ``(Ngrid, Ntile)``，瓦片轴置于最后，以便
+:mod:`surf_pytorch.physics.seb` 中的 Penman-Monteith 消元可以
+同时对格点与瓦片做向量化。
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from ..config import (
 )
 from ..constants import ConstantBundle
 from ..tables import VegTable
+from ._ieee import true_div
 
 
 # --------------------------------------------------------------------------- #
@@ -103,56 +104,53 @@ def vlamsk(
     lsicoup: bool = False,
     rurban_c: "torch.Tensor | float" = 20.0,    # urban skin conductivity
 ) -> torch.Tensor:
-    """Compute tiled skin layer conductivity ``PLAMSK`` (W/m^2/K).
+    """计算逐瓦片的皮肤层热导率 ``PLAMSK``（W/m^2/K）。
 
-    Mirrors ``VLAMSK_MOD:VLAMSK`` line-for-line.  Branches are evaluated
-    with ``torch.where`` so the routine is differentiable when the
-    surrounding module runs under ``enable_grad`` (gradients are
-    zero off the active branch, matching the Fortran piecewise
-    behaviour).  Snow / sea-ice stability corrections are applied as
-    post-multipliers where the Fortran uses the same expression.
+    逐行镜像 ``VLAMSK_MOD:VLAMSK``。各分支以 ``torch.where`` 求值，
+    因此当外围模块在 ``enable_grad`` 下运行时本例程是可微的
+    （非活跃分支上的梯度为零，与 Fortran 的分段行为一致）。
+    雪/海冰稳定性订正在 Fortran 使用相同表达式的位置以后乘
+    因子的形式施加。
 
-    Args
+    参数
     ----
     ptskm1m, ptsrf:
-        Per-tile skin temperature and sub-surface temperature (K).
-        Shape ``(Ngrid, Ntile)``.
+        逐瓦片的皮肤温度与次表层温度（K）。形状 ``(Ngrid, Ntile)``。
     psnm, prsn:
-        Grid-mean snow water equivalent and density (the Fortran indexes
-        ``PSNM(:,1)``/``PRSN(:,1)`` -- we keep the grid axis only).
+        格点平均的雪水当量与密度（Fortran 索引为
+        ``PSNM(:,1)``/``PRSN(:,1)``——此处仅保留格点轴）。
     psntice:
-        Snow depth on sea ice (m).  Required if the sea-ice tile is
-        active and ``lsicoup`` is False; ignored otherwise.
+        海冰上的雪深（m）。当海冰瓦片活跃且 ``lsicoup`` 为 False
+        时必需；否则被忽略。
     ktvl, ktvh:
-        Dominant low / high vegetation type per column (long, 1..20).
+        每柱的主导低/高植被类型（长整型，1..20）。
     veg_table:
-        :class:`surf_pytorch.tables.VegTable` providing RVLAMSK /
-        RVLAMSKS / RVTRSR.
+        :class:`surf_pytorch.tables.VegTable`，提供 RVLAMSK /
+        RVLAMSKS / RVTRSR。
     consts:
-        :class:`ConstantBundle` (only ``rtt`` is consumed here).
+        :class:`ConstantBundle`（此处仅消费 ``rtt``）。
     config:
-        :class:`SurfConfig` -- ``n_tile`` selects how many tile columns
-        to fill (extra columns are left untouched).
+        :class:`SurfConfig`——``n_tile`` 决定填充多少个瓦片列
+        （多余列保持不动）。
 
-    Keyword args
-    ------------
+    关键字参数
+    ----------
     ptstep:
-        Per-column VDF sub-step (s).  Required for the snow stability
-        correction on tile 6 (high-veg snow); may be a 0-d tensor.
+        逐柱的 VDF 子步长（s）。瓦片 6（高植被雪）的雪稳定性
+        订正需要它；可以是 0 维张量。
     lesn09, leskti5, leskti8:
-        Soil-package feature flags from ``YDSOIL%`` -- default to the
-        values in ``config`` where available.  Toggle to reproduce a
-        namelist override.
+        来自 ``YDSOIL%`` 的土壤方案特性开关——在可用时默认取
+        ``config`` 中的值。切换它们可复现 namelist 覆盖。
     lsicoup:
-        Sea-ice coupling flag from ``YDEXC%LSICOUP``.  When True the
-        sea-ice tile is forced to ``LARGE`` (skin pinned to SST).
+        来自 ``YDEXC%LSICOUP`` 的海冰耦合开关。为 True 时海冰
+        瓦片被强制为 ``LARGE``（皮肤温度钉扎到 SST）。
     rurban_c:
-        Urban tile skin conductivity (RURBTC).  Default 20.0 reproduces
-        the cy48r1 ``SUSURB`` value; override for sensitivity studies.
+        城镇瓦片皮肤热导率（RURBTC）。默认值 20.0 复现 cy48r1
+        ``SUSURB`` 的取值；敏感性研究可覆盖该值。
 
-    Returns
+    返回
     -------
-    plamsk : (Ngrid, Ntile) skin layer conductivity.
+    plamsk : (Ngrid, Ntile) 皮肤层热导率。
     """
     ntile = config.n_tile
     ngrid = ptskm1m.shape[0]
@@ -237,13 +235,13 @@ def vlamsk(
         # Snow stability factor ZSTABEXSN (uses full PSNM/PRSN at col).
         rq = RQSNCR_SN09 if lesn09 else RQSNCR_DEFAULT
         depth = torch.clamp(psnm / prsn, min=rq)
-        # rho_cp_eff = RHOCI*PRSN/RHOICE
-        rho_cp = RHO_CI * prsn / RHO_ICE
         if ptstep is None:
             stab = torch.zeros_like(depth)
         else:
             ts = ptstep.broadcast_to(depth.shape) if ptstep.dim() else ptstep
-            stab = ts / (depth * rho_cp)
+            # F90 groups the denominator as ((MAX*RHOCI)*PRSN)/RHOICE
+            # (left-to-right * and /); keep that exact association.
+            stab = ts / true_div((depth * RHO_CI) * prsn, RHO_ICE)
         plamsk[_tile(TILE_HIGH_VEG_SNOW)] = base / (1.0 + stab * base)
 
     # -- CASE 8 (Fortran): bare soil.  Optional cy46+ refinement

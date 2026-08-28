@@ -1,32 +1,26 @@
-"""State, forcing and static-field containers for the land-surface model.
+"""陆面模式的状态、强迫与静态字段容器。
 
-These dataclasses mirror the argument lists of the offline driver's
-``VDFMAIN1S`` entry point (see ``surf/offline/driver/callpar1s.F90``
-lines 906-955 and ``vdfmain1s.F90`` lines 1-130).  They are plain
-Python containers (no autograd, no buffer registration) so the model
-can pull tensors in/out for both inference and training.
+这些 dataclass 与离线驱动 ``VDFMAIN1S`` 入口的参数列表一一对应
+（见 ``surf/offline/driver/callpar1s.F90`` 第 906-955 行与
+``vdfmain1s.F90`` 第 1-130 行）。它们是纯 Python 容器（无 autograd、
+无 buffer 注册），使模型在推理与训练中都能方便地取放张量。
 
-Tensor layout convention
-------------------------
-The PyTorch port standardises on **grid-major batching**:
+张量布局约定
+------------
+PyTorch 移植统一采用**格点优先批处理**：
 
-* the leading dim of every grid field is the *batch / column* dim
-  (``Ngrid``), which can be 1 for a single column test and an arbitrary
-  power-of-two for ML training batches;
-* soil/snow vertical fields carry their level axis as the last dim
-  (``Ngrid, Nlev``) so that ``tridiag_solve`` can stride over ``-1``;
-* tile fields carry the tile axis as the last dim
-  (``Ngrid, Ntile``);
-* atmospheric levels are arranged surface-first (level ``KLEV`` is the
-  lowest model level in IFS; here we keep IFS order so the surface is
-  the *last* index along ``Nlev_atm``).  Helpers in
-  :mod:`surf_pytorch.utils` flip on demand.
+* 每个格点场的首维是*批次 / 列*维（``Ngrid``），单列测试可取 1，
+  ML 训练批次可取任意 2 的幂；
+* 土壤/雪的垂直场把层轴放在最后一维（``Ngrid, Nlev``），使
+  ``tridiag_solve`` 能沿 ``-1`` 维跨步；
+* 瓦片场把瓦片轴放在最后一维（``Ngrid, Ntile``）；
+* 大气层按"地表在前"排列（``KLEV`` 是 IFS 的最低模式层；这里保持
+  IFS 顺序，使地表是 ``Nlev_atm`` 上的*最后*一个索引）。
+  :mod:`surf_pytorch.utils` 中的辅助函数按需翻转。
 
-Fields are intentionally listed in the same order as the Fortran
-declarations so a side-by-side audit of the offline-driver output dump
-is easy.  Optional fields (lake, urban, multi-layer snow) are present
-as ``None`` placeholders -- the physics modules assert at construction
-time if they are required and missing.
+字段刻意按与 Fortran 声明相同的顺序列出，便于与离线驱动输出转储
+逐项对照审查。可选字段（湖泊、城市、多层雪）以 ``None`` 占位——
+物理模块在构造时若需要而缺失会立即断言报错。
 """
 
 from __future__ import annotations
@@ -107,6 +101,13 @@ class Forcing:
     # Optional radiative-time skin temperature PTSKRAD. The offline driver
     # carries this diagnostic across radiation and surface substeps.
     radiative_skin_t: Optional[torch.Tensor] = None  # (Ngrid,) [K]
+
+    # Optional authoritative mean radiative fluxes in W/m^2. callpar1s.F90:800
+    # computes PFRTH (and PSRSOD*(1-PALB)) directly in W/m^2; the cumulative
+    # fr_so/fr_th round-trip ((x*dt)/dt) double-rounds by up to 1 ulp, so
+    # strict comparisons pass the mean flux through untouched.
+    slrfl_grid_wm2: Optional[torch.Tensor] = None  # (Ngrid,) net LW at sfc [W/m2]
+    srfd_grid_wm2: Optional[torch.Tensor] = None   # (Ngrid,) downward SW at sfc [W/m2]
 
     # Optional authoritative tiled VUPDZ0 boundary from an atmospheric
     # diffusion driver.  These fields support strict offline comparison;
@@ -453,6 +454,21 @@ class SurfDiag:
     # Surface energy balance closure diagnostics.
     net_rad: Optional[torch.Tensor] = None       # (Ngrid,) [W/m^2]
     ground_heat: Optional[torch.Tensor] = None   # (Ngrid,) [W/m^2]
+
+    # Column water-budget diagnostics. Precipitation, runoff, storage, and
+    # residual are step-integrated water masses [kg/m^2]. Evaporation keeps
+    # the native e_flux sign convention (positive downward).
+    precip_input: Optional[torch.Tensor] = None
+    evaporation_input: Optional[torch.Tensor] = None
+    surface_runoff: Optional[torch.Tensor] = None
+    subsurface_runoff: Optional[torch.Tensor] = None
+    water_storage: Optional[torch.Tensor] = None
+    water_storage_change: Optional[torch.Tensor] = None
+    water_budget_residual: Optional[torch.Tensor] = None
+
+    # Instantaneous tiled surface-energy closure [W/m^2]:
+    # net_SW + net_LW + sensible + latent - ground_heat.
+    energy_budget_residual: Optional[torch.Tensor] = None
 
     # Carbon flux diagnostics (populated only when the Farquhar
     # photosynthesis port is active -- ``SurfConfig.use_farquhar``).  All

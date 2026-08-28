@@ -61,7 +61,9 @@ def test_stefan_boltzmann():
     # 5.670374e-8.  Pin to the Fortran-computed value, with the
     # expression matching sucst.F90 line-for-line.
     expected = 2.0 * math.pi**5 * C.RKBOL**4 / (15.0 * C.RCLUM**2 * C.RHPLA**3)
-    assert abs(C.RSIGMA - expected) < 1e-30
+    # RSIGMA keeps the Fortran grouping (integer-power multiply chains,
+    # not libm pow), so allow a few ulp against the math-module replay.
+    assert abs(C.RSIGMA - expected) <= 10 * math.ulp(expected)
     assert abs(C.RSIGMA - 5.6705085385e-8) < 1e-17
 
 

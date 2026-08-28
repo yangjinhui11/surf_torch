@@ -1,34 +1,30 @@
-"""Farquhar photosynthesis + Ball-Berry stomatal conductance (``FARQUHAR``).
+"""Farquhar 光合作用 + Ball-Berry 气孔导度模型（``FARQUHAR``）。
 
-Vectorised, differentiable PyTorch port of the coupled photosynthesis /
-stomatal-conductance model (Farquhar et al. 1980; Collatz et al. 1992;
-Yin et al. 2009 C3/C4 cubic closures; Ball et al. 1987).  The port is
-verified against an *independent* standalone Fortran re-implementation
-(``surf_ref.F90::SURF_REF_FARQUHAR``) at 1e-12 relative tolerance -- both
-transcriptions share the same :class:`FarquharConstants` parameterisation
-so any mismatch is purely arithmetic, which is exactly what the ULP test
-is meant to surface.
+对耦合的光合作用 / 气孔导度模型（Farquhar et al. 1980; Collatz et al.
+1992; Yin et al. 2009 的 C3/C4 三次方程闭合；Ball et al. 1987）的
+向量化、可微分 PyTorch 移植。该移植与一个 *独立的* 独立 Fortran 重实现
+（``surf_ref.F90::SURF_REF_FARQUHAR``）在 1e-12 相对容差下进行了校验——
+两份转写共享同一套 :class:`FarquharConstants` 参数化，因此任何失配都纯粹
+是算术层面的，而这正是 ULP 测试旨在暴露的问题。
 
-Algorithm (matches farquhar_mod.F90 + sufarquhar_mod.F90)
+算法（与 farquhar_mod.F90 + sufarquhar_mod.F90 一致）
 ---------------------------------------------------------
-For each vegetated column with daytime SW, non-trivial LAI and a growing-
-temperature in ``(-4, 55)`` degC:
+对每个有植被、白天有短波辐射、LAI 非平凡且生长温度在 ``(-4, 55)``
+摄氏度的柱体：
 
-1. Per-PFT table lookup at ``KVTYPE`` for Vcmax25 / g0 / a1 / b1 etc.
-2. Arrhenius (modified) temperature scalings for KmC / KmO / Sco /
-   gamma_star / Rd; Kattge&Knorr (2007) acclimation for Jmax / Vcmax.
-3. Yin (2009) C3 cubic (Appendix B) or C4 cubic (Appendix C) stomatal
-   closure: a depressed-cubic root via the trigonometric identity
-   ``cos(acos(q)/3)`` (Baldocchi 1994), iterated twice over the two
-   limiting processes (Rubisco- vs light-limited).
-4. Canopy integration over ``NLAI=20`` Beer-Lambert light levels.
-5. Ball-Berry conductance; unit conversions to m/s and kgC/m^2/s.
+1. 按 ``KVTYPE`` 对每个 PFT 查表获取 Vcmax25 / g0 / a1 / b1 等参数。
+2. 对 KmC / KmO / Sco / gamma_star / Rd 采用（修正的）Arrhenius 温度
+   标度；对 Jmax / Vcmax 采用 Kattge&Knorr (2007) 驯化方案。
+3. Yin (2009) 的 C3 三次方程（附录 B）或 C4 三次方程（附录 C）气孔
+   闭合：通过三角恒等式 ``cos(acos(q)/3)``（Baldocchi 1994）求缺项
+   三次方程的根，并在两种限制过程（Rubisco 限制与光限制）上迭代两次。
+4. 在 ``NLAI=20`` 个 Beer-Lambert 光照层上作冠层积分。
+5. Ball-Berry 导度；单位换算到 m/s 和 kgC/m^2/s。
 
-The C3/C4 cubic root uses ``torch.acos`` / ``torch.cos`` so it is fully
-differentiable; the two-iteration ``LIMIT_PHOTO`` loop and the ``min``
-selection over the two roots are reproduced verbatim because the upstream
-loop-exit semantics matter (C4 keeps the J-limited value, C3 keeps the
-smaller root).
+C3/C4 三次方程求根使用 ``torch.acos`` / ``torch.cos``，因此完全可微；
+两迭代的 ``LIMIT_PHOTO`` 循环以及对两个根取 ``min`` 的选择按原文逐字
+复现，因为上游的循环退出语义很关键（C4 保留 J 限制的值，C3 保留较小
+的根）。
 """
 from __future__ import annotations
 
@@ -45,12 +41,11 @@ from surf_pytorch.constants import R as RGAS
 # --------------------------------------------------------------------------- #
 @dataclass
 class FarquharInputs:
-    """Per-column state needed by the Farquhar photosynthesis model.
+    """Farquhar 光合作用模型所需的逐柱状态。
 
-    All tensors are ``(Ngrid,)`` -- the model is per-column (the tile
-    dimension is collapsed by the caller; the upstream FARQUHAR is
-    likewise called once per assimilating tile with the per-tile state).
-    The fields mirror the ``FARQUHAR`` dummy list (farquhar_mod.F90:73-75).
+    所有张量均为 ``(Ngrid,)`` 形状——模型是逐柱的（瓦片维度由调用方
+    折叠；上游 FARQUHAR 同样是按每个同化瓦片以其逐瓦片状态调用一次）。
+    各字段与 ``FARQUHAR`` 的哑元列表对应（farquhar_mod.F90:73-75）。
     """
 
     # State.
@@ -76,7 +71,7 @@ class FarquharInputs:
 
 @dataclass
 class FarquharOutputs:
-    """Photosynthesis / conductance outputs from ``FARQUHAR``."""
+    """``FARQUHAR`` 的光合作用 / 导度输出。"""
 
     pgstot: torch.Tensor        # stomatal conductance [m s^-1]
     pgpp:   torch.Tensor        # gross primary productivity [kgC m^-2 s^-1]
@@ -91,13 +86,13 @@ def _arrhenius_mod(
     ptemp: torch.Tensor, pref: float, peact: torch.Tensor,
     pdeact: torch.Tensor, pentr: torch.Tensor, prr: float,
 ) -> torch.Tensor:
-    """Modified Arrhenius function with a high-T deactivation term.
+    """带高温失活项的修正 Arrhenius 函数。
 
     ``f(T) = exp((T-Tref)*Ea/(Tref*R*T)) * (1+exp((Tref*Entr-Deact)/(Tref*R)))``
     ``                / (1+exp((T*Entr-Deact)/(R*T)))``
 
-    Vectorised over the leading dim of ``ptemp`` (Ngrid,).  ``peact`` /
-    ``pdeact`` / ``pentr`` may be scalars or per-grid tensors.
+    沿 ``ptemp`` 的首维（Ngrid,）向量化。``peact`` / ``pdeact`` /
+    ``pentr`` 可以是标量或逐网格张量。
     """
     num = ((ptemp - pref) * peact) / (pref * prr * ptemp)
     denom_num = 1.0 + torch.exp((pref * pentr - pdeact) / (pref * prr))
@@ -109,25 +104,25 @@ def _arrhenius_mod(
 # Driver
 # --------------------------------------------------------------------------- #
 def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> FarquharOutputs:
-    """Vectorised, differentiable Farquhar photosynthesis + conductance.
+    """向量化、可微分的 Farquhar 光合作用 + 导度。
 
     Args
     ----
     inp
-        Per-column state (see :class:`FarquharInputs`).
+        逐柱状态（见 :class:`FarquharInputs`）。
     veg
-        :class:`~surf_pytorch.tables.veg.VegTable` carrying the eight
-        per-PFT ``(21, 2)`` Farquhar tables (Vcmax25, g0, a1, b1, ...)
-        and the :class:`FarquharConstants` scalar bundle.
+        :class:`~surf_pytorch.tables.veg.VegTable`，携带八张逐 PFT 的
+        ``(21, 2)`` Farquhar 表（Vcmax25, g0, a1, b1, ...）以及
+        :class:`FarquharConstants` 标量包。
     consts
-        :class:`~surf_pytorch.constants.ConstantBundle` (for ``pi`` only;
-        the gas constant ``R`` comes from ``constants.R`` to match the
-        offline driver's SUCST exactly).
+        :class:`~surf_pytorch.constants.ConstantBundle`（仅用到
+        ``pi``；气体常数 ``R`` 来自 ``constants.R``，以与离线驱动
+        的 SUCST 严格一致）。
 
     Returns
     -------
-    :class:`FarquharOutputs` with ``pgstot`` / ``pgpp`` / ``prd`` / ``pan``
-    shaped ``(Ngrid,)`` and dtype/device matching ``inp.psrfd``.
+    :class:`FarquharOutputs`，其 ``pgstot`` / ``pgpp`` / ``prd`` / ``pan``
+    形状为 ``(Ngrid,)``，dtype/device 与 ``inp.psrfd`` 一致。
     """
     from surf_pytorch.tables.veg import FarquharConstants
 
@@ -141,8 +136,25 @@ def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> Far
     nlai = int(fc.nlai)
 
     # Scalar constants as tensors (so every op stays in dtype/device).
+    # Cache per (value, dtype, device) so CUDA-graph capture reuses the same
+    # device tensor instead of building a new one (which would require a
+    # host->device copy, forbidden during stream capture).
+    _cache = farquhar.__dict__.setdefault("_scalar_cache", {})
     def _s(x: float) -> torch.Tensor:
-        return torch.as_tensor(float(x), dtype=dtype, device=device)
+        key = (float(x), dtype, str(device))
+        t = _cache.get(key)
+        if t is None:
+            t = torch.as_tensor(float(x), dtype=dtype, device=device)
+            _cache[key] = t
+        return t
+
+    def _v(vals, _cache_v=farquhar.__dict__.setdefault("_table_cache", {})):
+        key = (tuple(float(v) for v in vals), dtype, str(device))
+        t = _cache_v.get(key)
+        if t is None:
+            t = torch.tensor(list(vals), dtype=dtype, device=device)
+            _cache_v[key] = t
+        return t
 
     rr_c   = _s(float(RGAS))
     rpi_c  = consts.pi.to(dtype=dtype, device=device)  # 0-d tensor, avoid .item()
@@ -182,7 +194,7 @@ def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> Far
     rstress_gs = _s(fc.rstress_gs)
     rstress_vcmax = _s(fc.rstress_vcmax)
     re_gamma_star_s = _s(fc.re_gamma_star)
-    eps = torch.as_tensor(torch.finfo(dtype).eps, dtype=dtype, device=device)
+    eps = _s(torch.finfo(dtype).eps)
 
     # ------------------------------------------------------------------ #
     # Per-PFT table gather -- index by kvtype (0..20).
@@ -230,10 +242,9 @@ def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> Far
             - (inp.pqm * zpb / (rtetens_1 + inp.pqm * rtetens_2))) / 10.0
 
     ztemp_growth = inp.ptsoil - rtp_00
-    zleaf_temp = torch.where(
-        torch.as_tensor(True, device=device).expand(ngrid),  # LSKIN_TEMP=True default
-        inp.ptskm, inp.ptskm,
-    )
+    # LSKIN_TEMP=True default: both branches are inp.ptskm, so the where is a
+    # no-op; take it directly (also avoids a graph-unsafe host scalar tensor).
+    zleaf_temp = inp.ptskm
     # The upstream honours LSKIN_TEMP (default True in offline mode);
     # here we always use skin T.  A caller wanting air-T can swap ptskm.
 
@@ -280,21 +291,21 @@ def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> Far
                               / (rref_temp * rr_c * zleaf_temp))
 
     # Path-pair scalars as (2,) tensors for clean C3/C4 selection.
-    rarjv = torch.tensor(fc.rarJV, dtype=dtype, device=device)
-    rbrjv = torch.tensor(fc.rbrJV, dtype=dtype, device=device)
-    rasj  = torch.tensor(fc.rasJ,  dtype=dtype, device=device)
-    rbsj  = torch.tensor(fc.rbsJ,  dtype=dtype, device=device)
-    rasv  = torch.tensor(fc.rasV,  dtype=dtype, device=device)
-    rbsv  = torch.tensor(fc.rbsV,  dtype=dtype, device=device)
-    rd_vcmax = torch.tensor(fc.rd_vcmax, dtype=dtype, device=device)
-    rd_jmax  = torch.tensor(fc.rd_jmax,  dtype=dtype, device=device)
-    re_gm    = torch.tensor(fc.re_gm,    dtype=dtype, device=device)
-    rs_gm    = torch.tensor(fc.rs_gm,    dtype=dtype, device=device)
-    rs_jmax  = torch.tensor(fc.rs_jmax,  dtype=dtype, device=device)
-    rd_gm    = torch.tensor(fc.rd_gm,    dtype=dtype, device=device)
-    rkmc25   = torch.tensor(fc.rkmc25,   dtype=dtype, device=device)
-    rkmo25   = torch.tensor(fc.rkmo25,   dtype=dtype, device=device)
-    rsco25   = torch.tensor(fc.rsco25,   dtype=dtype, device=device)
+    rarjv = _v(fc.rarJV)
+    rbrjv = _v(fc.rbrJV)
+    rasj  = _v(fc.rasJ)
+    rbsj  = _v(fc.rbsJ)
+    rasv  = _v(fc.rasV)
+    rbsv  = _v(fc.rbsV)
+    rd_vcmax = _v(fc.rd_vcmax)
+    rd_jmax  = _v(fc.rd_jmax)
+    re_gm    = _v(fc.re_gm)
+    rs_gm    = _v(fc.rs_gm)
+    rs_jmax  = _v(fc.rs_jmax)
+    rd_gm    = _v(fc.rd_gm)
+    rkmc25   = _v(fc.rkmc25)
+    rkmo25   = _v(fc.rkmo25)
+    rsco25   = _v(fc.rsco25)
     path_idx = (col.to(dtype=dtype))                                # 0=C3, 1=C4
 
     def _sel(v2: torch.Tensor) -> torch.Tensor:

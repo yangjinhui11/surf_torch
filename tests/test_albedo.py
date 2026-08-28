@@ -1,9 +1,10 @@
-"""Tests for the surface-albedo subsystem (snow + background two-tier).
+"""Tests for the surface-albedo subsystem (SURFRAD spectral mapping).
 
 Verifies the end-to-end albedo wiring in :mod:`surf_pytorch.model`:
 
-* :meth:`LandSurface._surface_albedo` -- per-tile broadband alpha mapping
-  (snow tiles -> PASN, wet-skin -> albw, dry/bare -> albd, water/ice -> 0).
+* :meth:`LandSurface._surface_albedo` -- per-tile broadband PALBTI
+  (snow tiles -> RSUN-band construction from PASN / the forest table,
+  wet-skin/dry/bare -> the flat background albedo albd, water/ice -> 0).
 * the alpha injection at forward() section 5 (``ssrfl_t *= (1 - alpha)``).
 * the prognostic snow-albedo advance via :meth:`_update_snow_albedo`.
 * the **dormant fallback**: with no albedo fields set, alpha is 0
@@ -121,6 +122,20 @@ def _model(*, validate=False) -> LandSurface:
     return LandSurface(SurfConfig(dtype=torch.float64, validate=validate))
 
 
+def _ulp_close(t: torch.Tensor, value: float, n_ulp: int = 4) -> bool:
+    """Assert equality within a few ulp (band-accumulation rounding)."""
+    tol = n_ulp * torch.finfo(t.dtype).eps * abs(value)
+    return bool(torch.all(torch.abs(t - value) <= tol))
+
+
+def _expected_forest_blend(m, static, dtype=torch.float64):
+    """PALBTI of the high-veg snow tile: RSUN band accumulation."""
+    uv = m._snow_forest_albedo(static, 1, dtype, torch.device("cpu"))
+    ni = m._snow_forest_albedo(static, 2, dtype, torch.device("cpu"))
+    return (m._RSUN_BANDS[0] * (uv + uv)) * 0.5 \
+        + (m._RSUN_BANDS[1] * (ni + ni)) * 0.5
+
+
 # --------------------------------------------------------------------------- #
 # Dormant fallback (bit-identical regression guard)
 # --------------------------------------------------------------------------- #
@@ -174,8 +189,10 @@ class TestSnowTileMapping:
         static = _make_static()    # albd=albw=None -> only snow path active
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == 0.70)
-        expected_high = m._snow_forest_albedo(static, torch.float64, torch.device("cpu"))
+        # Low-snow PALBTI: RSUN-band construction reproduces PASN to
+        # within band-rounding (surfrad 603-616, 670).
+        assert _ulp_close(alpha[:, TILE_LOW_VEG_SNOW], 0.70)
+        expected_high = _expected_forest_blend(m, static)
         assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == expected_high)
         # Non-snow tiles stay 0 (no background supplied).
         assert torch.all(alpha[:, TILE_WATER] == 0.0)
@@ -192,7 +209,7 @@ class TestSnowTileMapping:
             static = _make_static()
             alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                       torch.device("cpu"))
-            assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == pasn)
+            assert _ulp_close(alpha[:, TILE_LOW_VEG_SNOW], pasn)
 
     def test_fewer_tiles_safe(self):
         """With ntile < 8 the per-tile writes are skipped gracefully."""
@@ -210,7 +227,14 @@ class TestSnowTileMapping:
 # Background-albedo mapping
 # --------------------------------------------------------------------------- #
 class TestBackgroundMapping:
-    """albd/albw set -> dry/bare tiles and wet-skin take background."""
+    """albd/albw set -> flat background albedo (F90 PALBF) everywhere.
+
+    The offline Fortran runs NALBEDOSCHEME=0, so the wet-skin tile takes
+    the same flat background albd as the dry-vegetation and bare-soil
+    tiles (surfrad 549-561); albw only acts as a fallback when albd is
+    absent.  The broadband alpha is the RSUN band accumulation of the
+    per-band albedo, equal to albd up to band rounding.
+    """
 
     def test_background_on_dry_tiles(self):
         m = _model()
@@ -218,10 +242,10 @@ class TestBackgroundMapping:
         static = _make_static(albd=0.20, albw=0.10)
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        assert torch.all(alpha[:, TILE_WET_SKIN] == 0.10)        # albw
-        assert torch.all(alpha[:, TILE_LOW_VEG_DRY] == 0.20)     # albd
-        assert torch.all(alpha[:, TILE_HIGH_VEG_DRY] == 0.20)    # albd
-        assert torch.all(alpha[:, TILE_BARE_SOIL] == 0.20)       # albd
+        assert _ulp_close(alpha[:, TILE_WET_SKIN], 0.20)        # albd (flat)
+        assert _ulp_close(alpha[:, TILE_LOW_VEG_DRY], 0.20)     # albd
+        assert _ulp_close(alpha[:, TILE_HIGH_VEG_DRY], 0.20)    # albd
+        assert _ulp_close(alpha[:, TILE_BARE_SOIL], 0.20)       # albd
         # Snow tiles have no PASN and no albd-for-snow rule -> 0.
         assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == 0.0)
         assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == 0.0)
@@ -232,7 +256,7 @@ class TestBackgroundMapping:
         static = _make_static(albd=0.25)   # albw=None
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        assert torch.all(alpha[:, TILE_WET_SKIN] == 0.25)   # albd fallback
+        assert _ulp_close(alpha[:, TILE_WET_SKIN], 0.25)   # albd
 
     def test_albd_only_no_albw(self):
         m = _model()
@@ -240,8 +264,8 @@ class TestBackgroundMapping:
         static = _make_static(albd=0.18)
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        assert torch.all(alpha[:, TILE_LOW_VEG_DRY] == 0.18)
-        assert torch.all(alpha[:, TILE_WET_SKIN] == 0.18)    # albd fallback
+        assert _ulp_close(alpha[:, TILE_LOW_VEG_DRY], 0.18)
+        assert _ulp_close(alpha[:, TILE_WET_SKIN], 0.18)
 
 
 # --------------------------------------------------------------------------- #
@@ -256,15 +280,15 @@ class TestCombinedMapping:
         static = _make_static(albd=0.20, albw=0.10)
         alpha = m._surface_albedo(state, static, _make_forcing(), 8, torch.float64,
                                   torch.device("cpu"))
-        # Low-snow takes PASN; high-snow takes Fortran forest-snow albedo.
-        assert torch.all(alpha[:, TILE_LOW_VEG_SNOW] == 0.75)
-        expected_high = m._snow_forest_albedo(static, torch.float64, torch.device("cpu"))
+        # Low-snow band construction from PASN; high-snow forest table.
+        assert _ulp_close(alpha[:, TILE_LOW_VEG_SNOW], 0.75)
+        expected_high = _expected_forest_blend(m, static)
         assert torch.all(alpha[:, TILE_HIGH_VEG_SNOW] == expected_high)
-        # Dry / bare / wet tiles take background.
-        assert torch.all(alpha[:, TILE_WET_SKIN] == 0.10)
-        assert torch.all(alpha[:, TILE_LOW_VEG_DRY] == 0.20)
-        assert torch.all(alpha[:, TILE_HIGH_VEG_DRY] == 0.20)
-        assert torch.all(alpha[:, TILE_BARE_SOIL] == 0.20)
+        # Flat tiles take the background (wet-skin = albd, flat scheme).
+        assert _ulp_close(alpha[:, TILE_WET_SKIN], 0.20)
+        assert _ulp_close(alpha[:, TILE_LOW_VEG_DRY], 0.20)
+        assert _ulp_close(alpha[:, TILE_HIGH_VEG_DRY], 0.20)
+        assert _ulp_close(alpha[:, TILE_BARE_SOIL], 0.20)
 
 
 # --------------------------------------------------------------------------- #

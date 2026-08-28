@@ -28,7 +28,7 @@ from surf_pytorch.constants import PhysicalConstants
 from surf_pytorch.physics.exchange import (
     ExchangeOutputs,
     vexcs as port_vexcs,
-    psimu, psihu, psims, psihs,
+    psimu, psihu, psims, psihs, _psi_h,
     REPDU2, RKAP, RPARZI, RCHBHDL, DEFAULT_KITT,
 )
 from surf_pytorch.tables import RitblTable
@@ -152,6 +152,12 @@ class TestPsiFunctions:
         expected = (math.log((1 + x) ** 2 * (1 + y) * 0.125)
                     - 2 * math.atan(x) + RCDHPI2)
         assert psimu(e).item() == pytest.approx(expected, abs=1e-14)
+
+    def test_mixed_sign_heat_psi_has_finite_backward_gradient(self, dtype):
+        """The masked stable branch must not differentiate sqrt(0)."""
+        eta = torch.tensor([-100.0, 0.1], dtype=dtype, requires_grad=True)
+        _psi_h(eta).sum().backward()
+        assert torch.isfinite(eta.grad).all()
 
 
 # --------------------------------------------------------------------------- #

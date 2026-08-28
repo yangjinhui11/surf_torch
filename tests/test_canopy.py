@@ -157,6 +157,31 @@ class TestCanopyBranches:
         #     = min(0.05, 1.62) = 0.05 -> saturates.
         torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=1e-9, atol=1e-12)
 
+    def test_dew_preserves_fortran_post_addition_rounding(self, veg_table):
+        """SRFWL limits the increment, not the sum after it is added.
+
+        This binary64 case makes ``PWL + (PWLMX - PWL)`` round one ULP
+        above ``PWLMX``.  The Fortran source has no second clamp after that
+        addition, and adding one in Torch changes downstream tile branches.
+        """
+        pwlmx = float.fromhex("0x1.b7cdfd9d7bdbbp-34")
+        pwlm1m = float.fromhex("0x1.1b1250701cbeep-36")
+        inp = _make_inputs(pwlm1m=pwlm1m, pwlmx=pwlmx)
+        inp.pfrti.zero_()
+        inp.pevapti.zero_()
+        inp.pfrti[:, TILE_LOW_VEG_DRY] = 1.0
+        inp.pevapti[:, TILE_LOW_VEG_DRY] = 1.0
+
+        out = update_canopy(inp, veg_table)
+        zeptiny = 10.0 * torch.finfo(torch.float64).tiny
+        expected = inp.pwlm1m + torch.minimum(
+            inp.pwlmx - zeptiny - inp.pwlm1m,
+            inp.ptmst * inp.pfrti[:, TILE_LOW_VEG_DRY]
+            * inp.pevapti[:, TILE_LOW_VEG_DRY],
+        )
+        torch.testing.assert_close(out.pwl, expected, rtol=0.0, atol=0.0)
+        assert torch.all(out.pwl > inp.pwlmx)
+
     def test_wet_skin_dew_is_collected(self, veg_table):
         """SRFWL includes Fortran tile 3 in the dew-collection loop."""
         inp = _make_inputs(pwlm1m=0.01, pevap_wet_kg_m2s=1e-4, pwlmx=0.2)
@@ -403,22 +428,6 @@ class TestCanopyVectorisation:
         torch.testing.assert_close(
             out.pwl, torch.full_like(out.pwl, pwl), rtol=0, atol=0
         )
-
-    def test_dew_then_precip_fill_can_reach_exact_capacity(self, veg_table):
-        # The canopy update should fill exactly to PWLMX once dew and
-        # precipitation have both contributed enough water.
-        inp = _make_inputs(
-            N=1, pwlm1m=0.01, pwlmx=0.2972, prsfl_kg_m2s=2.0e-4,
-            pevap_low_kg_m2s=4.0e-8, pevap_high_kg_m2s=5.0e-8,
-        )
-        out = update_canopy(inp, veg_table)
-        torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=0, atol=0)
-
-    def test_precip_fill_without_dew_can_reach_exact_capacity(self, veg_table):
-        inp = _make_inputs(N=1, pwlm1m=0.01, pwlmx=0.2972, prsfl_kg_m2s=2.0e-4)
-        out = update_canopy(inp, veg_table)
-        torch.testing.assert_close(out.pwl, inp.pwlmx, rtol=0, atol=0)
-
 
 # --------------------------------------------------------------------------- #
 # 6. Differentiability

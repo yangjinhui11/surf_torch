@@ -1,45 +1,40 @@
-"""FLake lake model stub (``FLAKE_DRIVER``).
+"""FLake 湖泊模型占位桩（``FLAKE_DRIVER``）。
 
-This module is the placeholder port of ``FLAKE_DRIVER`` -- the
-fresh-water lake model used by ``SURFTSTP_CTL`` (section 4.7,
-surftstp_ctl_mod.F90:795-818) when the namelist switch ``LEFLAKE`` is
-``.TRUE.``.  The offline driver cold-starts with ``LEFLAKE = .FALSE.``
-(*sudim1s.F90*), so the upstream ``ELSE`` branch at lines 808-818 runs
-instead: every prognostic is held at its t-1 value (identity update).
+本模块是 ``FLAKE_DRIVER`` 的占位移植——``SURFTSTP_CTL``（第 4.7 节，
+surftstp_ctl_mod.F90:795-818）在 namelist 开关 ``LEFLAKE`` 为
+``.TRUE.`` 时使用的淡水湖泊模型。离线驱动冷启动时
+``LEFLAKE = .FALSE.``（*sudim1s.F90*），因此改为运行上游第 808-818
+行的 ``ELSE`` 分支：每个预报量保持其 t-1 值（恒等更新）。
 
-What the real FLake does
+真实 FLake 的功能
 ------------------------
-FLake (Mironov 2008) is a two-layer parametrization of the lake mixed
-layer and thermocline.  It integrates seven prognostics per lake point:
+FLake（Mironov 2008）是湖泊混合层与温跃层的双层参数化。它在每个湖
+点积分七个预报量：
 
-* ``PTLICE``  -- temperature at the air-ice / snow-ice interface [K]
-* ``PTLMNW``  -- mean temperature of the water column [K]
-* ``PTLWML``  -- mixed-layer temperature [K]
-* ``PTLBOT``  -- lake-bottom temperature [K]
-* ``PTLSF``   -- skin temperature at the lower surface of the ice [K]
-* ``PHLICE``  -- lake-ice thickness [m]
-* ``PHLML``   -- mixed-layer depth [m]
+* ``PTLICE``  -- 空气-冰 / 雪-冰界面温度 [K]
+* ``PTLMNW``  -- 水柱平均温度 [K]
+* ``PTLWML``  -- 混合层温度 [K]
+* ``PTLBOT``  -- 湖底温度 [K]
+* ``PTLSF``   -- 冰下表面表皮温度 [K]
+* ``PHLICE``  -- 湖冰厚度 [m]
+* ``PHLML``   -- 混合层深度 [m]
 
-The driver takes the surface forcing (net SW / LW, sensible / latent
-heat, momentum stress) plus the lake depth and latitude, and returns
-the t+1 prognostics.  It is gated behind a lake-point mask (``LDLAKE``)
-so non-lake points are skipped entirely.
+驱动接受地表强迫（净短波 / 长波、感热 / 潜热、动量应力）加上湖深与
+纬度，返回 t+1 预报量。它由湖点掩码（``LDLAKE``）门控，非湖点被
+完全跳过。
 
-What this stub does
+本桩的功能
 -------------------
-The function :func:`flake_driver` reproduces the upstream ``ELSE``
-branch only: it copies every t-1 prognostic into the t+1 output and
-returns it, ignoring the surface forcing.  This is exactly what the
-offline-driver default does, so flipping ``SurfConfig.use_flake`` from
-``False`` (the current state, which calls this stub) to ``True`` later
-will be a *pure* drop-in once the full FLake transcription lands -- the
-inputs / outputs / call site will not move.
+函数 :func:`flake_driver` 只复现上游的 ``ELSE`` 分支：将每个 t-1 预
+报量复制到 t+1 输出并返回，忽略地表强迫。这正是离线驱动默认的行为，
+因此一旦完整的 FLake 转写落地，将 ``SurfConfig.use_flake`` 从
+``False``（当前状态，调用本桩）切换为 ``True`` 将是*纯*替换——
+输入 / 输出 / 调用点都不会变动。
 
-A future milestone will port the real ``FLAKE_DRIVER`` body
-(flake_driver_mod.F90 + the flakeene / flakerad companions) into this
-file.  Until then, the identity update is bit-exact with the upstream
-``LEFLAKE = .FALSE.`` branch and is exercised by the unit test
-:mod:`tests.test_forward_m6`.
+未来的里程碑将把真实的 ``FLAKE_DRIVER`` 主体（flake_driver_mod.F90
+及 flakeene / flakerad 伴随例程）移植进本文件。在此之前，恒等更新与
+上游 ``LEFLAKE = .FALSE.`` 分支逐位一致，并由单元测试
+:mod:`tests.test_forward_m6` 检验。
 """
 from __future__ import annotations
 
@@ -53,13 +48,12 @@ import torch
 # --------------------------------------------------------------------------- #
 @dataclass
 class LakeInputs:
-    """t-1 lake prognostics + surface forcing (FLAKE_DRIVER dummy list).
+    """t-1 湖泊预报量 + 地表强迫（FLAKE_DRIVER 哑元列表）。
 
-    All tensors are ``(Ngrid,)``.  The prognostic fields mirror the
-    ``PT* M1M`` / ``PH* M1M`` arguments of ``FLAKE_DRIVER``; the forcing
-    fields mirror ``PSSRFLTI`` etc.  The forcing is accepted but ignored
-    by the stub -- it is present so the signature matches the eventual
-    real driver.
+    所有张量均为 ``(Ngrid,)``。预报量字段镜像 ``FLAKE_DRIVER`` 的
+    ``PT* M1M`` / ``PH* M1M`` 参数；强迫字段镜像 ``PSSRFLTI`` 等。
+    强迫被接受但被桩忽略——它的存在是为了让签名与最终的真实驱动
+    一致。
     """
 
     # t-1 prognostics (the upstream P* M1M arguments).
@@ -88,7 +82,7 @@ class LakeInputs:
 
 @dataclass
 class LakeOutputs:
-    """t+1 lake prognostics (the upstream ``ZT*`` / ``ZH*`` locals)."""
+    """t+1 湖泊预报量（上游的 ``ZT*`` / ``ZH*`` 局部变量）。"""
 
     ptlice: torch.Tensor       # air-ice interface T [K]
     ptlmnw: torch.Tensor       # mean water-column T [K]
@@ -103,16 +97,15 @@ class LakeOutputs:
 # Driver
 # --------------------------------------------------------------------------- #
 def flake_driver(inp: LakeInputs) -> LakeOutputs:
-    """Advance the FLake prognostics by one coupling step.
+    """将 FLake 预报量推进一个耦合步长。
 
-    **Stub implementation** -- reproduces the upstream ``ELSE`` branch of
-    ``SURFTSTP_CTL`` (surftstp_ctl_mod.F90:808-818): every prognostic is
-    held at its t-1 value.  Bit-exact with the offline-driver default
-    (``LEFLAKE = .FALSE.``); the surface forcing is accepted but unused.
+    **占位桩实现**——复现 ``SURFTSTP_CTL`` 上游的 ``ELSE`` 分支
+    （surftstp_ctl_mod.F90:808-818）：每个预报量保持其 t-1 值。与
+    离线驱动默认（``LEFLAKE = .FALSE.``）逐位一致；地表强迫被接受
+    但不使用。
 
-    Once the real FLake body is transcribed this function is the only
-    thing that changes -- the signature, the dataclasses and the call
-    site in :meth:`LandSurface._update_lake` stay put.
+    一旦真实的 FLake 主体转写完成，本函数是唯一改变的部分——签名、
+    数据类以及 :meth:`LandSurface._update_lake` 中的调用点保持不变。
     """
     return LakeOutputs(
         ptlice=inp.ptlice_m1m.clone(),

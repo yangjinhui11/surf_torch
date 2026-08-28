@@ -272,6 +272,17 @@ class TestWetSkinScaling:
                               torch.full((2,), 1.0, dtype=torch.float64),
                               atol=1e-9)
 
+    def test_saturated_skin_with_snow_preserves_differentiable_dry_remainder(self):
+        """Snow-covered saturation must not erase carried dry-tile state."""
+        m = _model()
+        static = _make_static(cvl=0.4, cvh=0.4, ice_land=0.0)
+        state = _make_state(snow_frac=0.25, skin_water=100.0)
+        frac = m._tile_frac(static, 8, state=state)
+        for idx in [TILE_LOW_VEG_DRY, TILE_HIGH_VEG_DRY, TILE_BARE_SOIL]:
+            assert (frac[:, idx] > 0.0).all()
+            assert (frac[:, idx] < 1e-15).all()
+        assert torch.isfinite(frac).all()
+
 
 # --------------------------------------------------------------------------- #
 # Bounds

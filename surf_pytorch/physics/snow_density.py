@@ -1,83 +1,73 @@
-"""Snow density evolution (``SRFSN_LWIMP`` section 3.1).
+"""雪密度演化（``SRFSN_LWIMP`` 第 3.1 节）。
 
-This module is the Python port of the snow-density block that lives in
-``SRFSN_LWIMP`` (``srfsn_lwimp_mod.F90`` lines 357-377 and 494-527) -- the
-single-layer snow scheme with prognostic density.  The simplified single-
-layer path the port's :mod:`surf_pytorch.physics.snow` mirrors is
-density evolution is done in the sibling ``SRFSN_LWIMP`` (no ``s``) and in
-the multi-layer ``SRFSN_RSN`` (called from ``SRFSN_DRIVER``).  This module
-supplies the single-layer density evolution used by ``SRFSN_LWIMP``,
-so the port's snow prognostic advances ``PRSNM1M`` alongside ``PSNM1M``
-and ``PTSNM1M``.
+本模块是位于 ``SRFSN_LWIMP``（``srfsn_lwimp_mod.F90`` 第 357-377 行
+与第 494-527 行）中的雪密度块的 Python 移植——带预报密度的单层雪
+方案。移植的 :mod:`surf_pytorch.physics.snow` 所镜像的简化单层路径
+不做密度演化，密度演化在姊妹例程 ``SRFSN_LWIMP``（无 ``s``）和多层
+``SRFSN_RSN``（由 ``SRFSN_DRIVER`` 调用）中完成。本模块提供
+``SRFSN_LWIMP`` 使用的单层密度演化，使移植的雪预报量随 ``PSNM1M``
+和 ``PTSNM1M`` 一起推进 ``PRSNM1M``。
 
-What the scheme does
+方案概述
 --------------------
-The new snow density ``PRSN`` (kg/m^3) is built from five contributions,
-exactly as in ``SRFSN_LWIMP`` lines 494-527:
+新的雪密度 ``PRSN``（kg/m^3）由五项贡献构建，与 ``SRFSN_LWIMP``
+第 494-527 行完全一致：
 
-1. **Fresh-snow density** ``ZRHOMINSN`` -- a linear function of the
-   surface temperature and the quarter-power of the surface wind speed,
-   floored at ``RHOMINSND`` (50 kg/m^3)::
+1. **新雪密度** ``ZRHOMINSN``——地表温度与地表风速四分之一幂的
+   线性函数，下界为 ``RHOMINSND``（50 kg/m^3）::
 
        ZRHOMINSN = RHOMINSNA + RHOMINSNB*(PTSRF - RTT)
                                  + RHOMINSNC*(U^2 + V^2)^0.25
        ZRHOMINSN = max(ZRHOMINSN, RHOMINSND)
 
-2. **Depth-weighted mixing** of the old pack density and the fresh-snow
-   density, weighted on snow *depth* (the post-CY43 formulation, Fortran
-   lines 506-508).  ``ZSSFC + ZSSFL`` is the snowfall over the coupling
-   interval::
+2. 旧积雪密度与新雪密度按雪*深度*加权的**混合**（CY43 之后的公式，
+   Fortran 第 506-508 行）。``ZSSFC + ZSSFL`` 是耦合间隔内的降雪::
 
        ZRSTAR = (PSSNM1M + PTMST*(ZSSFC+ZSSFL))
               / (PTMST*(ZSSFC+ZSSFL)/ZRHOMINSN + PSSNM1M/PRSNM1M)
 
-3. **Overburden compaction** (viscous deformation under the snow weight,
-   Fortran lines 511-512)::
+3. **覆压压实**（雪重下的黏性变形，Fortran 第 511-512 行）::
 
        ZRSNDTOVER = 0.5*PSSNM1M*RG
                   / (RSNDTOVERA*EXP(RSNDTOVERB*(RTT-PTSN)
                                     + RSNDTOVERC*PRSNM1M))
 
-4. **Destructive metamorphism** (rounding of grains, Fortran lines 514-
-   515); the ``RSNDTDESTC`` term damps metamorphism once the density
-   exceeds ``RSNDTDESTROI``::
+4. **破坏性变质作用**（雪粒圆化，Fortran 第 514-515 行）；当密度超过
+   ``RSNDTDESTROI`` 后，``RSNDTDESTC`` 项抑制变质作用::
 
        ZRSNDTDEST = RSNDTDESTA
                   * EXP(-RSNDTDESTB*(RTT-PTSN)
                         - RSNDTDESTC*max(0, PRSNM1M - RSNDTDESTROI))
 
-5. **Melt compaction** (Fortran lines 517-521), the density increase
-   driven by internal melt/refreeze.  ``ZPMSNINT`` is the internal melt
-   energy released as the snow warms through the melt window; the term
-   only acts when ``ZPMSNINT > 0`` and the pack is deep enough
-   (``PSSNM1M >= 15`` kg/m^2)::
+5. **消融压实**（Fortran 第 517-521 行），由内部消融/再冻结驱动的
+   密度增加。``ZPMSNINT`` 是雪穿过消融窗口升温时释放的内部消融能量；
+   该项仅在 ``ZPMSNINT > 0`` 且积雪足够深（``PSSNM1M >= 15``
+   kg/m^2）时起作用::
 
        ZRSNDTMELT = ZTMST*(ZPMSNINT*PTMST/RLMLT)/(PSSNM1M - ZLW)
 
-   ``ZPMSNINT`` and ``ZLW`` come from the snow liquid-water analytical
-   functions (lines 357-377): the liquid-water capacity ``ZLWC``, the
-   melt-window shape ``ZFUNC`` and its derivative ``ZDFUNC``, the actual
-   liquid water ``ZLW = ZFUNC*ZLWC``, and the internal-melt flux
-   ``ZPMSNINT = ZCONSB*ZFRSN*(PTSN - PTSNM1M)/PTMST`` with
-   ``ZCONSB = RLMLT*ZLWC*ZDFUNC``.
+   ``ZPMSNINT`` 与 ``ZLW`` 来自雪液态水解析函数（第 357-377 行）：
+   液态水容量 ``ZLWC``、消融窗口形状 ``ZFUNC`` 及其导数 ``ZDFUNC``、
+   实际液态水 ``ZLW = ZFUNC*ZLWC``，以及内部消融通量
+   ``ZPMSNINT = ZCONSB*ZFRSN*(PTSN - PTSNM1M)/PTMST``，其中
+   ``ZCONSB = RLMLT*ZLWC*ZDFUNC``。
 
-The new density is then::
+新密度为::
 
     PRSN = ZRSTAR + ZRSTAR*(ZRSNDTOVER + ZRSNDTDEST + ZRSNDTMELT)*PTMST
     PRSN = min(450, PRSN)
     PRSN = max(RHOMINSN, PRSN)
 
-At no-snow points (``LLNOSNOW``) the density is reset to ``RHOMINSN``
-(100 kg/m^3), matching the Fortran ``PRSN(JL) = RHOMINSN`` branch.
+在无雪点（``LLNOSNOW``），密度重置为 ``RHOMINSN``（100 kg/m^3），
+与 Fortran 的 ``PRSN(JL) = RHOMINSN`` 分支一致。
 
-Sign / unit convention
+符号 / 单位约定
 ----------------------
-All densities are in kg/m^3.  ``PTSRF`` is the surface (skin) temperature
-in K; ``PUSRF``/``PVSRF`` are the surface wind components in m/s.  The
-wind enters only via ``(U^2+V^2)^0.25`` so the magnitude is what matters.
-``PTSN`` is the *new* snow temperature from the snow solve (the Fortran
-uses the just-computed ``PTSN(JL)``, not ``PTSNM1M``, for the
-compaction/metamorphism exponentials).
+所有密度单位为 kg/m^3。``PTSRF`` 是地表（表皮）温度，单位 K；
+``PUSRF``/``PVSRF`` 是地表风分量，单位 m/s。风只通过
+``(U^2+V^2)^0.25`` 进入，因此重要的是大小。``PTSN`` 是雪求解得到的
+*新*雪温（Fortran 在压实/变质指数中使用刚算出的 ``PTSN(JL)``，而非
+``PTSNM1M``）。
 """
 
 from __future__ import annotations
@@ -93,11 +83,10 @@ from ..tables.soil import SoilTable
 
 @dataclass
 class SnowDensityInputs:
-    """Inputs to the single-layer snow-density solve.
+    """单层雪密度求解的输入。
 
-    Each tensor is ``(Ngrid,)`` unless noted.  Naming mirrors the
-    ``SRFSN_LWIMP`` local / dummy variables so a side-by-side audit is
-    easy.
+    除注明外，每个张量均为 ``(Ngrid,)``。命名镜像 ``SRFSN_LWIMP``
+    的局部变量 / 哑元变量，便于逐行对照审计。
     """
 
     # ---- Snow state at t-1 ----
@@ -127,7 +116,7 @@ class SnowDensityInputs:
 
 @dataclass
 class SnowDensityOutputs:
-    """Outputs of the single-layer snow-density solve."""
+    """单层雪密度求解的输出。"""
 
     prsn: torch.Tensor          # PRSN  new snow density       [kg/m^3]   (Ngrid,)
 
@@ -139,28 +128,27 @@ def compute_snow_density(
     *,
     differentiable: bool = True,
 ) -> SnowDensityOutputs:
-    """Run the single-layer snow-density evolution (``SRFSN_LWIMP`` 3.1).
+    """运行单层雪密度演化（``SRFSN_LWIMP`` 3.1）。
 
     Args
     ----
     inp:
-        :class:`SnowDensityInputs` -- packed snow state, surface forcing
-        and the snow geometry / mask from the snow solve.
+        :class:`SnowDensityInputs`——打包的雪状态、地表强迫以及来自
+        雪求解的雪几何 / 掩码。
     soil_table:
-        :class:`surf_pytorch.tables.soil.SoilTable` -- provides the
-        density constants (rhominsn*, rsndtover*, rsndtdest*,
-        rhomaxsn_new) and the liquid-water-capacity scalars
-        (rlwcswe*, rtempamp, rhoci, rhoice, rlamice, rdsmax, rfrsmall,
-        rfrtiny).
+        :class:`surf_pytorch.tables.soil.SoilTable`——提供密度常数
+        （rhominsn*, rsndtover*, rsndtdest*, rhomaxsn_new）与液态水
+        容量标量（rlwcswe*, rtempamp, rhoci, rhoice, rlamice, rdsmax,
+        rfrsmall, rfrtiny）。
     consts:
-        :class:`ConstantBundle` -- provides ``rtt``, ``rlmlt``, ``rg``
-        and ``pi``.
+        :class:`ConstantBundle`——提供 ``rtt``、``rlmlt``、``rg``
+        和 ``pi``。
     differentiable:
-        If ``False`` run under ``torch.no_grad()`` for speed.
+        若为 ``False`` 则在 ``torch.no_grad()`` 下运行以提速。
 
     Returns
     -------
-    :class:`SnowDensityOutputs` -- the new snow density ``PRSN``.
+    :class:`SnowDensityOutputs`——新的雪密度 ``PRSN``。
     """
 
     def _core() -> SnowDensityOutputs:
@@ -177,7 +165,7 @@ def _density_core(
     soil_table: SoilTable,
     consts: ConstantBundle,
 ) -> SnowDensityOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部：假定 no_grad / enable_grad 的决定已经做出。"""
     dtype = inp.pssnm1m.dtype
     device = inp.pssnm1m.device
 
@@ -241,10 +229,13 @@ def _density_core(
     # the density block is self-contained.
     # ------------------------------------------------------------------ #
     zeps = 1.0e-12
-    zifrsn = 1.0 / torch.clamp(zfrsn, min=rfrtiny)
     # real snow depth at t-1 (capped at RDSNMAX) and the liquid-water
     # capacity fraction ZCONSLWC (collapses to RLWCSWEC at high density).
-    zdsnr = pssnm1m * zifrsn / torch.clamp(prsnm1m, min=zeps)
+    zfrsn_safe = torch.clamp(zfrsn, min=rfrtiny)
+    prsnm1m_safe = torch.clamp(prsnm1m, min=zeps)
+    # Preserve SRFSN_LWIMP's denominator grouping exactly.  Replacing this
+    # division with products of reciprocals changes the final binary64 bits.
+    zdsnr = pssnm1m / (prsnm1m_safe * zfrsn_safe)
     zdsn_safe = torch.clamp(zdsnr, min=zeps)
     zconslwc = torch.clamp((rlwcswea - prsnm1m) / rlwcswea, min=0.0)
     zlwc = pssnm1m * (rlwcsweb + (rlwcswec - rlwcsweb) * zconslwc)
@@ -284,7 +275,6 @@ def _density_core(
 
     # Depth-weighted mixing of old pack + fresh snow (lines 506-508).
     zssf = (pssfl + pssfc) * ptmst            # snowfall over the interval
-    prsnm1m_safe = torch.clamp(prsnm1m, min=zeps)
     denom = zssf / torch.clamp(zrhominsn, min=zeps) + pssnm1m / prsnm1m_safe
     zrstar = (pssnm1m + zssf) / torch.clamp(denom, min=zeps)
 

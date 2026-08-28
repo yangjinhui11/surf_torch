@@ -1,83 +1,71 @@
-"""Surface energy balance (Penman-Monteith skin-T elimination).
+"""地表能量平衡（Penman-Monteith 表皮温度消元）。
 
-Direct translation of ``surf/module/surfseb_ctl_mod.F90`` (J. Polcher
-/ P. Best / A. Beljaars closure).  This is the heart of the land-
-surface scheme: it eliminates the skin temperature from the surface
-energy balance using a linearisation of qsat around the t-1 skin
-temperature, giving a closed-form solution for the new skin temperature
-and the tile-mean turbulent fluxes.
+直接翻译自 ``surf/module/surfseb_ctl_mod.F90``（J. Polcher / P. Best
+/ A. Beljaars 闭合方案）。这是陆面方案的核心：它利用围绕 t-1 时刻
+表皮温度对 qsat 的线性化，从地表能量平衡中消去表皮温度，从而给出
+新表皮温度和 tile 平均湍流通量的闭式解。
 
-Closure summary
----------------
-The lowest-model-level dry static energy ``Sl`` and specific humidity
-``Ql`` are coupled to the surface through the vertical-diffusion
-tridiagonal elimination (the *upward* sweep in
-:mod:`surf_pytorch.physics.diffusion`, M4).  That sweep produces a
-linear relation::
+闭合方案概要
+------------
+最低模式层的干静力能 ``Sl`` 与比湿 ``Ql`` 通过垂直扩散三对角消元
+（:mod:`surf_pytorch.physics.diffusion` 中的*上行*扫描，M4）与地表
+耦合。该扫描产生线性关系::
 
     Sl = ASL*Js + BSL
     Ql = AQL*Jq + BQL
 
-where ``Js`` and ``Jq`` are the fluxes of dry static energy and
-moisture.  Each tile has its own SEB::
+其中 ``Js`` 和 ``Jq`` 分别为干静力能通量和水汽通量。每个 tile 有其
+自身的 SEB::
 
     -PSSRFL -PSLRFL + PSTR + PG0 + PSSH + PSLH = 0
-    PSSH = Js - cp*Tsk*delta*Jq                (sensible)
-    PSLH = lambda * Jq                          (latent, lambda=Lv/Ls)
-    PG0  = lambda_skin * (Tsk - Tsrf)           (ground)
-    PSTR = PSLRFL + dLW/dT * (Tsk - Tsk_rad)    (linearised LW)
+    PSSH = Js - cp*Tsk*delta*Jq                （感热）
+    PSLH = lambda * Jq                          （潜热，lambda=Lv/Ls）
+    PG0  = lambda_skin * (Tsk - Tsrf)           （地面热通量）
+    PSTR = PSLRFL + dLW/dT * (Tsk - Tsk_rad)    （线性化长波）
 
-The skin temperature is linearised in qsat through ``qsk(Tsk) ~
-qsk_t1 + dqsdT_t1*(Tsk - Tsk_t1)`` so the whole SEB becomes linear in
-Tsk, Sl and Ql.  Eliminating Tsk per tile yields the per-tile
-coefficients ``ZD{JS,JQ,DSS}*`` (section 4 of the Fortran); tile-
-averaging and a 2x2 solve for ``Sl,Ql`` closes the system (sections
-5-6); per-tile fluxes and skin temperatures follow (section 7).
+表皮温度通过 ``qsk(Tsk) ~ qsk_t1 + dqsdT_t1*(Tsk - Tsk_t1)`` 在 qsat
+中线性化，因此整个 SEB 对 Tsk、Sl 和 Ql 均为线性。逐 tile 消去 Tsk
+得到逐 tile 系数 ``ZD{JS,JQ,DSS}*``（Fortran 第 4 节）；tile 平均
+并对 ``Sl,Ql`` 作 2x2 求解使系统闭合（第 5-6 节）；随后得到逐 tile
+通量和表皮温度（第 7 节）。
 
-Sign convention (IFS surface-package, NOT micrometeorology)
------------------------------------------------------------
-The SEB closure that this routine enforces is::
+符号约定（IFS 地表软件包，而非微气象学）
+-------------------------------------------
+本例程强制执行的 SEB 闭合为::
 
-    PSSRFL + PSTR + PSSH + PSLH - PG0 = 0   (per tile)
+    PSSRFL + PSTR + PSSH + PSLH - PG0 = 0   （逐 tile）
 
-i.e. all four surface fluxes share the **positive = downward** (into
-the surface) sign, and ``PG0`` (ground heat flux) is **positive =
-downward** into the ground:
+即全部四个地表通量均采用 **正 = 向下**（进入地表）的符号，且
+``PG0``（地面热通量）为 **正 = 向下** 进入地面：
 
-* ``PSSRFL``, ``PSTR`` (radiation): **positive = downward**.  ``PSTR``
-  is the net thermal radiation = ``PSLRFL + dLW/dT*(Tsk - Tskrad)`` and
-  ``PSLRFL`` is also positive downward, so a cooling surface (more
-  emission than absorption) has ``PSLRFL < 0``.
-* ``PSSH`` (sensible heat): **positive = downward** (atmosphere warms
-  the surface).  Note this is the *opposite* of the micrometeorological
-  sign convention; ``PSSH = PJS - cp*Tsk*delta*PJQ`` with ``PJS`` the
-  surface-going dry-static-energy flux already carries the downward
-  sign.
-* ``PSLH`` (latent heat): **positive = downward** (condensation warms
-  the surface).  Again opposite to the micrometeorological sign.
-* ``PG0`` (ground heat): **positive = downward**, into the ground (a
-  surface warming from above has ``PG0 > 0``).
+* ``PSSRFL``、``PSTR``（辐射）：**正 = 向下**。``PSTR`` 为净热辐射
+  = ``PSLRFL + dLW/dT*(Tsk - Tskrad)``，``PSLRFL`` 同样以向下为正，
+  因此冷却地表（发射多于吸收）有 ``PSLRFL < 0``。
+* ``PSSH``（感热）：**正 = 向下**（大气加热地表）。注意这与微气象学
+  符号约定*相反*；``PSSH = PJS - cp*Tsk*delta*PJQ``，其中 ``PJS``
+  为指向地表的干静力能通量，本身已携带向下符号。
+* ``PSLH``（潜热）：**正 = 向下**（凝结加热地表）。同样与微气象学
+  符号相反。
+* ``PG0``（地面热通量）：**正 = 向下**，进入地面（自上方受热的地表
+  有 ``PG0 > 0``）。
 
-This is the *output* convention of SURFSEB_CTL (see lines 467-470 of
-``surfseb_ctl_mod.F90``); the *elimination* uses the opposite internal
-signs (``-PSSRFL``, ``-PSLRFL``, ``+ZLAMSK*PTSRF`` in ZDSS4) which
-match the convention above after rearrangement.  This port reproduces
-the Fortran elimination verbatim and inherits the same output
-convention -- everything is positive downward.
+这是 SURFSEB_CTL 的*输出*约定（见 ``surfseb_ctl_mod.F90`` 第 467-470
+行）；*消元*使用相反的内部符号（ZDSS4 中的 ``-PSSRFL``、``-PSLRFL``、
+``+ZLAMSK*PTSRF``），经整理后与上述约定一致。本移植逐字复现 Fortran
+消元并继承相同的输出约定——所有量均以向下为正。
 
-Layout
+内存布局
 ------
-Tensors are ``(Ngrid, Ntile)`` with the tile axis last.  The 2x2 mean
-solve reduces the tile axis; outputs ``sl`` / ``ql`` are ``(Ngrid,)``.
+张量为 ``(Ngrid, Ntile)``，tile 轴位于最后一维。2x2 平均求解对 tile
+轴做归约；输出 ``sl`` / ``ql`` 为 ``(Ngrid,)``。
 
-Tile index conventions
+tile 索引约定
 ----------------------
-This port keeps the IFS 1-based tile semantics but addresses tensors
-0-based (see :mod:`surf_pytorch.config`).  Fortran JT=2 (sea ice) is
-this port's ``TILE_ICE=1``; Fortran JT=5 (snow on low veg) is this
-port's ``TILE_LOW_VEG_SNOW=4``.  The latent heat selector ``RLSTT``
-(sublimation) is used for ice and low-veg-snow tiles -- the offsets are
-applied here, not in the caller.
+本移植保留 IFS 的 1 基 tile 语义，但张量寻址采用 0 基（见
+:mod:`surf_pytorch.config`）。Fortran JT=2（海冰）对应本移植的
+``TILE_ICE=1``；Fortran JT=5（低植被上的雪）对应本移植的
+``TILE_LOW_VEG_SNOW=4``。潜热选择器 ``RLSTT``（升华）用于海冰和
+低植被-雪 tile——偏移在此处施加，而非在调用方。
 """
 
 from __future__ import annotations
@@ -111,11 +99,11 @@ _LARGE_SEB = 1.0e10
 
 @dataclass
 class SebInputs:
-    """All per-(grid,tile) inputs to SURFSEB_CTL.
+    """SURFSEB_CTL 的全部逐（网格，tile）输入。
 
-    Grouped for clarity; the :func:`surf_seb` call unpacks these.  Each
-    tensor is ``(Ngrid, Ntile)`` unless its name ends in ``_grid``
-    (``(Ngrid,)``) or it is a scalar field.
+    为清晰起见分组；:func:`surf_seb` 调用会解包这些输入。除名称以
+    ``_grid`` 结尾（``(Ngrid,)``）或为标量场外，每个张量均为
+    ``(Ngrid, Ntile)``。
     """
 
     # Skin reservoir at t-1 (linearised in qsat).
@@ -172,7 +160,7 @@ class SebInputs:
 
 @dataclass
 class SebOutputs:
-    """All per-(grid,tile) outputs of SURFSEB_CTL."""
+    """SURFSEB_CTL 的全部逐（网格，tile）输出。"""
 
     pjs: torch.Tensor           # flux of dry static energy   [W/m^2]
     pjq: torch.Tensor           # moisture flux               [kg/m^2/s]
@@ -194,26 +182,25 @@ def surf_seb(
     *,
     differentiable: Optional[bool] = None,
 ) -> SebOutputs:
-    """Run the Penman-Monteith surface energy balance.
+    """运行 Penman-Monteith 地表能量平衡。
 
     Args
     ----
     inp:
-        :class:`SebInputs` -- packed per-(grid,tile) and per-grid inputs.
+        :class:`SebInputs` —— 打包的逐（网格，tile）与逐网格输入。
     consts:
-        :class:`ConstantBundle` -- RCPD, RLSTT, RLVTT, RSIGMA, RTT, RVTMP2.
+        :class:`ConstantBundle` —— RCPD、RLSTT、RLVTT、RSIGMA、RTT、RVTMP2。
     config:
-        :class:`SurfConfig` -- ``n_tile`` selects which tile columns are
-        active (latent heat selector switches JT=ice/low-veg-snow to
-        sublimation, JT=9/lake to a Lv/Ls mix).
+        :class:`SurfConfig` —— ``n_tile`` 选择哪些 tile 列被激活
+        （潜热选择器将 JT=海冰/低植被-雪切换为升华，将 JT=9/湖泊切换
+        为 Lv/Ls 混合）。
     differentiable:
-        Override ``config.differentiable`` for this call.  Default
-        respects the config flag.
+        为本次调用覆盖 ``config.differentiable``。默认遵循 config 标志。
 
     Returns
     -------
-    :class:`SebOutputs` -- per-tile fluxes + skin temperature, plus the
-    grid-mean lowest-level dry static energy and specific humidity.
+    :class:`SebOutputs` —— 逐 tile 通量与表皮温度，以及网格平均的
+    最低层干静力能和比湿。
     """
     diff = config.differentiable if differentiable is None else differentiable
 
@@ -227,7 +214,7 @@ def surf_seb(
 
 
 def _seb_core(inp: SebInputs, consts: ConstantBundle, config: SurfConfig) -> SebOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部：假定 no_grad / enable_grad 的决策已完成。"""
     ngrid, ntile = inp.sskm1m.shape
 
     # Promote per-grid inputs to per-(grid,tile) for vectorised maths.
@@ -261,7 +248,8 @@ def _seb_core(inp: SebInputs, consts: ConstantBundle, config: SurfConfig) -> Seb
     # ------------------------------------------------------------------ #
     if inp.lelwdd:
         # Linearise LW around the radiation time-level skin T.
-        dlwdt_grid = -4.0 * inp.emis_grid * consts.rsigma * inp.tskrad_grid ** 3
+        dlwdt_grid = (-4.0 * inp.emis_grid * consts.rsigma) * (
+            (inp.tskrad_grid * inp.tskrad_grid) * inp.tskrad_grid)
     else:
         # Alternative: derive dLW/dT from the supplied net LW.
         dlwdt_grid = 4.0 * (inp.slrfl_grid / inp.tskrad_grid)
@@ -326,12 +314,22 @@ def _seb_core(inp: SebInputs, consts: ConstantBundle, config: SurfConfig) -> Seb
     # Section 5 -- tile-mean coefficients.
     # ------------------------------------------------------------------ #
     frti = inp.frti
-    ejs1 = (frti * djs1).sum(dim=-1)
-    ejs2 = (frti * djs2).sum(dim=-1)
-    ejs4 = (frti * djs4).sum(dim=-1)
-    ejq1 = (frti * djq1).sum(dim=-1)
-    ejq2 = (frti * djq2).sum(dim=-1)
-    ejq4 = (frti * djq4).sum(dim=-1)
+    # surfseb_ctl_mod.F90 412-427: ZEJS*/ZEJQ* are zero-initialised and
+    # accumulated tile-by-tile in a sequential DO loop; a pairwise tree
+    # reduction rounds differently and seeds ulp drift in the 2x2 solve.
+    ejs1 = torch.zeros(frti.shape[:-1], dtype=frti.dtype, device=frti.device)
+    ejs2 = torch.zeros_like(ejs1)
+    ejs4 = torch.zeros_like(ejs1)
+    ejq1 = torch.zeros_like(ejs1)
+    ejq2 = torch.zeros_like(ejs1)
+    ejq4 = torch.zeros_like(ejs1)
+    for jt in range(frti.shape[-1]):
+        ejs1 = ejs1 + frti[..., jt] * djs1[..., jt]
+        ejs2 = ejs2 + frti[..., jt] * djs2[..., jt]
+        ejs4 = ejs4 + frti[..., jt] * djs4[..., jt]
+        ejq1 = ejq1 + frti[..., jt] * djq1[..., jt]
+        ejq2 = ejq2 + frti[..., jt] * djq2[..., jt]
+        ejq4 = ejq4 + frti[..., jt] * djq4[..., jt]
 
     # ------------------------------------------------------------------ #
     # Section 6 -- 2x2 solve for the grid-mean (Sl, Ql).
@@ -372,8 +370,12 @@ def _seb_core(inp: SebInputs, consts: ConstantBundle, config: SurfConfig) -> Seb
     # mean skin temperature (LELWTL, energy-conserving correction).
     # ------------------------------------------------------------------ #
     if inp.lelwtl:
-        tsk_mean = (frti * ptsk).sum(dim=-1)
-        dlwdt_star = -4.0 * emis[..., 0] * consts.rsigma * tsk_mean ** 3
+        # surfseb_ctl_mod.F90 507-521: ZTSKMEAN is a sequential tile sum.
+        tsk_mean = torch.zeros(frti.shape[:-1], dtype=frti.dtype, device=frti.device)
+        for jt in range(frti.shape[-1]):
+            tsk_mean = tsk_mean + frti[..., jt] * ptsk[..., jt]
+        dlwdt_star = (-4.0 * emis[..., 0] * consts.rsigma) * (
+            (tsk_mean * tsk_mean) * tsk_mean)
         pstr = inp.slrfl_grid.unsqueeze(-1) + dlwdt_star.unsqueeze(-1) * (
             ptsk - tsk_mean.unsqueeze(-1)
         )
@@ -397,15 +399,15 @@ def _tile_latent_heat(
     lake_water: torch.Tensor,
     lake_ice: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-tile latent heat ``lambda`` (J/kg).
+    """逐 tile 潜热 ``lambda``（J/kg）。
 
-    Matches surfseb_ctl_mod.F90 lines 271-275 and 385-387:
-        JT in {ice, low-veg-snow}  -> RLSTT (sublimation)
-        JT == lake                 -> RLVTT*water + RLSTT*ice
-        else                       -> RLVTT (vaporisation)
+    对应 surfseb_ctl_mod.F90 第 271-275 行和第 385-387 行：
+        JT 属于 {海冰, 低植被-雪}    -> RLSTT（升华）
+        JT == 湖泊                   -> RLVTT*water + RLSTT*ice
+        其他                         -> RLVTT（蒸发）
 
-    Returns ``(Ngrid, Ntile)`` tensor.  Tile indices are 0-based
-    (``TILE_ICE=1``, ``TILE_LOW_VEG_SNOW=4``, ``TILE_LAKE=8``).
+    返回 ``(Ngrid, Ntile)`` 张量。tile 索引为 0 基
+    （``TILE_ICE=1``、``TILE_LOW_VEG_SNOW=4``、``TILE_LAKE=8``）。
     """
     lam = torch.full((ngrid, ntile), consts.rlvtt,
                      dtype=dtype, device=device)
@@ -427,27 +429,26 @@ def _tile_solar_transmission(
     dtype: torch.dtype,
     device,
 ) -> torch.Tensor:
-    """Per-tile factor ``1 - RVTRSR`` multiplying net SW in the SEB.
+    """SEB 中乘以净短波的逐 tile 因子 ``1 - RVTRSR``。
 
-    Mirrors the ``ZFRSR`` assignment in ``surfseb_ctl_mod.F90`` SELECT
-    CASE block.  Fortran uses 1-based ``JT``; this port is 0-based, so
-    the mapping goes through :data:`surf_pytorch.config.F90_TILE_OF`
-    (port_idx -> Fortran JT = port_idx + 1).  Tiles whose ``FRSR != 1``:
+    镜像 ``surfseb_ctl_mod.F90`` SELECT CASE 块中的 ``ZFRSR`` 赋值。
+    Fortran 使用 1 基 ``JT``；本移植为 0 基，因此映射经由
+    :data:`surf_pytorch.config.F90_TILE_OF`（port_idx -> Fortran JT
+    = port_idx + 1）。``FRSR != 1`` 的 tile 有：
 
         port TILE_WET_SKIN     (=2, F90 JT=3) -> 1 - RVTRSR(1) = 0.95
         port TILE_LOW_VEG_DRY  (=3, F90 JT=4) -> 1 - RVTRSR(1) = 0.95
         port TILE_HIGH_VEG_DRY (=5, F90 JT=6) -> 1 - RVTRSR(3) = 0.97
         port TILE_HIGH_VEG_SNOW(=6, F90 JT=7) -> 1 - RVTRSR(3) = 0.97
-        all other tiles                          -> 1.0
+        其余所有 tile                          -> 1.0
 
-    The values are *veg-type-independent* constants because the dominant
-    veg-type lookup already happened upstream and SURFSEB_CTL uses the
-    fixed index 1 or 3 uniformly (RVTRSR(1)=0.05, RVTRSR(3)=0.03 from
-    SUSVEG).
+    这些值是*与植被类型无关*的常数，因为主导植被类型的查找已在上游
+    完成，且 SURFSEB_CTL 统一使用固定索引 1 或 3（RVTRSR(1)=0.05、
+    RVTRSR(3)=0.03，来自 SUSVEG）。
 
-    (A previous version of this docstring said "tile 3 (wet skin)" while
-    assigning ``frsr[:, 2]`` -- the code was right, the prose mixed the
-    port and Fortran indices.  Both are now stated explicitly.)
+    （本 docstring 的早期版本在赋值 ``frsr[:, 2]`` 时写作“tile 3
+    （湿表皮）”——代码是对的，但文字混淆了移植索引与 Fortran 索引。
+    现在两者均已明确写出。）
     """
     from ..config import (
         TILE_WET_SKIN, TILE_LOW_VEG_DRY, TILE_HIGH_VEG_DRY, TILE_HIGH_VEG_SNOW,

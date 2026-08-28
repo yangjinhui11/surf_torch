@@ -1,36 +1,28 @@
-"""Idealized diurnal-cycle forcing generator for the land-surface model.
+"""陆面模式的理想化日循环强迫生成器。
 
-This module produces a self-consistent atmospheric forcing time series
-plus a matching static descriptor and cold-start state, so a multi-step
-column run can be exercised without any external data file.  The
-forcing is **analytic** (closed-form diurnal cycle): no NetCDF reader,
-no interpolation -- every field is computed from a small
-:class:`IdealizedDiurnalConfig`.
+本模块产生一套自洽的大气强迫时间序列，外加匹配的静态描述符与冷启动
+状态，使多步单列运行无需任何外部数据文件即可演练。强迫是**解析式**的
+（闭式日循环）：不读 NetCDF、不做插值——每个场都由一个小巧的
+:class:`IdealizedDiurnalConfig` 算出。
 
-Two design points carry over from the IFS convention (see
-:mod:`surf_pytorch.state`):
+沿袭 IFS 约定的两个设计点（见 :mod:`surf_pytorch.state`）：
 
-* **Units.**  The :class:`Forcing` container carries *cumulative*
-  radiation and precipitation (``fr_so`` / ``fr_th`` in J/m^2 and
-  ``rain`` / ``snow`` in kg/m^2 over the coupling interval), because
-  that is the form the upstream ``VDFMAIN1S`` consumes and the form
-  ``LandSurface.forward`` divides back by ``dt`` (model.py §5).  The
-  generator therefore computes everything at the *rate* level first
-  (W/m^2, kg/m^2/s) and multiplies by ``dt`` before packing, exactly
-  as the per-step test builder ``tests/test_forward_m5._make_inputs``
-  does (``fr_so = 200.0 * 3600.0``).
-* **Sign convention.**  ``fr_so`` is downwelling short-wave (>= 0);
-  ``fr_th`` is the *net* long-wave, positive downward.  The default
-  ``-300*3600`` used across the test-suite is a net radiative *loss*
-  (upward), so the generator's net LW must come out negative on a
-  typical night-to-day cycle -- which it does (see
-  :func:`_net_longwave`).
+* **单位。** :class:`Forcing` 容器携带*累积*辐射与降水
+  （耦合间隔内的 ``fr_so`` / ``fr_th``，单位 J/m^2，以及 ``rain`` /
+  ``snow``，单位 kg/m^2），因为这正是上游 ``VDFMAIN1S`` 所消费、也是
+  ``LandSurface.forward`` 要除回 ``dt`` 的形式（model.py §5）。因此
+  生成器先在*速率*层面（W/m^2、kg/m^2/s）计算所有量，再乘以 ``dt``
+  打包，与单步测试构造器 ``tests/test_forward_m5._make_inputs`` 的做法
+  完全一致（``fr_so = 200.0 * 3600.0``）。
+* **符号约定。** ``fr_so`` 为向下短波（>= 0）；``fr_th`` 为*净*长波，
+  向下为正。测试套件默认的 ``-300*3600`` 是净辐射*损失*（向上），因此
+  生成器的净长波在典型夜-日循环中应得出负值——事实如此（见
+  :func:`_net_longwave`）。
 
-The static descriptor uses the canonical **pure-land** tile fractions
-(``tests/test_forward_m5._make_inputs``): wet-skin 0.05 / low-veg-dry
-0.30 / high-veg-dry 0.30 / bare-soil 0.35, no water / ice / snow tiles.
-That keeps every column a genuine land column so the HTESSEL soil
-solves actually fire and the water / energy budgets are non-trivial.
+静态描述符使用规范的**纯陆地**瓦片份额
+（``tests/test_forward_m5._make_inputs``）：湿皮肤 0.05 / 低植被-干
+0.30 / 高植被-干 0.30 / 裸土 0.35，不含水/冰/雪瓦片。这使每一列都是
+真正的陆地列，HTESSEL 土壤求解才会真正触发，水量/能量收支才有意义。
 """
 
 from __future__ import annotations
@@ -47,18 +39,75 @@ from .utils import qsat
 
 
 # --------------------------------------------------------------------------- #
-# Solar ephemeris (simplified, analytic, testable)
+# Solar ephemeris (IFS fctast/cpg1s algorithm)
 # --------------------------------------------------------------------------- #
+_IFS_RDAY = 86400.0
+_IFS_REA = 1.49597870e11
+_IFS_REPSM = 0.409093
+_IFS_JD_EPOCH = 2446432.0
+_IFS_REF_YEAR = 2022
+
+
+def _ifs_jd_from_calendar(year: int, month: int, day: int) -> float:
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    return (day + (153 * m + 2) // 5 + 365 * y + y // 4
+            - y // 100 + y // 400 - 32045)
+
+
+def _ifs_doy_to_jd(year: int, day_of_year: int, hour_utc: float) -> float:
+    import calendar
+    month = 1
+    remaining = day_of_year
+    while remaining > calendar.monthrange(year, month)[1]:
+        remaining -= calendar.monthrange(year, month)[1]
+        month += 1
+    return _ifs_jd_from_calendar(year, month, remaining) + hour_utc / 24.0
+
+
+def _ifs_astronomy(rtime_seconds: float):
+    pteta = rtime_seconds / (_IFS_RDAY * 365.25)
+    rel = 1.7535 + 6.283076 * pteta
+    rem = 6.240075 + 6.283020 * pteta
+    rlls = 4.8951 + 6.283076 * pteta
+    rllls = (4.8952 + 6.283320 * pteta - 0.0075 * math.sin(rel)
+             - 0.0326 * math.cos(rel) - 0.0003 * math.sin(2.0 * rel)
+             + 0.0002 * math.cos(2.0 * rel))
+    decl = math.asin(math.sin(_IFS_REPSM) * math.sin(rllls))
+    eqt = (591.8 * math.sin(2.0 * rlls) - 459.4 * math.sin(rem)
+           + 39.5 * math.sin(rem) * math.cos(2.0 * rlls)
+           - 12.7 * math.sin(4.0 * rlls) - 4.8 * math.sin(2.0 * rem))
+    rrs = _IFS_REA * (1.0001 - 0.0163 * math.sin(rel)
+                      + 0.0037 * math.cos(rel))
+    rip0 = 1370.0 * _IFS_REA * _IFS_REA / (rrs * rrs)
+    angle = (eqt + rtime_seconds % _IFS_RDAY) * 2.0 * math.pi / _IFS_RDAY
+    return math.sin(decl), math.cos(decl), math.cos(angle), math.sin(angle), rip0
+
+
+def _ifs_mu0_from_rtime(lat_rad: float, lon_rad: float,
+                        rtime_seconds: float) -> float:
+    sin_dec, cos_dec, cos_ha, sin_ha, _ = _ifs_astronomy(rtime_seconds)
+    sin_lat = math.sin(lat_rad)
+    cos_lat = math.sqrt(1.0 - sin_lat * sin_lat)
+    mu0 = (sin_dec * sin_lat - cos_dec * cos_ha * cos_lat * math.cos(lon_rad)
+           + cos_dec * sin_ha * cos_lat * math.sin(lon_rad))
+    return max(0.0, min(1.0, mu0))
+
+
+def ifs_mu0_from_datetime(lat_rad: float, lon_rad: float,
+                          year: int, month: int, day: int,
+                          hour_utc: float) -> float:
+    jd = _ifs_jd_from_calendar(year, month, day) + hour_utc / 24.0
+    return _ifs_mu0_from_rtime(lat_rad, lon_rad,
+                               (jd - _IFS_JD_EPOCH) * _IFS_RDAY)
+
+
 def solar_mu0(lat_rad: float, lon_rad: float, day_of_year: int,
               hour_utc: float) -> float:
     """Solar zenith-angle cosine ``mu0`` (>= 0, 0 at night).
 
-    A deliberately simple closed form (Cooper 1969 declination + a
-    single hour-angle term) -- good enough to drive a realistic diurnal
-    SW cycle for the harness, and trivially unit-testable.  The full
-    OpenIFS ephemeris (``cpg1s.F90`` 297-300) carries the ~0.5 K/year
-    orbital corrections that are irrelevant at the precision a column
-    validation harness needs.
+    Legacy day-of-year wrapper around the IFS absolute-time ephemeris.
 
     Parameters
     ----------
@@ -75,16 +124,9 @@ def solar_mu0(lat_rad: float, lon_rad: float, day_of_year: int,
         ``mu0`` clamped to ``[0, 1]``; zero when the sun is below the
         horizon.
     """
-    # Declination (Cooper 1969): delta = 23.45 deg * sin(2pi/365 (284+N)).
-    delta = math.radians(23.45) * math.sin(2.0 * math.pi * (284 + day_of_year)
-                                           / 365.0)
-    # Solar time (hours): UTC + longitude/15deg, with the -12h offset that
-    # turns a clock hour into the hour-angle convention (noon = 0).
-    hour_local_solar = hour_utc + math.degrees(lon_rad) / 15.0
-    omega = math.radians(15.0) * (hour_local_solar - 12.0)
-    mu0 = (math.sin(lat_rad) * math.sin(delta)
-           + math.cos(lat_rad) * math.cos(delta) * math.cos(omega))
-    return max(0.0, min(1.0, mu0))
+    jd = _ifs_doy_to_jd(_IFS_REF_YEAR, day_of_year, hour_utc)
+    return _ifs_mu0_from_rtime(lat_rad, lon_rad,
+                               (jd - _IFS_JD_EPOCH) * _IFS_RDAY)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,7 +254,7 @@ def build_idealized_diurnal(
     bundle = ConstantBundle(
         consts or PhysicalConstants(), dtype=dtype, device=device,
     )
-    sigma = float(bundle.rsigma.item())
+    sigma = float(bundle.rsigma_drv.item())
     rtt = float(bundle.rtt.item())
     dt = float(cfg.dt_seconds)
 

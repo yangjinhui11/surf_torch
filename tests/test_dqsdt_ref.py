@@ -155,3 +155,24 @@ def test_dqsdt_salinity_tensor_broadcast(ref, consts):
     # And the salinity scaling is genuinely different from salinity=1.
     port_nosal = dqsat_dt_ifs(t, p, consts, salinity=1.0)
     assert not torch.allclose(port, port_nosal)
+
+
+@requires_fortran_dqsdt()
+def test_tile7_epsilon_fraction_guard_matches_fortran(ref, consts):
+    """The VSURF tile-7 guard evaluates saturation at RTT, not hot Tskin."""
+    n = 8
+    hot_t = torch.full((n,), 310.0, dtype=torch.float64)
+    p = torch.full((n,), 9.0e4, dtype=torch.float64)
+    frac7 = torch.zeros(n, dtype=torch.float64)
+    eps = torch.finfo(torch.float64).eps
+
+    f90 = ref.dqsdt(
+        hot_t, p, consts, pfrti7=frac7, lclamp7=True, zepsilon=eps,
+    )
+    port = dqsat_dt_ifs(
+        torch.full_like(hot_t, consts.rtt.item()), p, consts,
+    )
+    unguarded = dqsat_dt_ifs(hot_t, p, consts)
+
+    assert torch.equal(port, f90)
+    assert not torch.allclose(f90, unguarded)

@@ -1,74 +1,63 @@
-"""HTESSEL single-layer snow for the ``SURFTSTP_CTL`` path.
+"""HTESSEL 单层雪方案，对应 ``SURFTSTP_CTL`` 路径。
 
-This module ports ``SRFSN_LWIMP``, the single-layer snow process called
-by ``SURFTSTP_CTL`` in both the OpenIFS coupled model and its offline
-driver when ``LESNML=.FALSE.`` and ``LESN09=.TRUE.``.  No simplified
-snow solver is available through this interface.
+本模块移植了 ``SRFSN_LWIMP``，即当 ``LESNML=.FALSE.`` 且
+``LESN09=.TRUE.`` 时，由 ``SURFTSTP_CTL`` 在 OpenIFS 耦合模式及其
+离线驱动程序中调用的单层雪过程。该接口不提供简化雪求解器。
 
-What the scheme does
---------------------
-The single-layer snow prognostic integrates three coupled budgets over
-one coupling interval ``PTMST``:
+方案功能
+--------
+单层雪预报在一个耦合时间间隔 ``PTMST`` 内积分三个耦合的收支：
 
-1. **Snow mass** ``PSN`` (water-equivalent, kg/m^2): advanced by the
-   large-scale + convective snowfall (``PSSFL/PSSFC``), the snow-tile
-   evaporation/sublimation, the snow-under-forest evaporation
-   (``PEVAPSNW``) and the throughfall interception / melt.  Sublimation
-   is taken from the snow tiles 5 (snow-low-veg) and 7 (snow-high-veg)
-   weighted by their tile fractions.
+1. **雪量** ``PSN``（水当量，kg/m^2）：由大尺度 + 对流降雪
+   （``PSSFL/PSSFC``）、雪瓦片的蒸发/升华、林下积雪蒸发
+   （``PEVAPSNW``）以及穿透降水截获 / 融化推进。升华取自雪瓦片
+   5（低植被积雪）和 7（高植被下积雪），按各自瓦片比例加权。
 
-2. **Snow temperature** ``PTSN``: implicit Euler over the snow heat
-   capacity and the snow-to-soil conductive coupling.  The "snow heat
-   capacity" is the apparent heat capacity that absorbs the freeze/melt
-   release via the analytical melt-transition functions ``ZFUNC`` and
-   its derivative ``ZDFUNC`` (a sine ramp over ``[RTT-RTEMPAMP, RTT]``).
-   The melt branches then redistribute the timestep between heating to
-   ``RTT`` and consuming latent heat during melt.
+2. **雪温** ``PTSN``：对雪热容和雪-土壤导热耦合采用隐式 Euler。
+   “雪热容”是通过解析融化过渡函数 ``ZFUNC`` 及其导数 ``ZDFUNC``
+   （在 ``[RTT-RTEMPAMP, RTT]`` 区间上的正弦斜坡）吸收冻结/融化
+   释放的表观热容。融化分支随后在加热到 ``RTT`` 与融化期间消耗
+   潜热之间重新分配时间步。
 
-3. **Snow-soil ground heat flux** ``PGSN``: the conductive flux between
-   the snow-base (at the new snow temperature ``PTSN``) and the top soil
-   layer (at ``PTSAM1M(:,1)``), through the snow thermal resistance
-   ``ZSNRES = 0.5*ZDSN/(RLAMICE*(PRSNM1M*ZHOICE)**RALAMSN)`` in series
-   with the half-top-soil-layer resistance ``ZSOILRES = 1/RVLAMSK(8)``.
-   ``PGSN`` is normalised by the snow tile fraction ``ZFRSN`` so it is a
-   grid-box-mean flux ready to feed into ``SRFTS`` as the surface heat
-   flux from the snow pack.
+3. **雪-土壤地表热通量** ``PGSN``：雪底（处于新雪温 ``PTSN``）与
+   土壤顶层（处于 ``PTSAM1M(:,1)``）之间的导热通量，经过雪热阻
+   ``ZSNRES = 0.5*ZDSN/(RLAMICE*(PRSNM1M*ZHOICE)**RALAMSN)`` 与
+   半个土壤顶层热阻 ``ZSOILRES = 1/RVLAMSK(8)`` 串联。
+   ``PGSN`` 按雪瓦片比例 ``ZFRSN`` 归一化，因此它是格点平均通量，
+   可作为来自积雪的地表热通量直接送入 ``SRFTS``。
 
-Sign convention
----------------
-``PGSN`` is *positive downward* (heat flowing from the snow pack into
-the soil), matching the ``ZSURFL`` convention in
-:mod:`surf_pytorch.physics.soil`.  Sensible and latent heat fluxes from
-``VDFDIFH1S`` follow the same downward-positive convention.  The latent
-contribution is ``RLSTT*PEVAP`` on the snow-low-veg tile (sublimation)
-and ``RLVTT*(PEVAPTI-PEVAPSNW) + RLSTT*PEVAPSNW`` on the snow-high-veg
-tile (the under-canopy fraction sublimates, the rest evaporates the
-liquid intercepted by the canopy).
+符号约定
+--------
+``PGSN`` 为*向下为正*（热量从积雪流入土壤），与
+:mod:`surf_pytorch.physics.soil` 中的 ``ZSURFL`` 约定一致。来自
+``VDFDIFH1S`` 的感热和潜热通量遵循相同的向下为正约定。潜热贡献
+在低植被积雪瓦片上为 ``RLSTT*PEVAP``（升华），在高植被下积雪瓦片
+上为 ``RLVTT*(PEVAPTI-PEVAPSNW) + RLSTT*PEVAPSNW``（冠层下部分
+升华，其余部分蒸发冠层截获的液态水）。
 
-Cold-start simplifications
---------------------------
-The offline driver cold-starts the snow scheme with:
+冷启动简化
+----------
+离线驱动程序对雪方案做如下冷启动设置：
 
-* ``PEVAPSNW`` (snow-under-forest evaporation) = 0
-* ``PSSFC`` / ``PSSFL`` (convective / large-scale snowfall) = the
-  solid-precip throughfall; if absent, both are zero (no snow input).
-* ``PTSFC`` / ``PTSFL`` (convective / large-scale rainfall throughfall)
-  = the liquid-precip throughfall; used by the snow-rainfall
-  interception budget.
-* ``PHLICEM1M`` (lake-ice thickness) = 0 (FLake stub).
+* ``PEVAPSNW``（林下积雪蒸发）= 0
+* ``PSSFC`` / ``PSSFL``（对流 / 大尺度降雪）= 固态降水穿透量；
+  若不存在，则两者均为零（无降雪输入）。
+* ``PTSFC`` / ``PTSFL``（对流 / 大尺度降雨穿透量）
+  = 液态降水穿透量；用于雪-降雨截获收支。
+* ``PHLICEM1M``（湖冰厚度）= 0（FLake 占位）。
 
-All of these are exposed on :class:`SnowInputs` with explicit defaults
-of zero so a caller can build the minimum (state + fluxes + tiles) and
-let the scheme treat them as cold-start.
+所有这些量都在 :class:`SnowInputs` 上以显式的零默认值暴露，因此
+调用方可以只构建最小输入（状态 + 通量 + 瓦片），让方案将其视为
+冷启动处理。
 
-Index convention
-----------------
-``PFRTI`` / ``PAHFSTI`` / ``PEVAPTI`` / ``PSSRFLTI`` are 0-indexed in
-this port.  Fortran tile 5 (snow on low vegetation) maps to
-:data:`surf_pytorch.config.TILE_LOW_VEG_SNOW` (4) and tile 7 (snow under
-high vegetation) maps to :data:`surf_pytorch.config.TILE_HIGH_VEG_SNOW`
-(6).  Tile indices are guarded by ``ntile`` so a smaller tile dimension
-(e.g. a 4-tile test slab) does not raise.
+索引约定
+--------
+``PFRTI`` / ``PAHFSTI`` / ``PEVAPTI`` / ``PSSRFLTI`` 在本移植中
+采用 0 基索引。Fortran 瓦片 5（低植被上的积雪）映射到
+:data:`surf_pytorch.config.TILE_LOW_VEG_SNOW`（4），瓦片 7（高植被
+下的积雪）映射到 :data:`surf_pytorch.config.TILE_HIGH_VEG_SNOW`
+（6）。瓦片索引由 ``ntile`` 保护，因此较小的瓦片维度（例如 4 瓦片
+的测试板）不会引发错误。
 """
 
 from __future__ import annotations
@@ -92,100 +81,101 @@ from ..config import (
     SurfConfig,
 )
 from ..constants import ConstantBundle
+from ._ieee import true_div
 from ..tables.soil import SoilTable
 
 
 # --------------------------------------------------------------------------- #
-# Fortran tile indices used by SRFSN_LWIMP, mapped to the port tile enum.
-# Fortran PFRTI(JL,3..8) -> Python pfrti[:, 2..7]; lake is PFRTI(JL,9) -> 8.
+# SRFSN_LWIMP 使用的 Fortran 瓦片索引，映射到本移植的瓦片枚举。
+# Fortran PFRTI(JL,3..8) -> Python pfrti[:, 2..7]；湖泊为 PFRTI(JL,9) -> 8。
 # --------------------------------------------------------------------------- #
-# Snow tile-fraction indices (1-based in Fortran).
-_F90_TILE_SNOW_LOW = 5      # -> port TILE_LOW_VEG_SNOW (4)
-_F90_TILE_SNOW_HIGH = 7     # -> port TILE_HIGH_VEG_SNOW (6)
-# Snowfall-interception scaling grid fraction (Fortran tiles 3..8 +
-# lake tile 9 if present).  Fortran tile 3 == port TILE_WET_SKIN (2)
-# and tile 8 == port TILE_BARE_SOIL (7), so port indices 2..7 (+8 for
-# lake).  The earlier code used TILE_LOW_VEG_DRY (port 3 == F90 4),
-# which silently dropped the wet-skin tile from the sum -- caught by
-# the M6b ULP comparison against SURF_REF_SNOW.
-_INTERCEPT_FRAC_LO = TILE_WET_SKIN           # port 2 == F90 3
-_INTERCEPT_FRAC_HI = TILE_BARE_SOIL          # port 7 == F90 8
+# 雪瓦片比例索引（Fortran 中为 1 基）。
+_F90_TILE_SNOW_LOW = 5      # -> 移植版 TILE_LOW_VEG_SNOW (4)
+_F90_TILE_SNOW_HIGH = 7     # -> 移植版 TILE_HIGH_VEG_SNOW (6)
+# 降雪截获缩放的格点比例（Fortran 瓦片 3..8 +
+# 若存在湖瓦片 9）。Fortran 瓦片 3 == 移植版 TILE_WET_SKIN (2)，
+# 瓦片 8 == 移植版 TILE_BARE_SOIL (7)，因此移植索引为 2..7（湖泊另加 8）。
+# 早期代码使用了 TILE_LOW_VEG_DRY（移植版 3 == F90 4），
+# 这会悄悄地在求和中漏掉湿表皮瓦片 —— 由针对 SURF_REF_SNOW 的
+# M6b ULP 比较所捕获。
+_INTERCEPT_FRAC_LO = TILE_WET_SKIN           # 移植版 2 == F90 3
+_INTERCEPT_FRAC_HI = TILE_BARE_SOIL          # 移植版 7 == F90 8
 
 
 @dataclass
 class SnowInputs:
-    """All inputs to the HTESSEL single-layer snow solve.
+    """HTESSEL 单层雪求解的全部输入。
 
-    Each tensor is ``(Ngrid,)`` unless noted.  Per-tile fields are
-    ``(Ngrid, Ntile)``.  Naming mirrors the ``SRFSN_LWIMP`` dummy list
-    so a side-by-side audit is easy.
+    除特别注明外，每个张量形状均为 ``(Ngrid,)``。逐瓦片字段为
+    ``(Ngrid, Ntile)``。命名与 ``SRFSN_LWIMP`` 的形参列表对应，
+    便于逐项对照审查。
 
-    Cold-start note: the snowfall / throughfall / interception-mismatch
-    inputs (``pssfc``, ``pssfl``, ``ptsfc``, ``ptsfl``, ``pevapsnw``)
-    all default to zero and may be left at that for a cold start.
+    冷启动说明：降雪 / 穿透降水 / 截获不匹配输入
+    （``pssfc``、``pssfl``、``ptsfc``、``ptsfl``、``pevapsnw``）
+    均默认为零，冷启动时可以保持为零。
     """
 
-    # ---- Snow state at t-1 ----
-    pssnm1m: torch.Tensor             # PSSNM1M  snow mass (SWE)      [kg/m^2]    (Ngrid,)
-    ptsnm1m: torch.Tensor             # PTSNM1M  snow temperature     [K]         (Ngrid,)
-    prsnm1m: torch.Tensor             # PRSNM1M  snow density         [kg/m^3]    (Ngrid,)
+    # ---- t-1 时刻的雪状态 ----
+    pssnm1m: torch.Tensor             # PSSNM1M  雪量 (SWE)      [kg/m^2]    (Ngrid,)
+    ptsnm1m: torch.Tensor             # PTSNM1M  雪温            [K]         (Ngrid,)
+    prsnm1m: torch.Tensor             # PRSNM1M  雪密度          [kg/m^3]    (Ngrid,)
 
-    # ---- Soil top-layer temperature (for snow-soil coupling) ----
-    ptsam1m_top: torch.Tensor         # PTSAM1M(:,1)  soil T at top  [K]         (Ngrid,)
+    # ---- 土壤顶层温度（用于雪-土壤耦合）----
+    ptsam1m_top: torch.Tensor         # PTSAM1M(:,1)  顶层土壤温度 [K]         (Ngrid,)
 
-    # ---- Per-tile fluxes (from VDFDIFH1S / SURFSEB) ----
-    pfrti: torch.Tensor               # PFRTI    tile fractions     [-]         (Ngrid, Ntile)
-    pahfsti: torch.Tensor             # PAHFSTI  tile sensible heat  [W/m^2]     (Ngrid, Ntile)
-    pevapti: torch.Tensor             # PEVAPTI  tile moisture flux  [kg/m^2/s]  (Ngrid, Ntile)
-    pssrflti: torch.Tensor            # PSSRFLTI tile net SW         [W/m^2]     (Ngrid, Ntile)
-    pslrflti: torch.Tensor            # PSLRFLTI tile net LW         [W/m^2]     (Ngrid, Ntile)
+    # ---- 逐瓦片通量（来自 VDFDIFH1S / SURFSEB）----
+    pfrti: torch.Tensor               # PFRTI    瓦片比例        [-]         (Ngrid, Ntile)
+    pahfsti: torch.Tensor             # PAHFSTI  瓦片感热通量    [W/m^2]     (Ngrid, Ntile)
+    pevapti: torch.Tensor             # PEVAPTI  瓦片水汽通量    [kg/m^2/s]  (Ngrid, Ntile)
+    pssrflti: torch.Tensor            # PSSRFLTI 瓦片净短波辐射  [W/m^2]     (Ngrid, Ntile)
+    pslrflti: torch.Tensor            # PSLRFLTI 瓦片净长波辐射  [W/m^2]     (Ngrid, Ntile)
 
-    # ---- Per-grid radiation ----
-    pslrfl: torch.Tensor              # PSLRFL   net LW              [W/m^2]     (Ngrid,)
+    # ---- 逐格点辐射 ----
+    pslrfl: torch.Tensor              # PSLRFL   净长波辐射      [W/m^2]     (Ngrid,)
 
-    # ---- Snowfall throughfall (per grid) ----
-    pssfc: torch.Tensor               # PSSFC  convective snowfall    [kg/m^2/s]  (Ngrid,)
-    pssfl: torch.Tensor               # PSSFL  large-scale snowfall  [kg/m^2/s]  (Ngrid,)
+    # ---- 降雪穿透量（逐格点）----
+    pssfc: torch.Tensor               # PSSFC  对流降雪          [kg/m^2/s]  (Ngrid,)
+    pssfl: torch.Tensor               # PSSFL  大尺度降雪        [kg/m^2/s]  (Ngrid,)
 
-    # ---- Rainfall throughfall (per grid; for snow-rainfall interception) ----
-    ptsfc: torch.Tensor               # PTSFC  convective rainfall   [kg/m^2/s]  (Ngrid,)
-    ptsfl: torch.Tensor               # PTSFL  large-scale rainfall  [kg/m^2/s]  (Ngrid,)
+    # ---- 降雨穿透量（逐格点；用于雪-降雨截获）----
+    ptsfc: torch.Tensor               # PTSFC  对流降雨          [kg/m^2/s]  (Ngrid,)
+    ptsfl: torch.Tensor               # PTSFL  大尺度降雨        [kg/m^2/s]  (Ngrid,)
 
-    # ---- Snow-under-forest evaporation mismatch (per grid) ----
-    pevapsnw: torch.Tensor            # PEVAPSNW  snow-under-forest evap [kg/m^2/s] (Ngrid,)
+    # ---- 林下积雪蒸发不匹配量（逐格点）----
+    pevapsnw: torch.Tensor            # PEVAPSNW  林下积雪蒸发   [kg/m^2/s]  (Ngrid,)
 
-    # ---- Timestep ----
-    ptmst: torch.Tensor               # PTMST  timestep              [s]         scalar
+    # ---- 时间步长 ----
+    ptmst: torch.Tensor               # PTMST  时间步长          [s]         scalar
 
-    # ---- Lake ice (FLake stub; zero at cold start) ----
-    phlicem1m: Optional[torch.Tensor] = None   # PHLICEM1M lake ice thickness [m] (Ngrid,)
+    # ---- 湖冰（FLake 占位；冷启动时为零）----
+    phlicem1m: Optional[torch.Tensor] = None   # PHLICEM1M 湖冰厚度 [m] (Ngrid,)
 
 
 @dataclass
 class SnowOutputs:
-    """All outputs of the HTESSEL single-layer snow solve."""
+    """HTESSEL 单层雪求解的全部输出。"""
 
-    # ---- Snow state at t ----
-    ptsn: torch.Tensor                # PTSN  new snow temperature   [K]         (Ngrid,)
-    pgsn: torch.Tensor                # PGSN  ground heat flux from snow -> soil  [W/m^2] (Ngrid,)
+    # ---- t 时刻的雪状态 ----
+    ptsn: torch.Tensor                # PTSN  新雪温             [K]         (Ngrid,)
+    pgsn: torch.Tensor                # PGSN  由雪传入土壤的地表热通量 [W/m^2] (Ngrid,)
 
-    # ---- Diagnostics (mirror the SRFSN_LWIMP local variables) ----
-    psstar: torch.Tensor              # ZSSTAR  updated snow mass (SWE) [kg/m^2] (Ngrid,)
-    plwc: torch.Tensor                # ZLWC   snow liquid water capacity [kg/m^2] (Ngrid,)
-    zfrsn: torch.Tensor               # ZFRSN  snow tile fraction (normaliser) [-] (Ngrid,)
+    # ---- 诊断量（对应 SRFSN_LWIMP 的局部变量）----
+    psstar: torch.Tensor              # ZSSTAR  更新后的雪量 (SWE) [kg/m^2] (Ngrid,)
+    plwc: torch.Tensor                # ZLWC   积雪液态水容量 [kg/m^2] (Ngrid,)
+    zfrsn: torch.Tensor               # ZFRSN  雪瓦片比例（归一化因子）[-] (Ngrid,)
 
-    # ---- No-snow mask, exposed so the density-evolution block can ---- #
-    # reset density to RHOMINSN at LLNOSNOW points (SRFSN_LWIMP line 491).
-    llnosnow: Optional[torch.Tensor] = None   # LLNOSNOW  no-snow mask (bool) (Ngrid,)
+    # ---- 无雪掩码，暴露出来以便密度演变块能在 LLNOSNOW 点 ---- #
+    # 将密度重置为 RHOMINSN（SRFSN_LWIMP 第 491 行）。
+    llnosnow: Optional[torch.Tensor] = None   # LLNOSNOW  无雪掩码 (bool) (Ngrid,)
 
-    # ---- Melt rate, exposed so the snow-albedo aging block can split ---- #
-    # its melt/cold branches on PMSN > 0 (SRFSN line 354).  Zero at no-melt
-    # points; positive only where the melt branch is active.
-    pmsn: Optional[torch.Tensor] = None       # PMSN  melt rate [kg/m^2/s] (Ngrid,)
-    pmsnint: Optional[torch.Tensor] = None    # ZPMSNINT internal phase change [W/m^2] (Ngrid,)
-    pemssn: Optional[torch.Tensor] = None     # PEMSSN snow-mass clipping mismatch [kg/m^2/s]
-    ptsfcin: Optional[torch.Tensor] = None    # PTSFCIN snow-intercepted convective rain [kg/m^2/s]
-    ptsflin: Optional[torch.Tensor] = None    # PTSFLIN snow-intercepted large-scale rain [kg/m^2/s]
+    # ---- 融雪率，暴露出来以便雪反照率老化块能按 PMSN > 0 ---- #
+    # 划分融化/冷分支（SRFSN 第 354 行）。无融化点为零；仅在融化分支
+    # 激活的点上为正。
+    pmsn: Optional[torch.Tensor] = None       # PMSN  融雪率 [kg/m^2/s] (Ngrid,)
+    pmsnint: Optional[torch.Tensor] = None    # ZPMSNINT 内部相变 [W/m^2] (Ngrid,)
+    pemssn: Optional[torch.Tensor] = None     # PEMSSN 雪量截断不匹配量 [kg/m^2/s]
+    ptsfcin: Optional[torch.Tensor] = None    # PTSFCIN 被雪截获的对流降雨 [kg/m^2/s]
+    ptsflin: Optional[torch.Tensor] = None    # PTSFLIN 被雪截获的大尺度降雨 [kg/m^2/s]
 
 
 def compute_snow(
@@ -196,29 +186,28 @@ def compute_snow(
     *,
     differentiable: Optional[bool] = None,
 ) -> SnowOutputs:
-    """Run the HTESSEL single-layer snow solve (``SRFSN_LWIMP``).
+    """运行 HTESSEL 单层雪求解（``SRFSN_LWIMP``）。
 
     Args
     ----
     inp:
-        :class:`SnowInputs` -- packed snow state, fluxes and masks.
+        :class:`SnowInputs` —— 打包的雪状态、通量与掩码。
     soil_table:
-        :class:`surf_pytorch.tables.soil.SoilTable` -- provides the snow
-        constants (rhoice, rhoci, rlamsn, rlwcswe*, rtempamp, rfrsmall,
-        rfrtiny, rdsmax).
+        :class:`surf_pytorch.tables.soil.SoilTable` —— 提供雪常数
+        （rhoice、rhoci、rlamsn、rlwcswe*、rtempamp、rfrsmall、
+        rfrtiny、rdsmax）。
     consts:
-        :class:`ConstantBundle` -- provides ``rtt``, ``rlmlt``, ``rlvtt``,
-        ``rlstt`` and ``pi``.
+        :class:`ConstantBundle` —— 提供 ``rtt``、``rlmlt``、``rlvtt``、
+        ``rlstt`` 和 ``pi``。
     config:
-        :class:`SurfConfig` -- ``use_flake`` selects the lake branch.
+        :class:`SurfConfig` —— ``use_flake`` 选择湖泊分支。
     differentiable:
-        Override ``config.differentiable`` for this call.
+        为本次调用覆盖 ``config.differentiable``。
 
     Returns
     -------
-    :class:`SnowOutputs` -- new snow temperature, snow-soil ground heat
-    flux, updated snow mass, liquid-water capacity and the snow tile
-    fraction normaliser.
+    :class:`SnowOutputs` —— 新雪温、雪-土壤地表热通量、更新后的雪量、
+    液态水容量以及雪瓦片比例归一化因子。
     """
     diff = config.differentiable if differentiable is None else differentiable
 
@@ -237,14 +226,14 @@ def _snow_core(
     consts: ConstantBundle,
     config: SurfConfig,
 ) -> SnowOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部函数：假定 no_grad / enable_grad 的决定已经做出。"""
     ngrid = inp.pssnm1m.shape[0]
     ntile = inp.pfrti.shape[-1]
     dtype = inp.pssnm1m.dtype
     device = inp.pssnm1m.device
 
     # ------------------------------------------------------------------ #
-    # Scalar constants (read in the same order as the Fortran ASSOCIATE).
+    # 标量常数（按与 Fortran ASSOCIATE 相同的顺序读取）。
     # ------------------------------------------------------------------ #
     rtt = consts.rtt
     rlmlt = consts.rlmlt
@@ -267,56 +256,57 @@ def _snow_core(
 
     ptmst = inp.ptmst
 
-    # Soil resistance for heat conduction in the half top soil layer.
-    # RVLAMSK(8) is the bare-soil (desert) skin-layer conductivity
-    # (susveg line 175: 15 W/m^2/K); SRFSN_LWIMP uses its inverse.
-    # The value is class-agnostic in the snow context (only index 8 is
-    # ever used), so we hard-wire the desert value to match the Fortran.
+    # 半个土壤顶层中导热的土壤热阻。
+    # RVLAMSK(8) 是裸土（沙漠）表皮层导热率
+    #（susveg 第 175 行：15 W/m^2/K）；SRFSN_LWIMP 使用其倒数。
+    # 该值在雪的语境中与类型无关（只用到索引 8），
+    # 因此我们硬编码沙漠值以匹配 Fortran。
     rvlamsk_8 = 15.0
     zsoilres = 1.0 / rvlamsk_8
 
     # ------------------------------------------------------------------ #
-    # Computational constants (Fortran lines 164-174).
+    # 计算用常数（Fortran 第 164-174 行）。
     # ------------------------------------------------------------------ #
     zhoice = 1.0 / rhoice
     zt0 = rtt
     ztmst = 1.0 / ptmst
     zitempamp = 1.0 / rtempamp
 
-    # ZRDSNMAX / ZRDSNRESMAX (Fortran lines 173-174): both 1.0 m.
+    # ZRDSNMAX / ZRDSNRESMAX（Fortran 第 173-174 行）：均为 1.0 m。
     zrdsnmax = 1.0
     zrdsnresmax = 1.0
 
     # ------------------------------------------------------------------ #
-    # Per-grid setup (Fortran lines 189-213).
+    # 逐格点设置（Fortran 第 189-213 行）。
     # ------------------------------------------------------------------ #
-    # Snow tile fraction ZFRSN = max(PFRTI(5) + PFRTI(7), RFRTINY).
-    # LLNOSNOW is tested on the raw tile fraction before the RFRTINY clamp;
-    # otherwise an exactly snow-free column can be hidden by the numerical
-    # floor and miss the Fortran no-snow reset path.
+    # 雪瓦片比例 ZFRSN = max(PFRTI(5) + PFRTI(7), RFRTINY)。
+    # LLNOSNOW 在 RFRTINY 截断之前的原始瓦片比例上判定；
+    # 否则一个恰好无雪的列可能被数值下掩蔽，
+    # 从而错过 Fortran 的无雪重置路径。
     pf_low_snow = _tile_col(inp.pfrti, TILE_LOW_VEG_SNOW, dtype, device)
     pf_high_snow = _tile_col(inp.pfrti, TILE_HIGH_VEG_SNOW, dtype, device)
     zfrsn_raw = pf_low_snow + pf_high_snow
     zfrsn = torch.clamp(zfrsn_raw, min=rfrtiny)
-    zifrsn = 1.0 / zfrsn
 
-    # LLNOSNOW: snow tile fraction below RFRSMALL.
+    # LLNOSNOW：雪瓦片比例低于 RFRSMALL。
     llnosnow = zfrsn_raw < rfrsmall
 
-    # Snowfall interception scaling: grid fraction covered by tiles
-    # 3..8 (Fortran) plus lake tile 9 if FLake is on.
-    zgridfrac = _interception_gridfrac(inp.pfrti, config.use_flake, dtype, device)
+    # 降雪截获缩放：F90 对陆地点直接取 GRIDFRAC=1.0（srfsn_lwimp_mod.F90
+    # 258-266），仅用于缩放 PSSFC/PSSFL/PTSFC/PTSFL；ZFRLDGP（陆地分数和）
+    # 在本 cycle 是死代码。分数和会舍入到 1±1ulp 并在 ZWFLUXRF_RAW 处
+    # 播下 1-ulp 种子，因此这里精确取 1.0。
+    zgridfrac = torch.ones(inp.pfrti.shape[:-1], dtype=dtype, device=device)
 
-    # Scaled snowfall / throughfall (lines 208-211).
+    # 缩放后的降雪 / 穿透降水（第 208-211 行）。
     zssfc = zgridfrac * inp.pssfc
     zssfl = zgridfrac * inp.pssfl
     ztsfc = zgridfrac * inp.ptsfc
     ztsfl = zgridfrac * inp.ptsfl
 
     # ------------------------------------------------------------------ #
-    # Tile-column extractions (vectorised over Ngrid).
+    # 瓦片列提取（对 Ngrid 向量化）。
     # ------------------------------------------------------------------ #
-    # Net heat flux at the snow surface uses tiles 5 and 7 (1-based).
+    # 雪面净热通量使用瓦片 5 和 7（1 基）。
     pf5 = pf_low_snow                                       # PFRTI(:,5)
     pf7 = pf_high_snow                                      # PFRTI(:,7)
     pahfsti_5 = _tile_col(inp.pahfsti, TILE_LOW_VEG_SNOW, dtype, device)
@@ -325,7 +315,7 @@ def _snow_core(
     pevapti_7 = _tile_col(inp.pevapti, TILE_HIGH_VEG_SNOW, dtype, device)
     pssrflti_5 = _tile_col(inp.pssrflti, TILE_LOW_VEG_SNOW, dtype, device)
     pssrflti_7 = _tile_col(inp.pssrflti, TILE_HIGH_VEG_SNOW, dtype, device)
-    # SRFSN_LWIMP receives the tiled longwave field built by SURFTSTP.
+    # SRFSN_LWIMP 接收由 SURFTSTP 构建的瓦片化长波辐射场。
     pslrflti_5 = _tile_col(inp.pslrflti, TILE_LOW_VEG_SNOW, dtype, device)
     pslrflti_7 = _tile_col(inp.pslrflti, TILE_HIGH_VEG_SNOW, dtype, device)
 
@@ -336,12 +326,12 @@ def _snow_core(
     pevapsnw = inp.pevapsnw
 
     # ------------------------------------------------------------------ #
-    # Main loop body, vectorised (Fortran lines 215-331).
+    # 主循环体，向量化（Fortran 第 215-331 行）。
     # ------------------------------------------------------------------ #
-    # Default outputs (no-snow branch values; overwritten where snow).
+    # 默认输出（无雪分支的取值；有雪处会被覆盖）。
     zt0_t = torch.as_tensor(zt0, dtype=dtype, device=device)
 
-    # --- Net heat flux at the snow surface (ZHFLUX) ------------------- #
+    # --- 雪面净热通量（ZHFLUX）---------------------------------------- #
     # ZHFLUXP = PFRTI(5)*(PAHFSTI(5)+RLSTT*PEVAPTI(5))
     #         + PFRTI(7)*(PAHFSTI(7)+RLVTT*(PEVAPTI(7)-PEVAPSNW)
     #                     +RLSTT*PEVAPSNW)
@@ -349,7 +339,8 @@ def _snow_core(
     #         + PFRTI(7)*PSSRFLTI(7)
     #         + PFRTI(5)*PSLRFLTI(5)
     #         + PFRTI(7)*PSLRFLTI(7)
-    # ZHFLUX  = ZIFRSN * ZHFLUXP
+    # ZHFLUX  = ZHFLUXP / ZFRSN。保持 Fortran 的运算顺序：
+    # 乘以预先计算的倒数会改变末位比特。
     zhfluxp = (
         pf5 * (pahfsti_5 + rlstt * pevapti_5)
         + pf7 * (pahfsti_7 + rlvtt * (pevapti_7 - pevapsnw) + rlstt * pevapsnw)
@@ -358,9 +349,9 @@ def _snow_core(
         + pf5 * pslrflti_5
         + pf7 * pslrflti_7
     )
-    zhflux = zifrsn * zhfluxp
+    zhflux = zhfluxp / zfrsn
 
-    # --- Preliminary snow mass ZSSTAR --------------------------------- #
+    # --- 初步雪量 ZSSTAR ---------------------------------------------- #
     # ZSSTAR = PSSNM1M + PTMST*(ZSSFC+ZSSFL+PFRTI(5)*PEVAPTI(5)
     #                          +PFRTI(7)*PEVAPSNW)
     zsstar_raw = pssnm1m + ptmst * (
@@ -425,12 +416,12 @@ def _snow_core(
     # --- Terms for the implicit temperature equation ------------------ #
     # ZCONSB     = RLMLT*ZLWC*ZDFUNC
     # ZCONSAMAX  = (PRSNM1M*RHOCI*ZRDSNMAX)*ZHOICE
-    # ZCOND1     = (PSSNM1M*RHOCI*ZHOICE)*ZIFRSN
+    # ZCOND1     = (PSSNM1M*RHOCI*ZHOICE)/ZFRSN
     # ZCONSA     = min(ZCOND1, ZCONSAMAX)
     # ZCONS2     = PTMST / (ZCONSA + ZCONSB)
     zconsb = rlmlt * zlwc * zdfunc
     zconsamax = (prsnm1m * rhoci * zrdsnmax) * zhoice
-    zcond1 = (pssnm1m * rhoci * zhoice) * zifrsn
+    zcond1 = (pssnm1m * rhoci * zhoice) / zfrsn
     zconsa = torch.minimum(zcond1, zconsamax)
     zcons_denom = zconsa + zconsb
     zcons_denom_safe = torch.where(
@@ -478,14 +469,19 @@ def _snow_core(
     # rain that froze in the snow from entering the soil-water budget.
     zptsf = inp.ptsfc + inp.ptsfl
     valid_rain = (~llnosnow) & (zwfluxrf > 0.0) & (zptsf > 0.0)
+    # ``torch.where`` evaluates both branches.  A snow-free column has
+    # zptsf=0, so the masked direct division is harmless in forward mode
+    # but produces a NaN DivBackward gradient. Keep the exact Fortran
+    # denominator on the active path and use a neutral denominator elsewhere.
+    zptsf_safe = torch.where(valid_rain, zptsf, torch.ones_like(zptsf))
     ptsfcin = torch.where(
         valid_rain,
-        torch.clamp(zwfluxrf * inp.ptsfc / zptsf, min=0.0),
+        torch.clamp(zwfluxrf * inp.ptsfc / zptsf_safe, min=0.0),
         torch.zeros_like(zwfluxrf),
     )
     ptsflin = torch.where(
         valid_rain,
-        torch.clamp(zwfluxrf * inp.ptsfl / zptsf, min=0.0),
+        torch.clamp(zwfluxrf * inp.ptsfl / zptsf_safe, min=0.0),
         torch.zeros_like(zwfluxrf),
     )
 
@@ -521,8 +517,9 @@ def _snow_core(
         -torch.clamp(torch.abs(zdthi_denom), min=zepsilon),
         torch.clamp(torch.abs(zdthi_denom), min=zepsilon),
     )
-    zdthi = 1.0 / zdthi_safe
-    zdth = (zt0 - ptsnm1m) * (zconsa + zconsb) * zdthi
+    # srfsn_lwimp 418: ZDTH is a true division by SIGN(MAX(eps,|w|),w);
+    # a reciprocal-multiply here differs in the last bit at melt onset.
+    zdth = true_div((zt0 - ptsnm1m) * (zconsa + zconsb), zdthi_safe)
     zdtm = ptmst - zdth
     zgsn_melt = (zt0 - ptsam1m_top) * zrs
     zmsn = (zhflux + zhfluxrf1 - zgsn_melt) / rlmlt
@@ -591,22 +588,16 @@ def _snow_core(
         llnosnow, torch.zeros_like(zlwc), zlwc
     )
 
-    # ------------------------------------------------------------------ #
-    # Normalise PGSN to the grid-square (Fortran lines 336-338):
-    #   PGSN = ZFRSN * PGSN
-    # ------------------------------------------------------------------ #
-    # Retain the local snow-tile flux for trace alignment: the Fortran
-    # SRFSN_LWIMP debug hook writes before this grid-area normalization.
-    pgsn_local = pgsn
-    pgsn = zfrsn * pgsn_local
-
-    # PMSN follows SRFSN_LWIMP: the branch logic first computes the local
-    # snow-tile melt flux, then section 5 normalises it to the grid square
-    # with the same ZFRSN factor used for PGSN before SRFWEXC_VG consumes it.
+    # The Fortran debug writer (srfsn_lwimp_mod.F90:533) snapshots PGSN
+    # and PMSN *before* section 5 normalises them in place (lines
+    # 643-644: PGSN=ZFRSN*PGSN, PMSN=ZFRSN*PMSN).  Keep these
+    # pre-normalisation values for the CSV; the grid-square-scaled
+    # fluxes are applied after the debug call below because SRFT and
+    # SRFWEXC_VG consume them in grid-square units.
     pmsn_partial = zmsn * zdtm * ztmst
     pmsn_full = zmsn * zdtm_full * ztmst
     pmsn_melt = torch.where(full_melt, pmsn_full, pmsn_partial)
-    pmsn_out = zfrsn * torch.where(melt, pmsn_melt, torch.zeros_like(zmsn))
+    pmsn_out = torch.where(melt, pmsn_melt, torch.zeros_like(zmsn))
     # SRFSN_LWIMP's LLNOSNOW branch explicitly resets both PGSN and PMSN.
     # PMSN is consumed by the soil-water budget in the same surface step;
     # retaining a provisional melt flux here injects spurious water when
@@ -666,11 +657,15 @@ def _snow_core(
         full_melt=full_melt,
         ptsn=ptsn,
         pssn=zsstar_out,
-        pgsn_local=pgsn_local,
         pgsn=pgsn,
         pmsn=pmsn_out,
         pmsnint=pmsnint,
     )
+
+    # Section 5 (srfsn_lwimp_mod.F90:643-644): normalise the returned
+    # fluxes to the grid square after the debug snapshot.
+    pgsn = zfrsn * pgsn
+    pmsn_out = zfrsn * pmsn_out
 
     return SnowOutputs(
         ptsn=ptsn,
@@ -728,12 +723,12 @@ def _append_snow_debug(**cols: torch.Tensor) -> None:
 def _tile_col(
     pfrti: torch.Tensor, idx: int, dtype: torch.dtype, device
 ) -> torch.Tensor:
-    """Return ``pfrti[:, idx]`` if the tile axis is wide enough.
+    """若瓦片轴足够宽，则返回 ``pfrti[:, idx]``。
 
-    Falls back to zeros if the tile dimension is narrower than ``idx + 1``
-    (e.g. a 4-tile test slab that omits the snow tiles).  This mirrors
-    the ``ntile > TILE_*`` guards used by
-    :meth:`LandSurface._update_soil_temperature`.
+    若瓦片维度窄于 ``idx + 1``（例如省略了雪瓦片的 4 瓦片测试板），
+    则回退为零。这对应于
+    :meth:`LandSurface._update_soil_temperature`
+    中使用的 ``ntile > TILE_*`` 保护。
     """
     ntile = pfrti.shape[-1]
     if ntile > idx:
@@ -744,29 +739,13 @@ def _tile_col(
 def _interception_gridfrac(
     pfrti: torch.Tensor, use_flake: bool, dtype: torch.dtype, device
 ) -> torch.Tensor:
-    """Snowfall-interception scaling grid fraction (Fortran lines 197-206).
+    """降雪截获缩放的格点比例（srfsn_lwimp_mod.F90 258-277）。
 
-    The grid fraction is the sum of tiles 3..8 (Fortran 1-based), i.e.
-    port tiles 2..7 (low-veg-dry .. bare-soil).  If FLake is active and
-    the lake tile (port 8) is fully covering (PFRTI(:,9) == 1) the grid
-    fraction collapses to zero (no snow over a full lake); otherwise the
-    lake fraction is added.
+    F90 对陆地点直接赋 GRIDFRAC=1.0（海洋点 0.0），仅用于缩放
+    PSSFC/PSSFL/PTSFC/PTSFL。陆地分数和 ZFRLDGP 在本 cycle 未被
+    使用；按分数和计算会引入 1-ulp 舍入差。
     """
-    ntile = pfrti.shape[-1]
-    zgridfrac = torch.zeros(pfrti.shape[:-1], dtype=dtype, device=device)
-    # Tiles 4..8 in Fortran -> port indices 3..7.
-    for port_idx in range(_INTERCEPT_FRAC_LO, _INTERCEPT_FRAC_HI + 1):
-        if ntile > port_idx:
-            zgridfrac = zgridfrac + pfrti[..., port_idx]
-
-    if use_flake and ntile > TILE_LAKE:
-        lake_frac = pfrti[..., TILE_LAKE]
-        full_lake = lake_frac == 1.0
-        # Full-lake points get zero (no snow there).
-        zgridfrac = torch.where(
-            full_lake, torch.zeros_like(zgridfrac), zgridfrac + lake_frac
-        )
-    return zgridfrac
+    return torch.ones(pfrti.shape[:-1], dtype=dtype, device=device)
 
 __all__ = [
     "SnowInputs",

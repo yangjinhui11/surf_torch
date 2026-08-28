@@ -91,11 +91,11 @@ class TestPhaseSelectors:
         d = U.foedelta(T, bundle)
         assert d.tolist() == [0.0, 0.0, 0.0]
 
-    def test_foedelta_at_triple_point_is_ice(self, bundle):
-        """SIGN(1.0, 0.0) == 0 in Fortran -> FOEDELTA(RTT) == 0."""
+    def test_foedelta_at_triple_point_is_water(self, bundle):
+        """Fortran SIGN(1.0, +0.0) is +1 -> FOEDELTA(RTT) is liquid."""
         T = torch.tensor([C.RTT], dtype=bundle.dtype)
         d = U.foedelta(T, bundle)
-        assert d.item() == 0.0
+        assert d.item() == 1.0
 
     def test_foealfa_endpoints(self, bundle):
         T = torch.tensor([C.RTICE, C.RTWAT, C.RTWAT + 5.0], dtype=bundle.dtype)

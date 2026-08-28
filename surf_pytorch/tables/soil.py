@@ -203,6 +203,7 @@ class SoilConstants:
     rwlmax: float = 0.2             # skin reservoir scaling [kg/m^2]
     rsimp: float = 1.0              # implicit time weight
     rsrdep: float = 0.5             # VIC representative depth [m]
+    rpsfr: float = 2.0               # convective precipitation scaling (SUSSOIL)
     # VIC surface-runoff sub-grid orography bounds (sussoil 480-481).
     # ZROEFF = clamp((PSDOR - RSIGORMIN)/(PSDOR + RSIGORMAX), 0, 0.5) drives
     # the saturation-area exponent ZBWS; the defaults 100/1000 mean a flat

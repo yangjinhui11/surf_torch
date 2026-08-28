@@ -1,43 +1,38 @@
-"""Urban canyon albedo (``CANALB``, ``canalb_mod.F90`` lines 82-181).
+"""城市峡谷反照率（``CANALB``，``canalb_mod.F90`` 第 82-181 行）。
 
-This module ports the ECMWF urban canyon broadband albedo -- the
-Masson (2000) shadowing scheme combined with the Harman (2004) matrix
-exchange formulation and the Porson (2010) shape factors.  It is the
-algorithm ``SURFRAD`` calls at ``surfrad_ctl_mod.F90:520`` to get the
-canyon albedo for the urban tile (tile 10).
+本模块移植 ECMWF 城市峡谷宽波段反照率——Masson (2000) 遮蔽方案与
+Harman (2004) 矩阵交换公式以及 Porson (2010) 形状因子的组合。它是
+``SURFRAD`` 在 ``surfrad_ctl_mod.F90:520`` 处调用以求取城市瓦片
+（瓦片 10）峡谷反照率的算法。
 
-What the scheme does
+方案概述
 --------------------
-For each grid column the routine builds three canyon "surfaces" --
-sky (1), road (2), wall (3) -- and solves a 3x3 reflection problem to
-find the albedo of the canyon as a whole.  The steps are:
+对每个网格柱，例程构建三个峡谷"表面"——天空 (1)、路面 (2)、墙面
+(3)——并求解一个 3x3 反射问题，得到峡谷整体的反照率。步骤如下：
 
-1. **Solar partition** (Masson 2000 eq 13-14, lines 88-99).  From the
-   solar zenith cosine ``PMU0`` and the canyon aspect ratio ``RHWR``
-   (height-to-road-width), compute the fractions of incident SW scattered
-   onto the road (``x_r``) and walls (``x_w``)::
+1. **太阳分配**（Masson 2000 式 13-14，第 88-99 行）。由太阳天顶角
+   余弦 ``PMU0`` 与峡谷高宽比 ``RHWR``（建筑高度与路宽之比），计算
+   入射短波散射到路面（``x_r``）与墙面（``x_w``）上的比例::
 
        var1   = tan(acos(mu0))                 # limited away from 0
        omega0 = asin(min(1, 1/(var1*RHWR)))
        x_r    = (2/pi)*(omega0 - RHWR*var1*(1 - cos(omega0)))
        x_w    = (1 - x_r)/(2*RHWR)
 
-   ``x_f = 0.3`` is the sky-scattered fraction (line 85, hard-coded).
+   ``x_f = 0.3`` 是天空散射比例（第 85 行，硬编码）。
 
-2. **Shape factors** (Harman 2004 eq 2-5 + Porson 2010 eq 12-14, lines
-   101-116).  From ``RHWR`` build the view-factor matrix ``shf`` that
-   distributes outgoing flux among the three surfaces.
+2. **形状因子**（Harman 2004 式 2-5 + Porson 2010 式 12-14，第
+   101-116 行）。由 ``RHWR`` 构建视角因子矩阵 ``shf``，在三个表面
+   之间分配出射通量。
 
-3. **Reflection matrix** (lines 118-127).  A 3x3 system coupling
-   incoming and reflected flux, using the road albedo ``RROAALB`` and
-   the wall albedo ``RWALALB``.
+3. **反射矩阵**（第 118-127 行）。耦合入射与反射通量的 3x3 系统，
+   使用路面反照率 ``RROAALB`` 与墙面反照率 ``RWALALB``。
 
-4. **Inverse** (lines 130-144).  The reflection matrix is inverted
-   analytically by cofactors (reproduced here verbatim, rather than via
-   ``torch.linalg.inv``, so the result matches the Fortran bit-for-bit
-   when the inputs match).
+4. **求逆**（第 130-144 行）。反射矩阵用余子式解析求逆（此处逐字
+   复现，而不是通过 ``torch.linalg.inv``，以便输入一致时结果与
+   Fortran 逐位一致）。
 
-5. **Reference flux + assembly** (Porson 2010 eq 10, lines 146-170)::
+5. **参考通量 + 组装**（Porson 2010 式 10，第 146-170 行）::
 
        ref = [RROAALB*(1-x_f)*x_r, RWALALB*(1-x_f)*x_w, x_f]
        OUT = rinv @ ref
@@ -46,17 +41,16 @@ find the albedo of the canyon as a whole.  The steps are:
        INC(2) += (1-x_f)*x_w - OUT(2)
        PCANALB = clamp(1 - (INC(1) + 2*RHWR*INC(2)), 0, 1)
 
-   ``INC(3)`` is computed but never used -- matching the Fortran (the
-   wall self-absorption is folded into the ``2*RHWR`` weighting of the
-   wall flux).
+   ``INC(3)`` 被计算但从未使用——与 Fortran 一致（墙面自吸收已折叠
+   进墙面通量的 ``2*RHWR`` 权重中）。
 
-Inputs / outputs
+输入 / 输出
 ----------------
-``mu0`` is the cosine of the solar zenith angle ``(Ngrid,)``.  The three
-material/geometry fields (``rwalalb``, ``rroaalb``, ``rhwr``) are
-``(Ngrid,)`` tensors (per-column) or scalars broadcast across the grid;
-the upstream defaults are RWALALB=0.6, RROAALB=0.05, RHWR=1.0.  The
-output ``pcanalb`` is the broadband canyon albedo ``(Ngrid,)`` in [0,1].
+``mu0`` 是太阳天顶角余弦，形状 ``(Ngrid,)``。三个材质/几何场
+（``rwalalb``、``rroaalb``、``rhwr``）是 ``(Ngrid,)`` 张量（逐柱）
+或跨网格广播的标量；上游默认值为 RWALALB=0.6、RROAALB=0.05、
+RHWR=1.0。输出 ``pcanalb`` 是宽波段峡谷反照率 ``(Ngrid,)``，取值
+在 [0,1] 内。
 """
 
 from __future__ import annotations
@@ -69,11 +63,10 @@ import torch
 
 @dataclass
 class CanalbInputs:
-    """Inputs to the urban canyon albedo solve.
+    """城市峡谷反照率求解的输入。
 
-    Each field is ``(Ngrid,)`` and broadcasts naturally against the
-    others.  Naming mirrors the ``CANALB`` dummy variables / the
-    ``YOS_URB`` members so a side-by-side audit is easy.
+    每个字段均为 ``(Ngrid,)``，彼此自然广播。命名镜像 ``CANALB`` 的
+    哑元变量 / ``YOS_URB`` 成员，便于逐行对照审计。
     """
 
     # ---- Solar geometry ----
@@ -89,7 +82,7 @@ class CanalbInputs:
 
 @dataclass
 class CanalbOutputs:
-    """Outputs of the urban canyon albedo solve."""
+    """城市峡谷反照率求解的输出。"""
 
     pcanalb: torch.Tensor          # PCANALB  canyon albedo [-]      (Ngrid,)
 
@@ -99,19 +92,18 @@ def compute_canalb(
     *,
     differentiable: bool = True,
 ) -> CanalbOutputs:
-    """Run the urban canyon albedo (``canalb_mod.F90`` 82-181).
+    """运行城市峡谷反照率（``canalb_mod.F90`` 82-181）。
 
     Args
     ----
     inp:
-        :class:`CanalbInputs` -- packed solar geometry and canyon
-        material / geometry fields.
+        :class:`CanalbInputs`——打包的太阳几何与峡谷材质 / 几何场。
     differentiable:
-        If ``False`` run under ``torch.no_grad()`` for speed.
+        若为 ``False`` 则在 ``torch.no_grad()`` 下运行以提速。
 
     Returns
     -------
-    :class:`CanalbOutputs` -- the canyon albedo ``PCANALB`` in [0, 1].
+    :class:`CanalbOutputs`——峡谷反照率 ``PCANALB``，取值在 [0, 1] 内。
     """
 
     def _core() -> CanalbOutputs:
@@ -124,7 +116,7 @@ def compute_canalb(
 
 
 def _canalb_core(inp: CanalbInputs) -> CanalbOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部：假定 no_grad / enable_grad 的决定已经做出。"""
     # ------------------------------------------------------------------ #
     # Scalar constants (Fortran lines 85-86).
     # ------------------------------------------------------------------ #

@@ -1,43 +1,36 @@
-"""Ocean mixed-layer model stub (``OCEAN_ML_DRIVER`` / KPP).
+"""海洋混合层模型占位桩（``OCEAN_ML_DRIVER`` / KPP）。
 
-This module is the placeholder port of ``OCEAN_ML_DRIVER`` -- the
-K-profile-parameterization ocean mixed-layer model (Large, McWilliams &
-Doney 1994) invoked by ``SURFTSTP_CTL`` when the per-point mask
-``LDOCN_KPP`` is ``.TRUE.``.  The offline driver cold-starts with
-``LEOCSA = .FALSE.`` (*su0phy1s.F90:107*), which forces
-``LDOCN_KPP = .FALSE.`` everywhere (surfbc_ctl_mod.F90:262), so the
-KPP driver never runs and the SST is prescribed instead.
+本模块是 ``OCEAN_ML_DRIVER`` 的占位移植——K 廓线参数化海洋混合层
+模型（Large, McWilliams & Doney 1994），由 ``SURFTSTP_CTL`` 在逐点
+掩码 ``LDOCN_KPP`` 为 ``.TRUE.`` 时调用。离线驱动冷启动时
+``LEOCSA = .FALSE.``（*su0phy1s.F90:107*），这迫使
+``LDOCN_KPP = .FALSE.`` 处处成立（surfbc_ctl_mod.F90:262），因此
+KPP 驱动从不运行，SST 改为被规定。
 
-What the real KPP driver does
+真实 KPP 驱动的功能
 -----------------------------
-``OCEAN_ML_DRIVER`` integrates a 1-D column ocean over a fixed depth
-grid (``KLEVO`` levels, default 8 -- *sudim1s.F90*).  It advances the
-prognostic temperature, salinity and (optionally) horizontal currents
-under the surface fluxes (net SW / LW, sensible / latent heat, momentum
-stress, convective + large-scale rain and snow), using the KPP mixing
-scheme (Large et al. 1994) for the surface-boundary-layer eddy
-diffusivities and the Richardson-number-based interior mixing.
+``OCEAN_ML_DRIVER`` 在固定深度网格（``KLEVO`` 层，默认 8——
+*sudim1s.F90*）上积分一维柱状海洋。它在表面通量（净短波 / 长波、
+感热 / 潜热、动量应力、对流 + 大尺度雨和雪）作用下推进预报的温度、
+盐度以及（可选的）水平流，表面边界层涡扩散率使用 KPP 混合方案
+（Large et al. 1994），内部混合基于 Richardson 数。
 
-The prognostic state lives on the IFS state as ``PTO0`` (temperature),
-``PSO0`` (salinity), ``PUO0``/``PVO0`` (currents) at the ocean levels,
-plus the depth grid ``PZO`` and layer thicknesses ``PDO``.  The driver
-returns the t+1 state plus the SW-penetration diagnostic.
+预报状态存放在 IFS 状态上：海洋层处的 ``PTO0``（温度）、``PSO0``
+（盐度）、``PUO0``/``PVO0``（流），加上深度网格 ``PZO`` 与层厚
+``PDO``。驱动返回 t+1 状态以及短波穿透诊断。
 
-What this stub does
+本桩的功能
 -------------------
-The function :func:`ocean_ml_driver` reproduces the offline-driver
-default behaviour: it returns the t-1 SST unchanged (identity update),
-ignoring the surface forcing.  This is exactly what the offline driver
-does when ``LEOCSA = .FALSE.`` (the prescribed-SST path), so flipping
-``SurfConfig.use_kpp`` from ``False`` (the current state, which calls
-this stub) to ``True`` later will be a *pure* drop-in once the full KPP
-transcription lands.
+函数 :func:`ocean_ml_driver` 复现离线驱动的默认行为：将 t-1 SST 原样
+返回（恒等更新），忽略地表强迫。这正是离线驱动在
+``LEOCSA = .FALSE.`` 时的行为（规定 SST 路径），因此一旦完整的 KPP
+转写落地，将 ``SurfConfig.use_kpp`` 从 ``False``（当前状态，调用本
+桩）切换为 ``True`` 将是*纯*替换。
 
-A future milestone will port the real ``OCEAN_ML_DRIVER`` body
-(ocean_ml_driver_mod.F90 + the kpp_* companions) into this file.  Until
-then the identity update is bit-exact with the upstream
-``LEOCSA = .FALSE.`` branch and is exercised by the unit test
-:mod:`tests.test_forward_m6`.
+未来的里程碑将把真实的 ``OCEAN_ML_DRIVER`` 主体
+（ocean_ml_driver_mod.F90 及 kpp_* 伴随例程）移植进本文件。在此之
+前，恒等更新与上游 ``LEOCSA = .FALSE.`` 分支逐位一致，并由单元测试
+:mod:`tests.test_forward_m6` 检验。
 """
 from __future__ import annotations
 
@@ -51,14 +44,13 @@ import torch
 # --------------------------------------------------------------------------- #
 @dataclass
 class OceanMlInputs:
-    """t-1 ocean state + surface forcing (OCEAN_ML_DRIVER dummy list).
+    """t-1 海洋状态 + 地表强迫（OCEAN_ML_DRIVER 哑元列表）。
 
-    The prognostic tensors are ``(Ngrid, Nlev_ocean)``; the forcing and
-    mask tensors are ``(Ngrid,)``.  The full 3-D state (temperature,
-    salinity, currents) is accepted but ignored by the stub -- it is
-    present so the signature matches the eventual real driver.  Only
-    ``pto0[:, 0]`` (the skin-layer temperature, which feeds the water
-    tile skin) is propagated into :class:`OceanMlOutputs`.
+    预报量张量为 ``(Ngrid, Nlev_ocean)``；强迫与掩码张量为
+    ``(Ngrid,)``。完整的 3-D 状态（温度、盐度、流）被接受但被桩
+    忽略——它的存在是为了让签名与最终的真实驱动一致。只有
+    ``pto0[:, 0]``（表皮层温度，供给水瓦片表皮）被传播到
+    :class:`OceanMlOutputs`。
     """
 
     # t-1 prognostic state.
@@ -86,13 +78,11 @@ class OceanMlInputs:
 
 @dataclass
 class OceanMlOutputs:
-    """t+1 ocean state (the upstream ``PTOE1`` / ``PSOE1`` locals).
+    """t+1 海洋状态（上游的 ``PTOE1`` / ``PSOE1`` 局部变量）。
 
-    Only the surface temperature ``pto0_new[:, 0]`` is consumed by the
-    forward path (it pins the water-tile skin).  The deeper levels and
-    the salinity / currents are returned for completeness so the
-    real-driver transcription can populate them without changing the
-    output contract.
+    前向路径只消费表面温度 ``pto0_new[:, 0]``（它固定水瓦片表皮）。
+    更深的层次以及盐度 / 流为完整性而返回，以便真实驱动的转写可以
+    在不改变输出契约的情况下填充它们。
     """
 
     pto0_new: torch.Tensor     # t+1 ocean temperature [K], (Ngrid, Nlev)
@@ -105,15 +95,14 @@ class OceanMlOutputs:
 # Driver
 # --------------------------------------------------------------------------- #
 def ocean_ml_driver(inp: OceanMlInputs) -> OceanMlOutputs:
-    """Advance the ocean mixed-layer state by one coupling step.
+    """将海洋混合层状态推进一个耦合步长。
 
-    **Stub implementation** -- reproduces the offline-driver default
-    (``LEOCSA = .FALSE.``): every prognostic is held at its t-1 value.
-    The surface forcing is accepted but unused.
+    **占位桩实现**——复现离线驱动默认（``LEOCSA = .FALSE.``）：每个
+    预报量保持其 t-1 值。地表强迫被接受但不使用。
 
-    Once the real KPP body is transcribed this function is the only
-    thing that changes -- the signature, the dataclasses and the call
-    site in :meth:`LandSurface._update_ocean_ml` stay put.
+    一旦真实的 KPP 主体转写完成，本函数是唯一改变的部分——签名、
+    数据类以及 :meth:`LandSurface._update_ocean_ml` 中的调用点保持
+    不变。
     """
     return OceanMlOutputs(
         pto0_new=inp.pto0.clone(),

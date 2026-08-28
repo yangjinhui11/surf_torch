@@ -1,19 +1,17 @@
-"""Physical constants of the IFS / OpenIFS land-surface package.
+"""IFS / OpenIFS 陆面模式包的物理常量。
 
-All values are transcribed verbatim from the offline driver's ``SUCST``
-routine (``surf/offline/driver/sucst.F90``) and its thermodynamic
-``yoethf`` companions.  The intent is *bit-level* agreement with the
-Fortran single-column driver so that ``tests/reference`` gold files can
-be reproduced.
+所有数值逐字转录自离线驱动的 ``SUCST`` 例程
+（``surf/offline/driver/sucst.F90``）及其热力学 ``yoethf`` 伴生模块。
+目标是与 Fortran 单列驱动达到*逐位*一致，使 ``tests/reference``
+金标文件可以被复现。
 
-Precision
----------
-``SUCST`` uses ``REAL(KIND=JPRB)``; in the offline driver ``JPRB`` is
-the working precision which is double by default for offline runs, so
-every literal below is written at full IEEE-754 double precision.
+精度
+----
+``SUCST`` 使用 ``REAL(KIND=JPRB)``；在离线驱动中 ``JPRB`` 是工作精度，
+离线运行默认为双精度，因此下面每个字面量都按完整 IEEE-754 双精度写出。
 
-The numbers are computed in exactly the same order as the Fortran so
-that compound expressions (e.g. ``RSIGMA``) match to the last ULP.
+各数值按与 Fortran 完全相同的顺序计算，使复合表达式（如 ``RSIGMA``）
+一致到末位 ULP。
 """
 
 from __future__ import annotations
@@ -54,7 +52,23 @@ R1SA = 1.0 / RA                       # inverse Earth radius
 # --------------------------------------------------------------------------- #
 # Keep the double-precision expression used in SUCST (the JPRM branch is
 # only an fp32 re-association that we do not need here).
-RSIGMA = 2.0 * RPI**5 * RKBOL**4 / (15.0 * RCLUM**2 * RHPLA**3)   # Stefan-Boltzmann
+# gfortran expands integer powers as multiplication trees; python's
+# ``**`` calls libm pow, which differs in the last ulp.
+_RPI5 = (RPI * RPI) * (RPI * RPI) * RPI
+# SUCST (offline module variant, suscst_mod.F90) groups the Boltzmann ratio as
+#   RSIGMA = 2*RPI**5*(RKBOL/RHPLA)**3*RKBOL/(15*RCLUM**2)
+# whose double result differs in the low bits from the naive K**4/H**3
+# grouping, so keep the exact same association.
+_RKBOVPLA3 = (RKBOL / RHPLA) * (RKBOL / RHPLA) * (RKBOL / RHPLA)
+RSIGMA = 2.0 * _RPI5 * _RKBOVPLA3 * RKBOL / (15.0 * (RCLUM * RCLUM))   # Stefan-Boltzmann
+
+# The offline driver keeps a *separate* YOMCST (driver/sucst.F90) whose RSIGMA
+# uses the naive K**4/H**3 grouping; callpar1s builds the net-LW forcing with
+# that value, 5 ulp above the module RSIGMA above.  Forcing-side consumers
+# (net longwave) must use this one, SEB internals the one above.
+_RKBOL4 = (RKBOL * RKBOL) * (RKBOL * RKBOL)
+_RHPLA3 = (RHPLA * RHPLA) * RHPLA
+RSIGMA_DRV = 2.0 * _RPI5 * _RKBOL4 / (15.0 * (RCLUM * RCLUM) * _RHPLA3)
 RI0 = 1370.0                          # solar constant  [W/m^2]
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +187,7 @@ class PhysicalConstants:
     rlstt: float = RLSTT
     rlmlt: float = RLMLT
     rsigma: float = RSIGMA
+    rsigma_drv: float = RSIGMA_DRV
     rho_h2o: float = RHOH2O
     rday: float = RDAY
 
@@ -221,6 +236,16 @@ class PhysicalConstants:
     zepsf3: float = 1.0e-5
     rclu: float = 50.0
     rsmin_b: float = 50.0
+
+    # Permanent-snow reset (SURFTSTP, surftstp_ctl_mod.F90): a column whose
+    # previous total snow mass reaches ZSNPERT is forced to glacier values --
+    # SWE pinned at 10^4 kg m-2, density RHOMAXSN (SUSSOIL), albedo
+    # RALFMINPSN (SUPHEC).  Upstream notes this reset does not conserve
+    # mass in the LESNWBCON=F branch used by the offline configuration.
+    zsn_pert: float = 9000.0
+    snow_permanent_swe: float = 10000.0
+    rhomaxsn: float = 300.0
+    ralfminpsn: float = 0.835
 
 
 def _scalar_tensor(value: float, *, dtype: torch.dtype, device) -> torch.Tensor:

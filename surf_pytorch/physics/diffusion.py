@@ -1,83 +1,73 @@
-"""Implicit vertical diffusion -- offline single-column SURFSEB wrapper.
+"""隐式垂直扩散——离线单柱 SURFSEB 包装器。
 
-This module is the Python port of ``surf/offline/driver/vdfdifh1s.F90``,
-the *offline-driver* version of the implicit vertical-diffusion routine
-that closes the surface energy balance.
+本模块是 ``surf/offline/driver/vdfdifh1s.F90`` 的 Python 移植版，
+即闭合地表能量平衡的隐式垂直扩散例程的*离线驱动*版本。
 
-In the full IFS, ``VDFDIFH`` runs a Thomas-algorithm tridiagonal solve
-over the model levels and feeds the upward-sweep coefficients
-``(asl, bsl, aql, bql)`` into ``SURFSEB``.  In the offline single-column
-driver (``vdfdifh1s.F90``) the entire tridiag block is commented out
-with the ``!1s `` prefix and replaced by a Dirichlet boundary
-condition (section 1.0 - 1.5 OFFLINE SETUP)::
+在完整的 IFS 中，``VDFDIFH`` 在模式层上运行 Thomas 算法的三对角求解，
+并将向上回扫系数 ``(asl, bsl, aql, bql)`` 传入 ``SURFSEB``。在离线
+单柱驱动（``vdfdifh1s.F90``）中，整个三对角块被 ``!1s `` 前缀注释掉，
+并以 Dirichlet 边界条件（第 1.0 - 1.5 节，离线设置）替代::
 
     asl = 0, aql = 0
     bsl = PSLM1(:,KLEV) + PTMST*PSLGE(:,KLEV)
     bql = PQTM1(:,KLEV) + PTMST*PQTE(:,KLEV)
 
-so this port simply assembles the SURFSEB inputs from the lowest-model-
-level forcing and runs ``SURFSEB`` (call #3, the canonical call).  An
-optional conditional snow-melt repeat (call #4, gated by the ``LESNML``
-flag) handles the explicit snow-melt-under-low-veg branch.  The
-optional unstressed-evap diagnostic calls (#1 water, #2 fully
-unstressed) are not transcribed here -- they are diagnostic-only and
-require extra ``PCPTSTIU/PCAIRTIU/PCSATTIU`` inputs from upstream
-VSURF; M4-rem-c will add a ``pjqu`` output when the reference kernel
-exercises them.
+因此本移植版仅由最低模式层强迫组装 SURFSEB 输入，并运行 ``SURFSEB``
+（第 3 次调用，即规范调用）。一个可选的、有条件的融雪重复调用
+（第 4 次调用，由 ``LESNML`` 开关控制）处理低植被下雪面显式融化的分支。
+可选的非胁迫蒸发诊断调用（第 1 次水体、第 2 次完全非胁迫）未在此转录——
+它们仅用于诊断，且需要来自上游 VSURF 的额外 ``PCPTSTIU/PCAIRTIU/PCSATTIU``
+输入；当参考内核调用这些分支时，M4-rem-c 将添加一个 ``pjqu`` 输出。
 
-Steps reproduced (vdfdifh1s.F90 section numbers)
+所复现的步骤（vdfdifh1s.F90 的节号）
 ------------------------------------------------
-1.0-1.5  Standalone forcing (offline setup)::
+1.0-1.5  独立强迫（离线设置）::
 
      asl = 0,  aql = 0
      bsl = PSLM1(:,KLEV) + PTMST*PSLGE(:,KLEV)
      bql = PQTM1(:,KLEV) + PTMST*PQTE(:,KLEV)
 
-1.6  Per-tile sub-surface temperature ``PTSRF`` (lines 372-388):
+1.6  逐瓦片的次表层温度 ``PTSRF``（第 372-388 行）：
 
-       water=PSST, ice=PTICE, wet_skin/low-veg-dry/high-veg-dry/
-       bare=PTSM1M, low-veg-snow/high-veg-snow=PTSNOW, lake=PTLICE
-       (if ice thicker than 1e-9 m) else PTLWML.
+       水体=PSST，海冰=PTICE，湿皮肤/低植被干/高植被干/
+       裸土=PTSM1M，低植被雪/高植被雪=PTSNOW，湖泊=PTLICE
+       （若冰厚超过 1e-9 m），否则为 PTLWML。
 
-1.6b Exchange-coefficient inversion (lines 409-415)::
+1.6b 交换系数反演（第 409-415 行）::
 
        rhoChU = PCFHTI / (RG * RVDIFTS * PTMST)
        rhoCqU = PCFQTI / (RG * RVDIFTS * PTMST)
 
-     where PCFHTI / PCFQTI carry the upstream ``RG*PTSPHY*RVDIFTS``
-     rescaling that ``vdfmain1s`` applies (lines 745-746) before
-     calling VDFDIFH1S.  In the offline single-column driver
-     ``PTMST == PTSPHY`` so the inversion exactly recovers
-     ``rho*Ch*|U|`` -- the quantity :mod:`surf_pytorch.physics.seb`
-     consumes.
+     其中 PCFHTI / PCFQTI 携带 ``vdfmain1s`` 在调用 VDFDIFH1S 之前
+     施加的上游 ``RG*PTSPHY*RVDIFTS`` 重标定（第 745-746 行）。
+     在离线单柱驱动中 ``PTMST == PTSPHY``，因此该反演精确恢复
+     ``rho*Ch*|U|``——即 :mod:`surf_pytorch.physics.seb` 所消耗的量。
 
-1.7  SURFSEB canonical call (#3) -> per-tile (PJS, PJQ, PSSH, PSLH,
-     PSTR, PG0, PTSK) and grid-mean (PSL, PQL).
+1.7  SURFSEB 规范调用（第 3 次）-> 逐瓦片的 (PJS, PJQ, PSSH, PSLH,
+     PSTR, PG0, PTSK) 以及格点平均的 (PSL, PQL)。
 
-1.7a Snow-under-forest evaporation (lines 557-558), applied to Fortran
-     tile 7 = :data:`surf_pytorch.config.TILE_HIGH_VEG_SNOW`::
+1.7a 林下积雪蒸发（第 557-558 行），施加于 Fortran 瓦片 7，
+     即 :data:`surf_pytorch.config.TILE_HIGH_VEG_SNOW`::
 
        PJQ[:,TILE_HIGH_VEG_SNOW] += PEVAPSNW
        PSLH[:,TILE_HIGH_VEG_SNOW] += PEVAPSNW*RLSTT
 
-1.7c Skin-T extrapolation to t+1 (lines 585-590)::
+1.7c 皮肤温度向 t+1 的外推（第 585-590 行）::
 
        PTSKTIP1 = ZTPFAC2*PTSK + ZTPFAC3*PTSKTI
                 = (1/RVDIFTS)*PTSK + (1-1/RVDIFTS)*PTSKTI
 
-LESNML snow-melt repeat (call #4, lines 518-547) -- optional, gated by
-``DiffusionInputs.lesnml``.  When any column has ``PFRTI(:,5) >= 1e-6``
-*and* the call-#3 skin temperature on the low-veg-snow tile is at the
-freezing point, the routine pins that tile's ``TSRF`` to ``RTT`` and
-``LAMSK`` to 100 W/m^2/K (mimicking a melting snow surface) and re-runs
-SURFSEB.  This is a no-op when ``lesnml`` is False.
+LESNML 融雪重复（第 4 次调用，第 518-547 行）——可选，由
+``DiffusionInputs.lesnml`` 控制。当任一柱满足 ``PFRTI(:,5) >= 1e-6``
+*并且*第 3 次调用在低植被雪瓦片上的皮肤温度处于冰点时，例程将该瓦片的
+``TSRF`` 固定为 ``RTT``、``LAMSK`` 固定为 100 W/m^2/K（模拟融化的雪面），
+并重新运行 SURFSEB。当 ``lesnml`` 为 False 时该过程为空操作。
 
-Sign convention
+符号约定
 ---------------
-Outputs inherit the SURFSEB_CTL convention documented in
-:mod:`surf_pytorch.physics.seb`: all four surface fluxes and the ground
-heat flux are **positive downward**.  See that module's docstring for
-the full closure statement.
+输出继承 :mod:`surf_pytorch.physics.seb` 中记录的 SURFSEB_CTL 约定：
+全部四个地表通量以及地面热通量均为**向下为正**。完整的闭合说明
+参见该模块的文档字符串。
 """
 
 from __future__ import annotations
@@ -105,138 +95,135 @@ from .seb import SebInputs, SebOutputs, surf_seb
 
 
 # --------------------------------------------------------------------------- #
-# VDFDIFH1S hard-wired constants (yoevdf / SUEVDF)
+# VDFDIFH1S 硬编码常量（yoevdf / SUEVDF）
 # --------------------------------------------------------------------------- #
-# Over-implicit time weight RVDIFTS.  Used both in the exchange-coefficient
-# inversion (ZCOEF1 = 1/(RG*RVDIFTS*PTMST)) and in the skin-T extrapolation
-# (ZTPFAC2 = 1/RVDIFTS, ZTPFAC3 = 1 - ZTPFAC2).
+# 超隐式时间权重 RVDIFTS。同时用于交换系数反演
+# （ZCOEF1 = 1/(RG*RVDIFTS*PTMST)）和皮肤温度外推
+# （ZTPFAC2 = 1/RVDIFTS，ZTPFAC3 = 1 - ZTPFAC2）。
 #
-# NOTE: the full IFS uses the default RVDIFTS=1.5 (set in arpifs/phys_ec/
-# suvdf.F90), but the *offline single-column driver* overrides it to 1.0 in
-# surf/offline/driver/suvdf.F90:57.  Since this port targets the offline
-# driver (which we validate against), we pin RVDIFTS=1.0 here.  With this
-# value the extrapolation collapses to PTSKTIP1 = PTSK (ZTPFAC2=1, ZTPFAC3=0),
-# which matches the driver's step-0 skin-T dump exactly.  Exposed as a module
-# constant so tests can pin it.
+# 注意：完整 IFS 使用默认值 RVDIFTS=1.5（在 arpifs/phys_ec/
+# suvdf.F90 中设置），但*离线单柱驱动*在
+# surf/offline/driver/suvdf.F90:57 中将其覆盖为 1.0。由于本移植版
+# 以离线驱动为（验证）目标，此处固定 RVDIFTS=1.0。取此值时外推退化为
+# PTSKTIP1 = PTSK（ZTPFAC2=1，ZTPFAC3=0），与驱动程序第 0 步的皮肤温度
+# 转储完全一致。暴露为模块常量以便测试固定它。
 RVDIFTS = 1.0
 
-# Snow-melt repeat (LESNML branch) thresholds, mirrors vdfdifh1s lines 523-528.
-_LESNML_FRAC_MIN = 1.0e-6     # PFRTI threshold to consider tile active
-_LESNML_TSK_EPS = 1.0e-6      # TSK - RTT threshold (snow at melting point)
-_LESNML_LAMSK_MELT = 100.0    # pinned lambda_skin for melting snow [W/m^2/K]
+# 融雪重复（LESNML 分支）阈值，对应 vdfdifh1s 第 523-528 行。
+_LESNML_FRAC_MIN = 1.0e-6     # 判定瓦片活跃的 PFRTI 阈值
+_LESNML_TSK_EPS = 1.0e-6      # TSK - RTT 阈值（雪处于融点）
+_LESNML_LAMSK_MELT = 100.0    # 融雪时固定的 lambda_skin [W/m^2/K]
 
-# Lake ice thickness threshold (vdfdifh1s line 382, SUSFLAKE H_ICE_MIN).
+# 湖冰厚度阈值（vdfdifh1s 第 382 行，SUSFLAKE 的 H_ICE_MIN）。
 _LAKE_HICE_MIN = 1.0e-9
 
 
 @dataclass
 class DiffusionInputs:
-    """All inputs to VDFDIFH1S (offline single-column driver).
+    """VDFDIFH1S（离线单柱驱动）的全部输入。
 
-    Each tensor is ``(Ngrid, Ntile)`` unless noted otherwise (per-grid
-    fields are ``(Ngrid,)``).  The naming mirrors the Fortran dummy
-    list of ``vdfdifh1s.F90`` so a side-by-side audit is easy.
+    除非另有说明，每个张量的形状为 ``(Ngrid, Ntile)``（逐格点字段
+    为 ``(Ngrid,)``）。命名与 ``vdfdifh1s.F90`` 的 Fortran 哑元列表
+    保持一致，便于逐行对照审计。
 
-    Lowest-model-level forcing
+    最低模式层强迫
     --------------------------
-    ``pslm1_lev`` / ``pqtm1_lev`` are the lowest-level dry static energy
-    and specific humidity at t-1; ``pslge_lev`` / ``pqte_lev`` are
-    their tendencies.  These produce the Dirichlet boundary condition
-    (``bsl``, ``bql``) of the offline driver.
+    ``pslm1_lev`` / ``pqtm1_lev`` 是 t-1 时刻最低层的干静力能与
+    比湿；``pslge_lev`` / ``pqte_lev`` 是它们的倾向。它们构成离线
+    驱动的 Dirichlet 边界条件（``bsl``、``bql``）。
 
-    Rescaled exchange coefficients
+    重标定的交换系数
     ------------------------------
-    ``pcfhti`` / ``pcfqti`` carry the upstream ``RG*PTSPHY*RVDIFTS``
-    rescaling applied by ``vdfmain1s`` (lines 745-746); the wrapper
-    inverts it via ``ZCOEF1 = 1/(RG*RVDIFTS*PTMST)``.  When called from
-    :class:`surf_pytorch.LandSurface` the model multiplies the raw
-    ``rho*Ch*|U|`` (from :func:`surf_pytorch.physics.exchange.vexcs`)
-    by ``RG*PTSPHY*RVDIFTS`` before populating these fields, mirroring
-    the upstream contract.
+    ``pcfhti`` / ``pcfqti`` 携带上游 ``vdfmain1s``（第 745-746 行）
+    施加的 ``RG*PTSPHY*RVDIFTS`` 重标定；包装器通过
+    ``ZCOEF1 = 1/(RG*RVDIFTS*PTMST)`` 将其反演。当由
+    :class:`surf_pytorch.LandSurface` 调用时，模型在填充这些字段之前，
+    会将原始的 ``rho*Ch*|U|``（来自
+    :func:`surf_pytorch.physics.exchange.vexcs`）乘以
+    ``RG*PTSPHY*RVDIFTS``，与上游约定一致。
     """
 
-    # ---- Lowest-model-level forcing at KLEV (per grid) ----
-    pslm1_lev: torch.Tensor       # PSLM1(:,KLEV)  dry static energy  [J/kg]
-    pqtm1_lev: torch.Tensor       # PQTM1(:,KLEV)  specific humidity  [kg/kg]
-    pslge_lev: torch.Tensor       # PSLGE(:,KLEV)  dry-static-energy tendency  [J/kg/s]
-    pqte_lev: torch.Tensor        # PQTE(:,KLEV)   humidity tendency  [kg/kg/s]
+    # ---- KLEV 处最低模式层强迫（逐格点） ----
+    pslm1_lev: torch.Tensor       # PSLM1(:,KLEV)  干静力能  [J/kg]
+    pqtm1_lev: torch.Tensor       # PQTM1(:,KLEV)  比湿  [kg/kg]
+    pslge_lev: torch.Tensor       # PSLGE(:,KLEV)  干静力能倾向  [J/kg/s]
+    pqte_lev: torch.Tensor        # PQTE(:,KLEV)   湿度倾向  [kg/kg/s]
 
-    # ---- Rescaled turbulent exchange coefficients (per tile) ----
-    pcfhti: torch.Tensor          # PCFHTI  heat exch coeff (rescaled)
-    pcfqti: torch.Tensor          # PCFQTI  moist exch coeff (rescaled)
+    # ---- 重标定的湍流交换系数（逐瓦片） ----
+    pcfhti: torch.Tensor          # PCFHTI  热量交换系数（重标定后）
+    pcfqti: torch.Tensor          # PCFQTI  水汽交换系数（重标定后）
 
-    # ---- Lower-boundary temperatures (per grid) for the PTSRF build ----
-    psst: torch.Tensor            # PSST  open-sea surface temperature  [K]
-    ptice: torch.Tensor           # PTICE sea-ice skin temperature      [K]
-    ptsm1m: torch.Tensor          # PTSM1M top soil-layer temperature   [K]
-    ptsnow: torch.Tensor          # PTSNOW snow skin temperature        [K]
+    # ---- 下边界温度（逐格点），用于构建 PTSRF ----
+    psst: torch.Tensor            # PSST  开阔海面温度  [K]
+    ptice: torch.Tensor           # PTICE 海冰皮肤温度  [K]
+    ptsm1m: torch.Tensor          # PTSM1M 顶层土壤温度  [K]
+    ptsnow: torch.Tensor          # PTSNOW 雪面皮肤温度  [K]
 
-    # ---- Skin reservoir at t-1 (per tile, from VSURF) ----
+    # ---- t-1 时刻的皮肤储库（逐瓦片，来自 VSURF） ----
     sskm1m: torch.Tensor          # PCPTSTI  cp*Tsk              [J/kg]
-    tskm1m: torch.Tensor          # PTSKTI   skin T at t-1       [K]
+    tskm1m: torch.Tensor          # PTSKTI   t-1 时刻皮肤温度    [K]
     qskm1m: torch.Tensor          # PQSTI    qsat(Tsk)           [kg/kg]
-    dqsdT: torch.Tensor           # PDQSTI   dqsat/dT at Tsk     [kg/kg/K]
+    dqsdT: torch.Tensor           # PDQSTI   Tsk 处的 dqsat/dT   [kg/kg/K]
 
-    # ---- Moisture-flux closure coefficients (per tile, from VEVAP) ----
-    alphal: torch.Tensor          # PCAIR  multiplier of ql       [-]
-    alphas: torch.Tensor          # PCSAT  multiplier of qs       [-]
+    # ---- 水汽通量闭合系数（逐瓦片，来自 VEVAP） ----
+    alphal: torch.Tensor          # PCAIR  ql 的乘子      [-]
+    alphas: torch.Tensor          # PCSAT  qs 的乘子      [-]
 
-    # ---- Radiation / emissivity ----
-    pssrflti: torch.Tensor        # PSSRFLTI (Ngrid, Ntile) per-tile net SW  [W/m^2]
-    pslrfl: torch.Tensor          # PSLRFL   (Ngrid,) net LW               [W/m^2]
-    ptskrad: torch.Tensor         # PTSKRAD  (Ngrid,) skin T at rad time   [K]
-    pemis: torch.Tensor           # PEMIS    (Ngrid,) surface emissivity   [-]
+    # ---- 辐射 / 发射率 ----
+    pssrflti: torch.Tensor        # PSSRFLTI (Ngrid, Ntile) 逐瓦片净短波  [W/m^2]
+    pslrfl: torch.Tensor          # PSLRFL   (Ngrid,) 净长波              [W/m^2]
+    ptskrad: torch.Tensor         # PTSKRAD  (Ngrid,) 辐射时刻的皮肤温度  [K]
+    pemis: torch.Tensor           # PEMIS    (Ngrid,) 地表发射率          [-]
 
-    # ---- Skin conductivity from VLAMSK (per tile) ----
+    # ---- 来自 VLAMSK 的皮肤热导率（逐瓦片） ----
     plamsk: torch.Tensor          # PLAMSK (Ngrid, Ntile)  [W/m^2/K]
 
-    # ---- Tile fractions and dominant veg types ----
+    # ---- 瓦片覆盖比例与主导植被类型 ----
     pfrti: torch.Tensor           # PFRTI (Ngrid, Ntile)
-    ktvl: torch.Tensor            # KTVL (Ngrid,) long
-    ktvh: torch.Tensor            # KTVH (Ngrid,) long
+    ktvl: torch.Tensor            # KTVL (Ngrid,) 长整型
+    ktvh: torch.Tensor            # KTVH (Ngrid,) 长整型
 
-    # ---- Timestep ----
-    ptmst: torch.Tensor           # PTMST scalar  [s]
+    # ---- 时间步长 ----
+    ptmst: torch.Tensor           # PTMST 标量  [s]
 
-    # ---- Snow-under-forest evaporation (per grid) ----
+    # ---- 林下积雪蒸发（逐格点） ----
     pevapsnw: Optional[torch.Tensor] = None    # PEVAPSNW  [kg/m^2/s]
 
-    # ---- Optional lake tile skin (only used when n_tile > TILE_LAKE) ----
-    phlice: Optional[torch.Tensor] = None      # PHLICE (Ngrid,) lake ice thickness [m]
-    ptlice: Optional[torch.Tensor] = None      # PTLICE (Ngrid,) lake ice skin T     [K]
-    ptlwml: Optional[torch.Tensor] = None      # PTLWML (Ngrid,) lake mixed-layer T  [K]
+    # ---- 可选的湖泊瓦片皮肤量（仅当 n_tile > TILE_LAKE 时使用） ----
+    phlice: Optional[torch.Tensor] = None      # PHLICE (Ngrid,) 湖冰厚度 [m]
+    ptlice: Optional[torch.Tensor] = None      # PTLICE (Ngrid,) 湖冰皮肤温度 [K]
+    ptlwml: Optional[torch.Tensor] = None      # PTLWML (Ngrid,) 湖泊混合层温度 [K]
 
-    # ---- LESNML snow-melt repeat flag (call #4) ----
+    # ---- LESNML 融雪重复开关（第 4 次调用） ----
     lesnml: bool = False
 
-    # ---- Feature flags inherited from SebInputs ----
+    # ---- 继承自 SebInputs 的特性开关 ----
     lelwdd: bool = True
     lelwtl: bool = False
 
 
 @dataclass
 class DiffusionOutputs:
-    """All outputs of VDFDIFH1S (offline single-column driver).
+    """VDFDIFH1S（离线单柱驱动）的全部输出。
 
-    Inherits the SURFSEB_CTL sign convention -- all four surface fluxes
-    and the ground heat flux are positive downward.  See
-    :mod:`surf_pytorch.physics.seb` for the closure statement.
+    继承 SURFSEB_CTL 的符号约定——全部四个地表通量以及地面热通量
+    均为向下为正。闭合说明参见 :mod:`surf_pytorch.physics.seb`。
     """
 
-    # Canonical SURFSEB outputs (call #3, after snow-under-forest evap).
-    pjq: torch.Tensor             # PJQ (Ngrid, Ntile) moisture flux  [kg/m^2/s]
-    pssh: torch.Tensor            # PSSH (Ngrid, Ntile) sensible heat [W/m^2]
-    pslh: torch.Tensor            # PSLH (Ngrid, Ntile) latent heat   [W/m^2]
-    pstr: torch.Tensor            # PSTR (Ngrid, Ntile) net thermal radiation [W/m^2]
-    pg0: torch.Tensor             # PG0  (Ngrid, Ntile) ground heat flux     [W/m^2]
-    ptsk: torch.Tensor            # PTSK (Ngrid, Ntile) skin T at t+1/2      [K]
+    # 规范的 SURFSEB 输出（第 3 次调用，经林下积雪蒸发修正后）。
+    pjq: torch.Tensor             # PJQ (Ngrid, Ntile) 水汽通量  [kg/m^2/s]
+    pssh: torch.Tensor            # PSSH (Ngrid, Ntile) 感热通量 [W/m^2]
+    pslh: torch.Tensor            # PSLH (Ngrid, Ntile) 潜热通量 [W/m^2]
+    pstr: torch.Tensor            # PSTR (Ngrid, Ntile) 净热辐射 [W/m^2]
+    pg0: torch.Tensor             # PG0  (Ngrid, Ntile) 地面热通量 [W/m^2]
+    ptsk: torch.Tensor            # PTSK (Ngrid, Ntile) t+1/2 时刻皮肤温度 [K]
 
-    # Skin T extrapolated to t+1 (ZTPFAC2*PTSK + ZTPFAC3*PTSKTI).
-    ptsktip1: torch.Tensor        # PTSKTIP1 (Ngrid, Ntile) skin T at t+1    [K]
+    # 外推到 t+1 的皮肤温度（ZTPFAC2*PTSK + ZTPFAC3*PTSKTI）。
+    ptsktip1: torch.Tensor        # PTSKTIP1 (Ngrid, Ntile) t+1 时刻皮肤温度 [K]
 
-    # Grid-mean lowest-level update from SURFSEB.
-    psl: torch.Tensor             # PSL (Ngrid,) dry static energy at t+1/2  [J/kg]
-    pql: torch.Tensor             # PQL (Ngrid,) specific humidity at t+1/2  [kg/kg]
+    # 来自 SURFSEB 的格点平均最低层更新。
+    psl: torch.Tensor             # PSL (Ngrid,) t+1/2 时刻干静力能  [J/kg]
+    pql: torch.Tensor             # PQL (Ngrid,) t+1/2 时刻比湿  [kg/kg]
 
 
 def vdfdifh1s(
@@ -246,27 +233,25 @@ def vdfdifh1s(
     *,
     differentiable: Optional[bool] = None,
 ) -> DiffusionOutputs:
-    """Run the offline single-column VDFDIFH1S wrapper around SURFSEB.
+    """运行围绕 SURFSEB 的离线单柱 VDFDIFH1S 包装器。
 
-    Args
+    参数
     ----
     inp:
-        :class:`DiffusionInputs` -- packed per-(grid,tile) and per-grid
-        inputs.  See that dataclass for the rescaled-exchange-coeff
-        contract.
+        :class:`DiffusionInputs`——打包的逐（格点，瓦片）与逐格点
+        输入。重标定交换系数的约定参见该数据类。
     consts:
-        :class:`ConstantBundle` -- provides ``RG``, ``RLSTT``, ``RTT``
-        and the constants consumed by :func:`surf_seb`.
+        :class:`ConstantBundle`——提供 ``RG``、``RLSTT``、``RTT``
+        以及 :func:`surf_seb` 所消耗的常量。
     config:
-        :class:`SurfConfig` -- ``n_tile`` selects which tile columns
-        are active.
+        :class:`SurfConfig`——``n_tile`` 决定哪些瓦片列处于活跃状态。
     differentiable:
-        Override ``config.differentiable`` for this call.
+        为本次调用覆盖 ``config.differentiable``。
 
-    Returns
+    返回
     -------
-    :class:`DiffusionOutputs` -- per-tile fluxes, extrapolated skin
-    temperature, and grid-mean lowest-level state.
+    :class:`DiffusionOutputs`——逐瓦片通量、外推的皮肤温度，
+    以及格点平均的最低层状态。
     """
     diff = config.differentiable if differentiable is None else differentiable
 
@@ -284,7 +269,7 @@ def _vdfdifh1s_core(
     consts: ConstantBundle,
     config: SurfConfig,
 ) -> DiffusionOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部函数：假定 no_grad / enable_grad 的决定已经做出。"""
     ngrid = inp.pslm1_lev.shape[0]
     ntile = config.n_tile
     dtype = inp.pslm1_lev.dtype
@@ -293,10 +278,10 @@ def _vdfdifh1s_core(
     rg = consts.g
     rlstt = consts.rlstt
     rtt = consts.rtt
-    ptmst = inp.ptmst  # 0-d tensor
+    ptmst = inp.ptmst  # 0 维张量
 
     # ------------------------------------------------------------------ #
-    # Step 1.0-1.5: standalone Dirichlet forcing (offline setup).
+    # 步骤 1.0-1.5：独立 Dirichlet 强迫（离线设置）。
     # ------------------------------------------------------------------ #
     asl_grid = torch.zeros((ngrid,), dtype=dtype, device=device)
     bsl_grid = inp.pslm1_lev + ptmst * inp.pslge_lev
@@ -304,22 +289,22 @@ def _vdfdifh1s_core(
     bql_grid = inp.pqtm1_lev + ptmst * inp.pqte_lev
 
     # ------------------------------------------------------------------ #
-    # Step 1.6: per-tile sub-surface temperature PTSRF.
+    # 步骤 1.6：逐瓦片的次表层温度 PTSRF。
     # ------------------------------------------------------------------ #
     tsrf = _build_tsrf(inp, ngrid, ntile, dtype, device)
 
     # ------------------------------------------------------------------ #
-    # Step 1.6b: exchange-coefficient inversion (ZCOEF1).
+    # 步骤 1.6b：交换系数反演（ZCOEF1）。
     # ------------------------------------------------------------------ #
-    # PCFHTI / PCFQTI carry the upstream RG*PTSPHY*RVDIFTS rescaling;
-    # the SEB consumes the inverted "rho*Ch*|U|" form.
+    # PCFHTI / PCFQTI 携带上游的 RG*PTSPHY*RVDIFTS 重标定；
+    # SEB 消耗的是反演后的 "rho*Ch*|U|" 形式。
     ptmst_tile = ptmst.unsqueeze(-1) if ptmst.ndim == 1 else ptmst
     zcoef1 = 1.0 / (rg * RVDIFTS * ptmst_tile)
     rhochu = inp.pcfhti * zcoef1
     rhocqu = inp.pcfqti * zcoef1
 
     # ------------------------------------------------------------------ #
-    # Step 1.7: SURFSEB canonical call (#3).
+    # 步骤 1.7：SURFSEB 规范调用（第 3 次）。
     # ------------------------------------------------------------------ #
     seb_inp = SebInputs(
         sskm1m=inp.sskm1m, tskm1m=inp.tskm1m,
@@ -337,7 +322,7 @@ def _vdfdifh1s_core(
     )
     out = surf_seb(seb_inp, consts, config)
 
-    ptsk = out.ptsk           # call-#3 skin T (may be overwritten by #4)
+    ptsk = out.ptsk           # 第 3 次调用的皮肤温度（可能被第 4 次覆盖）
     pstr = out.pstr
     pg0 = out.pg0
     pssh = out.pssh
@@ -345,9 +330,9 @@ def _vdfdifh1s_core(
     pslh = out.pslh.clone() if inp.pevapsnw is not None else out.pslh
 
     # ------------------------------------------------------------------ #
-    # LESNML snow-melt repeat (call #4): if any column has a melting
-    # low-veg-snow tile (Fortran JT=5 = port TILE_LOW_VEG_SNOW=4),
-    # re-run SURFSEB with that tile pinned to RTS=RTT, LAMSK=100.
+    # LESNML 融雪重复（第 4 次调用）：若任一柱存在融化的
+    # 低植被雪瓦片（Fortran JT=5 = 移植版 TILE_LOW_VEG_SNOW=4），
+    # 则以该瓦片固定为 RTS=RTT、LAMSK=100 重新运行 SURFSEB。
     # ------------------------------------------------------------------ #
     if inp.lesnml and ntile > TILE_LOW_VEG_SNOW:
         ptsk, pstr, pg0, pssh, pjq, pslh = _lesnml_repeat(
@@ -356,15 +341,15 @@ def _vdfdifh1s_core(
         )
 
     # ------------------------------------------------------------------ #
-    # Step 1.7a: snow-under-forest evaporation.
-    # Fortran tile 7 == port TILE_HIGH_VEG_SNOW (6).
+    # 步骤 1.7a：林下积雪蒸发。
+    # Fortran 瓦片 7 == 移植版 TILE_HIGH_VEG_SNOW（6）。
     # ------------------------------------------------------------------ #
     if inp.pevapsnw is not None and ntile > TILE_HIGH_VEG_SNOW:
         pjq[:, TILE_HIGH_VEG_SNOW] = pjq[:, TILE_HIGH_VEG_SNOW] + inp.pevapsnw
         pslh[:, TILE_HIGH_VEG_SNOW] = pslh[:, TILE_HIGH_VEG_SNOW] + inp.pevapsnw * rlstt
 
     # ------------------------------------------------------------------ #
-    # Step 1.7c: skin T extrapolation to t+1.
+    # 步骤 1.7c：皮肤温度向 t+1 的外推。
     # ------------------------------------------------------------------ #
     ztpfac2 = 1.0 / RVDIFTS
     ztpfac3 = 1.0 - ztpfac2
@@ -378,7 +363,7 @@ def _vdfdifh1s_core(
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# 辅助函数
 # --------------------------------------------------------------------------- #
 def _build_tsrf(
     inp: DiffusionInputs,
@@ -387,19 +372,19 @@ def _build_tsrf(
     dtype: torch.dtype,
     device,
 ) -> torch.Tensor:
-    """Per-tile sub-surface temperature PTSRF (vdfdifh1s lines 372-388).
+    """逐瓦片的次表层温度 PTSRF（vdfdifh1s 第 372-388 行）。
 
-    Tile mapping (Fortran JT -> port idx):
-        1 water      -> PSST
-        2 ice        -> PTICE
-        3 wet skin   -> PTSM1M
-        4 low-veg dry-> PTSM1M
-        5 low-veg snow -> PTSNOW
-        6 high-veg dry -> PTSM1M
-        7 high-veg snow -> PTSNOW
-        8 bare soil  -> PTSM1M
-        9 lake       -> PTLICE if ice thicker than 1e-9 else PTLWML
-       10 urban      -> PTSM1M (not yet wired -- needs LEURBAN flag)
+    瓦片映射（Fortran JT -> 移植版索引）：
+        1 水体        -> PSST
+        2 海冰        -> PTICE
+        3 湿皮肤      -> PTSM1M
+        4 低植被干    -> PTSM1M
+        5 低植被雪    -> PTSNOW
+        6 高植被干    -> PTSM1M
+        7 高植被雪    -> PTSNOW
+        8 裸土        -> PTSM1M
+        9 湖泊        -> 冰厚超过 1e-9 时取 PTLICE，否则取 PTLWML
+       10 城镇        -> PTSM1M（尚未接线——需要 LEURBAN 开关）
     """
     tsrf = torch.empty((ngrid, ntile), dtype=dtype, device=device)
     tsrf[:, TILE_WATER] = inp.psst
@@ -419,22 +404,21 @@ def _build_tsrf(
         tsrf[:, TILE_BARE_SOIL] = inp.ptsm1m
     if ntile > TILE_LAKE and inp.phlice is not None \
             and inp.ptlice is not None and inp.ptlwml is not None:
-        # vdfdifh1s line 382: PHLICE > 1e-9 picks the ice skin T, else
-        # the mixed-layer T.
+        # vdfdifh1s 第 382 行：PHLICE > 1e-9 时选取冰面皮肤温度，
+        # 否则选取混合层温度。
         is_ice = (inp.phlice > _LAKE_HICE_MIN).to(dtype)
         tsrf[:, TILE_LAKE] = is_ice * inp.ptlice + (1.0 - is_ice) * inp.ptlwml
     elif ntile > TILE_LAKE:
-        # FLake prognostics not surfaced (use_flake=False stub branch).
-        # Fall back to PTSM1M so the lake tile is not left at the
-        # ``torch.empty`` allocation (uninitialised memory -- the same
-        # cross-column "leak" class as the urban tile below).
+        # FLake 预报量未暴露（use_flake=False 的占位分支）。
+        # 回退到 PTSM1M，以免湖泊瓦片停留在 ``torch.empty``
+        # 分配的内存上（未初始化内存——与下方城镇瓦片同类的
+        # 跨柱"泄漏"问题）。
         tsrf[:, TILE_LAKE] = inp.ptsm1m
     if ntile > TILE_URBAN:
-        # vdfdifh1s line 387: the urban tile's sub-surface T is PTSM1M
-        # (same as bare soil).  Without this the column is left at the
-        # ``torch.empty`` allocation -- *uninitialised memory*, which is
-        # batch-call-dependent and produced a cross-column "leak" that
-        # the n_tile=10 batch-independence test catches.
+        # vdfdifh1s 第 387 行：城镇瓦片的次表层温度为 PTSM1M
+        # （与裸土相同）。若无此行，该列将停留在 ``torch.empty``
+        # 分配的内存上——即*未初始化内存*，其取值依赖于批次调用，
+        # 会产生跨柱"泄漏"，n_tile=10 的批次无关性测试可捕获该问题。
         tsrf[:, TILE_URBAN] = inp.ptsm1m
     return tsrf
 
@@ -455,30 +439,29 @@ def _lesnml_repeat(
     dtype: torch.dtype,
     device,
 ) -> tuple:
-    """LESNML snow-melt repeat (call #4, vdfdifh1s lines 518-547).
+    """LESNML 融雪重复（第 4 次调用，vdfdifh1s 第 518-547 行）。
 
-    For columns where ``PFRTI(:,TILE_LOW_VEG_SNOW) >= 1e-6`` *and* the
-    call-#3 skin T on that tile is at melting (``ZTSK(:,5) >= RTT - 1e-6``),
-    pin that tile's ``TSRF`` to ``RTT`` and ``LAMSK`` to 100 W/m^2/K and
-    re-run SURFSEB.  The new outputs overwrite the call-#3 outputs on
-    *every* tile for those columns (matching the Fortran, which calls
-    SURFSEB on the whole KLON/NTILES slab rather than per-column).
+    对于满足 ``PFRTI(:,TILE_LOW_VEG_SNOW) >= 1e-6`` *并且*第 3 次调用
+    在该瓦片上的皮肤温度处于融点（``ZTSK(:,5) >= RTT - 1e-6``）的柱，
+    将该瓦片的 ``TSRF`` 固定为 ``RTT``、``LAMSK`` 固定为 100 W/m^2/K，
+    并重新运行 SURFSEB。对于这些柱，新输出会覆盖*所有*瓦片上的第 3 次
+    调用输出（与 Fortran 一致——Fortran 在整个 KLON/NTILES 切片上调用
+    SURFSEB，而非逐柱调用）。
     """
-    # Build the per-(grid,tile) repeat mask.  LREPEAT in Fortran is
-    # OR-reduced across columns; the SURFSEB call then runs on the
-    # whole slab.  We replicate that: the repeat happens iff any column
-    # triggers.
+    # 构建逐（格点，瓦片）的重复掩码。Fortran 中的 LREPEAT 是跨柱
+    # 做 OR 归约的；随后 SURFSEB 调用在整个切片上运行。此处复现
+    # 该行为：只要任一柱触发即进行重复调用。
     active = inp.pfrti[:, TILE_LOW_VEG_SNOW] >= _LESNML_FRAC_MIN
     melting = out.ptsk[:, TILE_LOW_VEG_SNOW] >= rtt - _LESNML_TSK_EPS
     any_repeat = (active & melting).any()
     if not any_repeat:
         return ptsk, pstr, pg0, pssh, pjq, pslh
 
-    # Pin TSRF and LAMSK on the low-veg-snow tile for melting columns.
+    # 对融化的柱，将低植被雪瓦片上的 TSRF 与 LAMSK 固定。
     tsrf_r = seb_inp.tsrf.clone()
     lamsk_r = seb_inp.lamsk.clone()
     mask = (active & melting).to(dtype)
-    # Pin to RTT wherever the mask is 1, keep original elsewhere.
+    # 掩码为 1 处固定为 RTT，其余位置保持原值。
     tsrf_r[:, TILE_LOW_VEG_SNOW] = (
         mask * rtt + (1.0 - mask) * tsrf_r[:, TILE_LOW_VEG_SNOW]
     )

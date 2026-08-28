@@ -1,9 +1,8 @@
-"""Monin-Obukhov surface-layer exchange coefficients (Fortran ``VEXCS``).
+"""Monin-Obukhov 近地层交换系数（Fortran ``VEXCS``）。
 
-Direct translation of ``surf/module/vexcs_mod.F90`` (48r1).  Solves the
-implicit relation between the bulk Richardson number and the stability
-parameter ``eta = z/L`` iteratively, then evaluates the scaled transfer
-coefficients::
+``surf/module/vexcs_mod.F90``（48r1）的直接翻译。迭代求解总体
+Richardson 数与稳定度参数 ``eta = z/L`` 之间的隐式关系，然后计算
+缩放后的输送系数::
 
     PCFM = rho * Cm * |U|     [kg/m^2/s]
     PCFH = rho * Ch * |U|     [kg/m^2/s]
@@ -11,39 +10,33 @@ coefficients::
     PKH  = Ch * |U|           [m/s]
     PKC  = Cc * |U|           [m/s]   (tracer, between lev and z0m)
 
-The algorithm (Beljaars 1990) has four sections, transcribed in order:
+该算法（Beljaars 1990）分为四节，按顺序转录如下：
 
-1. *Basic quantities* (sec. 2 of vexcs_mod.F90): the bulk Richardson
-   number ``ZRICLS``, the effective wind-shear ``ZDU2`` (incl. the W*
-   convective velocity scale), the neutral log-profile ratios and the
-   ``Z1DZ1D`` factor that appears in the back-substitution.
-2. *Initial guess* (sec. 3.1): if ``ldinit`` is True the routine builds
-   its own two-point initial guess -- the RITBL lookup for stable Ri,
-   the simple log-ratio for unstable.  Otherwise it uses the previous
-   step's ``PZDL``.
-3. *Secant iteration* (sec. 3.2-3.3): one back-substitution produces a
-   second approximation, then ``kitt`` linear-interpolation (Newton with
-   the derivative approximated from successive iterates) iterations.
-   A sign-flip safety keeps the iterates on the right side of zero.
-4. *Transfer coefficients* (sec. 4): a very-stable cap at
-   ``RCHBHDL * L`` truncates the profile to a finite NBL height, then
-   the scaled transfer coefficients follow from the integrated PSI
-   functions.
+1. *基本量*（vexcs_mod.F90 第 2 节）：总体 Richardson 数 ``ZRICLS``、
+   有效风切变 ``ZDU2``（含 W* 对流速度尺度）、中性对数廓线比值，
+   以及在回代中出现的 ``Z1DZ1D`` 因子。
+2. *初猜*（第 3.1 节）：若 ``ldinit`` 为 True，例程自行构造两点
+   初猜——稳定 Ri 查 RITBL 表，不稳定时用简单的对数比值。否则使用
+   上一步的 ``PZDL``。
+3. *割线迭代*（第 3.2-3.3 节）：一次回代产生第二近似，随后进行
+   ``kitt`` 次线性插值（以相继迭代近似导数的 Newton 法）迭代。
+   符号翻转保护使迭代值保持在零的正确一侧。
+4. *输送系数*（第 4 节）：在 ``RCHBHDL * L`` 处的强稳定截断将廓线
+   截断到有限的 NBL 高度，然后由积分后的 PSI 函数得到缩放后的
+   输送系数。
 
-Differentiability
+可微性
 -----------------
-Every branch (stable vs unstable, capping region) is evaluated with
-``torch.where`` so the routine is end-to-end differentiable under
-``enable_grad``.  Off-branch contributions are zero -- matching the
-piecewise Fortran semantics.  The RITBL initial-guess is detached
-(it is a constant table, never a function of the inputs).
+每个分支（稳定与不稳定、截断区域）均用 ``torch.where`` 求值，因此
+该例程在 ``enable_grad`` 下端到端可微。未选中分支的贡献为零——与
+分段 Fortran 语义一致。RITBL 初猜已 detach（它是常数表，绝不是输入
+的函数）。
 
-Layout
+布局
 ------
-All inputs/outputs are ``(Ngrid,)`` -- ``VEXCS`` is grid-mean.  The
-per-tile tiling in the upstream driver (``VDFEXCS``) sits above this
-kernel and is not implemented here; the port's SEB stage consumes the
-grid-mean coefficients broadcast across tiles.
+所有输入/输出均为 ``(Ngrid,)`` —— ``VEXCS`` 是格点平均量。上游驱动
+（``VDFEXCS``）中的逐斑块平铺位于此内核之上，此处未实现；本移植的
+SEB 阶段消费广播到各斑块的格点平均系数。
 """
 
 from __future__ import annotations
@@ -76,9 +69,11 @@ from ..tables.ritbl import (
 # Constants from YOS_EXC / YOS_EXCS that are not in PhysicalConstants.
 # --------------------------------------------------------------------------- #
 # Wind-speed floor for ZDU2 (REPDU2 in YOS_EXC). OpenIFS SURF
-# initialises this as (0.1 m/s)^2 in suvexc_mod.F90; using a much
-# smaller floor over-amplifies stable Richardson numbers in calm cases.
-REPDU2 = 1.0e-2
+# initialises this as (0.1 m/s)^2 in suvexc_mod.F90:
+#   REPDU2 = (0.1_JPRB)**2  ==  fl(0.1)*fl(0.1)  ==  0.010000000000000002
+# 1.0e-2 is one ulp lower (0.01) and diverges from the Fortran on every
+# calm-wind step where the clamp binds.
+REPDU2 = 0.1 * 0.1
 
 # von Karman constant (RKAP in YOS_EXC).  48r1 default.
 RKAP = 0.4
@@ -104,7 +99,7 @@ DEFAULT_KITT = 3
 # the branch via ``torch.where``.
 # --------------------------------------------------------------------------- #
 def psimu(eta: torch.Tensor) -> torch.Tensor:
-    """Unstable momentum PSI (Dyer-Hicks).
+    """不稳定动量 PSI（Dyer-Hicks）。
 
     ``PSIMU(eta) = log((1 + sqrt(sqrt(1 - 16*eta)))^2
                        * (1 + sqrt(1 - 16*eta)) / 8)
@@ -135,7 +130,7 @@ def psimu(eta: torch.Tensor) -> torch.Tensor:
 
 
 def psihu(eta: torch.Tensor) -> torch.Tensor:
-    """Unstable heat/moisture PSI (Dyer-Hicks).
+    """不稳定热量／水汽 PSI（Dyer-Hicks）。
 
     ``PSIHU(eta) = 2 * log((1 + sqrt(1 - 16*eta)) / 2)``
     """
@@ -152,40 +147,59 @@ def psihu(eta: torch.Tensor) -> torch.Tensor:
 
 
 def psims(eta: torch.Tensor) -> torch.Tensor:
-    """Stable momentum PSI (Holtslag-de Bruin).
+    """稳定动量 PSI（Holtslag-de Bruin）。
 
     ``PSIMS(eta) = -RCHBB*(eta - RCHBCD)*exp(-RCHBD*eta)
                    - RCHBA*eta - RCHBBCD``
     """
+    eta_stable = eta
+    if torch.is_grad_enabled():
+        # This function is selected only for eta>0. Prevent the unselected
+        # unstable branch from overflowing exp() inside torch.where.
+        eta_stable = torch.clamp(eta, min=0.0)
     return (
-        -RCHBB * (eta - RCHBCD) * torch.exp(-RCHBD * eta)
-        - RCHBA * eta
+        -RCHBB * (eta_stable - RCHBCD) * torch.exp(-RCHBD * eta_stable)
+        - RCHBA * eta_stable
         - RCHBBCD
     )
 
 
 def psihs(eta: torch.Tensor) -> torch.Tensor:
-    """Stable heat/moisture PSI (Holtslag-de Bruin with critical-Ri cap).
+    """稳定热量／水汽 PSI（带临界 Ri 上限的 Holtslag-de Bruin）。
 
     ``PSIHS(eta) = -RCHBB*(eta - RCHBCD)*exp(-RCHBD*eta)
                    - (1 + RCHB23A*eta)*sqrt(1 + RCHB23A*eta)
                    - RCHBBCD + 1``
     """
-    inner = 1.0 + RCHB23A * eta
+    eta_stable = eta
+    if torch.is_grad_enabled():
+        # PSIHS is selected only for eta>0; evaluating its exponential for
+        # an unselected, very unstable eta can overflow before torch.where
+        # masks the forward value and corrupt its backward product.
+        eta_stable = torch.clamp(eta, min=0.0)
+    inner = 1.0 + RCHB23A * eta_stable
+    # ``_psi_h`` selects this stable function with ``torch.where``. On the
+    # unselected unstable branch, inner can be negative and clamp(..., 0)
+    # gives sqrt(0) an infinite backward derivative. Raise only that inactive
+    # graph construction away from zero; the physical stable branch has
+    # inner > 1 and retains the original Fortran expression exactly.
+    sqrt_inner = torch.clamp(inner, min=0.0)
+    if torch.is_grad_enabled():
+        sqrt_inner = torch.clamp(sqrt_inner, min=torch.finfo(inner.dtype).eps)
     return (
-        -RCHBB * (eta - RCHBCD) * torch.exp(-RCHBD * eta)
-        - inner * torch.sqrt(torch.clamp(inner, min=0.0))
+        -RCHBB * (eta_stable - RCHBCD) * torch.exp(-RCHBD * eta_stable)
+        - inner * torch.sqrt(sqrt_inner)
         - RCHBBCD + 1.0
     )
 
 
 def _psi_m(eta: torch.Tensor) -> torch.Tensor:
-    """Momentum PSI on a mixed-sign eta (branch by sign)."""
+    """混合符号 eta 上的动量 PSI（按符号选择分支）。"""
     return torch.where(eta > 0.0, psims(eta), psimu(eta))
 
 
 def _psi_h(eta: torch.Tensor) -> torch.Tensor:
-    """Heat/moisture PSI on a mixed-sign eta (branch by sign)."""
+    """混合符号 eta 上的热量／水汽 PSI（按符号选择分支）。"""
     return torch.where(eta > 0.0, psihs(eta), psihu(eta))
 
 
@@ -194,11 +208,11 @@ def _psi_h(eta: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 @dataclass
 class ExchangeOutputs:
-    """Scaled Monin-Obukhov transfer coefficients (VEXCS outputs).
+    """缩放后的 Monin-Obukhov 输送系数（VEXCS 输出）。
 
-    All fields have shape ``(Ngrid,)``.  ``pcfm``/``pcfh``/``pcfq`` are
-    the rho-scaled coefficients that feed the SEB; ``pkh``/``pkc`` are
-    the unscaled (no rho) heat / tracer exchange velocities.
+    所有字段形状为 ``(Ngrid,)``。``pcfm``/``pcfh``/``pcfq`` 是经 rho
+    缩放、馈入 SEB 的系数；``pkh``/``pkc`` 是未缩放（不含 rho）的
+    热量／示踪物交换速度。
     """
 
     pcfm: torch.Tensor     # rho*Cm*|U|  [kg/m^2/s]
@@ -212,6 +226,42 @@ class ExchangeOutputs:
 # --------------------------------------------------------------------------- #
 # VEXCS
 # --------------------------------------------------------------------------- #
+
+# ------------------------------------------------------------------ #
+# Debug: per-call VEXCS internals (SURF_VEXCS_CSV), mirroring the F90
+# SURF_VEXCS_BIN records so the two can be diffed tile by tile.
+# ------------------------------------------------------------------ #
+import csv as _csv
+import os as _os
+
+_VEXCS_CSV = _os.environ.get("SURF_VEXCS_CSV", "").strip()
+_VEXCS_CALLS = 0
+
+
+def _vexcs_debug(zprh1_bs, zprh0_bs, zprm1_bs, zprm0_bs, zprh_bs, zprm_bs,
+                 zeta3, pcfh, pcfq, pcfm, zaux2, zdu2, zricls, zhu,
+                 zf2, zf3, zeta2, zeta3_c, zprm, zprh):
+    global _VEXCS_CALLS
+    if not _VEXCS_CSV:
+        return
+    groups = [t.reshape(-1) for t in (
+        zprh1_bs, zprh0_bs, zprm1_bs, zprm0_bs, zprh_bs, zprm_bs,
+        zeta3, pcfh, pcfq, pcfm, zaux2, zdu2, zricls, zhu,
+        zf2, zf3, zeta2, zeta3_c, zprm, zprh)]
+    ntile = groups[0].shape[0]
+    new = not _os.path.exists(_VEXCS_CSV)
+    with open(_VEXCS_CSV, "a", newline="") as fh:
+        w = _csv.writer(fh)
+        if new:
+            w.writerow(["call"] + ["%s_t%d" % (n, t)
+                                   for n in ("zprh1_bs", "zprh0_bs", "zprm1_bs", "zprm0_bs", "zprh_bs", "zprm_bs", "zeta3", "pcfh", "pcfq", "pcfm", "zaux2", "zdu2", "zricls", "zhu", "zf2", "zf3", "zeta2", "zeta3_c", "zprm", "zprh")
+                                   for t in range(ntile)])
+        row = [_VEXCS_CALLS]
+        for g in groups:
+            row += ["%r" % v for v in g.detach().cpu().tolist()]
+        w.writerow(row)
+    _VEXCS_CALLS += 1
+
 def vexcs(
     # lowest-level state
     pu: torch.Tensor,            # (Ngrid,)  u at lowest level
@@ -241,25 +291,24 @@ def vexcs(
     rparzi: float = RPARZI,
     rchbhdl: float = RCHBHDL,
 ) -> ExchangeOutputs:
-    """Compute Monin-Obukhov exchange coefficients (port of VEXCS).
+    """计算 Monin-Obukhov 交换系数（VEXCS 的移植）。
 
-    The keyword-only signature matches the upstream ``VEXCS`` dummy
-    argument list one-for-one; constants that the upstream pulls from
-    ``YDCST`` / ``YDEXC`` are taken from ``consts`` and the defaults at
-    the top of this module.
+    仅关键字签名与上游 ``VEXCS`` 形参列表一一对应；上游取自
+    ``YDCST`` / ``YDEXC`` 的常数，此处取自 ``consts`` 及本模块顶部
+    的默认值。
 
     Args
     ----
     pzdl0:
-        Previous-step ``z/L`` initial guess.  If ``None`` or if
-        ``ldinit`` is True the routine builds its own first guess from
-        the RITBL lookup / log-ratio (sec. 3.1, ``LDINIT=.T.`` branch).
+        上一步的 ``z/L`` 初猜。若为 ``None`` 或 ``ldinit`` 为 True，
+        例程通过 RITBL 查表／对数比值自行构造初猜（第 3.1 节，
+        ``LDINIT=.T.`` 分支）。
     kitt:
-        Number of secant iterations after the back-substitution.  The
-        upstream default is 3 (cold start) / 0..1 (warm start).
+        回代之后的割线迭代次数。上游默认值为 3（冷启动）／ 0..1
+        （暖启动）。
     ldinit:
-        Forces the internal first-guess path even when ``pzdl0`` is
-        provided; mirrors the upstream ``LDINIT`` flag.
+        即使提供了 ``pzdl0`` 也强制走内部初猜路径；对应上游的
+        ``LDINIT`` 标志。
     """
     # ------------------------------------------------------------------ #
     # 1. Constants and bookkeeping
@@ -273,7 +322,7 @@ def vexcs(
     # Upstream section-1 scalars (vexcs_mod.F90 183-189).
     zcon1 = rvtmp2 - retv       # contribution of humidity to buoyancy
     zcon2 = 2.0 / 3.0           # exponent for (W*)^2
-    zcon3 = rkap ** 2           # kappa^2 in neutral log-profiles
+    zcon3 = rkap * rkap         # kappa^2 (gfortran expands RKAP**2)
     zipbl = rparzi              # PBL height for W* scaling
 
     # ------------------------------------------------------------------ #
@@ -356,6 +405,12 @@ def vexcs(
     zhu = zprm ** 2 * z1dz1d / zprh
     zeta3 = zricls * zhu
     zf2 = zricls - zeta2 / zhu
+    zprh1_bs = zprh1
+    zprh0_bs = zprh0
+    zprm1_bs = zprm1
+    zprm0_bs = zprm0
+    zprh_bs = zprh
+    zprm_bs = zprm
 
     # ------------------------------------------------------------------ #
     # 3.3 KITT secant iterations (vexcs 369-406).
@@ -445,6 +500,9 @@ def vexcs(
     pkh = pcfh / rho
     pkc = zuabs * zcon3 / (zprm * zprc)
 
+    _vexcs_debug(zprh1_bs, zprh0_bs, zprm1_bs, zprm0_bs, zprh_bs, zprm_bs,
+                 zeta3, pcfh, pcfq, pcfm, zaux2, zdu2, zricls, zhu,
+                 zf2, zf3, zeta2, zeta3_c, zprm, zprh)
     return ExchangeOutputs(
         pcfm=pcfm, pcfh=pcfh, pcfq=pcfq,
         pkh=pkh, pkc=pkc, pzdl=zeta3,
@@ -465,13 +523,12 @@ def vexcss(
     pz0hm: torch.Tensor, pz0qm: torch.Tensor, pbuom: torch.Tensor,
     consts: ConstantBundle, ptmst: torch.Tensor, rvdifts: float = 1.0,
 ) -> ExchangeOutputs:
-    """Offline OSM ``VEXCSS`` exchange coefficients.
+    """离线 OSM ``VEXCSS`` 交换系数。
 
-    Fortran ``VEXCSS`` forms C-star coefficients already scaled by
-    ``RG * PTMST * PRVDIFTS`` for the VDF driver.  The public Python
-    exchange contract is instead the physical ``rho*C*|U|`` coefficient,
-    shared with :func:`vexcs`; the VDF scaling is applied once later when
-    building ``DiffusionInputs``.
+    Fortran ``VEXCSS`` 生成已为 VDF 驱动程序预先按
+    ``RG * PTMST * PRVDIFTS`` 缩放的 C-star 系数。而公开的 Python
+    交换接口约定采用物理量 ``rho*C*|U|`` 系数，与 :func:`vexcs`
+    共享；VDF 缩放在之后构建 ``DiffusionInputs`` 时统一施加一次。
     """
     rlpbb = 5.0
     rlpcc = 5.0
@@ -480,9 +537,21 @@ def vexcss(
     rd = consts.rd
     retv = consts.retv
     rvtmp2 = consts.rvtmp2
+    # Fortran branches before evaluating the fractional power.  Use a
+    # positive placeholder only in the inactive/autograd graph so the
+    # derivative of x**(2/3) at x=0 is never formed; the selected output
+    # remains exactly zero for PBUOM <= 0.
+    wstar_arg = (pbuom * RPARZI).clamp_min(0.0)
+    if torch.is_grad_enabled():
+        wstar_arg = torch.where(
+            pbuom > 0.0,
+            wstar_arg,
+            torch.full_like(wstar_arg, torch.finfo(wstar_arg.dtype).eps),
+        )
+    zwst2 = wstar_arg.pow(2.0 / 3.0)
+    zwst2 = torch.where(pbuom > 0.0, zwst2, torch.zeros_like(zwst2))
     zdu2 = torch.maximum(
-        pu.square() + pv.square()
-        + torch.where(pbuom > 0.0, (pbuom * RPARZI).clamp_min(0.0).pow(2.0 / 3.0), torch.zeros_like(pbuom)),
+        pu.square() + pv.square() + zwst2,
         torch.full_like(pu, REPDU2),
     )
     qsam = torch.minimum(pqsam, torch.full_like(pqsam, 0.1))
@@ -497,15 +566,28 @@ def vexcss(
     cdnh = 1.0 / (lnm * lnh)
     cdnq = 1.0 / (lnm * lnq)
     stable = zri > 0.0
-    z2s_st = torch.sqrt(1.0 + rlpdd * zri)
+    # Fortran evaluates only the selected stability branch.  ``where``
+    # evaluates both tensors in PyTorch, so keep the inactive stable sqrt
+    # finite for unstable columns to avoid NaN gradients.
+    z2s_st_arg = 1.0 + rlpdd * zri
+    if torch.is_grad_enabled():
+        z2s_st_arg = torch.clamp(z2s_st_arg, min=torch.finfo(z2s_st_arg.dtype).eps)
+    else:
+        z2s_st_arg = torch.clamp(z2s_st_arg, min=0.0)
+    z2s_st = torch.sqrt(z2s_st_arg)
     fm_st = cdnm * z2s_st / (z2s_st + 2.0 * rlpbb * zri)
     fh_st = cdnh / (1.0 + 3.0 * rlpbb * zri * z2s_st)
     fq_st = cdnq / (1.0 + 3.0 * rlpbb * zri * z2s_st)
-    z2s_un = torch.sqrt(torch.maximum(-zri, torch.full_like(zri, 1.0e-3)))
+    # The unstable branch uses max(-Ri, ZRIMIN).  Keep its inactive
+    # derivative finite when Ri is stable, where the max argument is zero.
+    z2s_un_arg = torch.maximum(-zri, torch.full_like(zri, 1.0e-3))
+    if torch.is_grad_enabled():
+        z2s_un_arg = torch.clamp(z2s_un_arg, min=torch.finfo(z2s_un_arg.dtype).eps)
+    z2s_un = torch.sqrt(z2s_un_arg)
     zcm = rlpcc * torch.sqrt(znlev / pz0mm)
     zch = rlpcc * torch.sqrt(znlev / pz0hm)
     zcq = rlpcc * torch.sqrt(znlev / pz0qm)
-    zrk3b = RKAP**2 * 3.0 * rlpbb
+    zrk3b = RKAP * RKAP * 3.0 * rlpbb
     fm_un = cdnm * (1.0 - 2.0 * rlpbb * zri / (1.0 + zrk3b * cdnm * zcm * z2s_un))
     fh_un = cdnh * (1.0 - 3.0 * rlpbb * zri / (1.0 + zrk3b * cdnh * zch * z2s_un))
     fq_un = cdnq * (1.0 - 3.0 * rlpbb * zri / (1.0 + zrk3b * cdnq * zcq * z2s_un))
@@ -515,7 +597,7 @@ def vexcss(
     # expects physical rho*C*|U| and applies the VDF scaling exactly once
     # in model.py, so undo the C-star time/gravity scaling here.
     aux = (rvdifts * ptmst * g / rd * paphms) / (pt * (1.0 + retv * pq))
-    cstar_scale = aux * torch.sqrt(zdu2) * RKAP**2
+    cstar_scale = aux * torch.sqrt(zdu2) * (RKAP * RKAP)
     scale = cstar_scale / (rvdifts * ptmst * g)
     pcfm = scale * torch.where(stable, fm_st, fm_un)
     pcfh = scale * torch.where(stable, fh_st, fh_un)

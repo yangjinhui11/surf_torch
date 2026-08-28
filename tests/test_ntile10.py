@@ -257,8 +257,13 @@ class TestNTile10BatchIndependence:
             kw = {}
             for f in dataclasses.fields(obj):
                 v = getattr(obj, f.name)
+                # Soil-layer thickness is shared across columns: its
+                # one-dimensional axis is (Nsoil,), not (Ngrid,).
+                shared_static = (
+                    isinstance(obj, Static) and f.name == "soil_thickness"
+                )
                 kw[f.name] = (v[i:i + 1] if isinstance(v, torch.Tensor)
-                              and v.dim() >= 1 else v)
+                              and v.dim() >= 1 and not shared_static else v)
             return type(obj)(**kw)
 
         ns0, d0 = model(slice1(state, 0), slice1(forcing, 0), slice1(static, 0))

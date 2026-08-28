@@ -1760,7 +1760,7 @@ class SurfRef:
         # 100/1000 -- sussoil_mod.F90:480-481).
         rsigormax = float(soil_table.consts.rsigormax)
         rsigormin = float(soil_table.consts.rsigormin)
-        rpsfr = float(getattr(soil_table.consts, "rpsfr", 1.0))
+        rpsfr = float(soil_table.consts.rpsfr)
         ptmst = float(inp.ptmst.item()) if torch.is_tensor(inp.ptmst) \
             else float(inp.ptmst)
         rsimp = float(soil_table.consts.rsimp)

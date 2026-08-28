@@ -325,7 +325,14 @@ def _slice_batch(obj, start: int, stop: int):
     kw = {}
     for f in dataclasses.fields(obj):
         v = getattr(obj, f.name)
-        if isinstance(v, torch.Tensor) and _is_batched(v):
+        # Static.soil_thickness is a shared soil-layer axis ``(Nsoil,)``;
+        # it is not a column axis even though it is one-dimensional. A
+        # rank-only rule would slice the four layer thicknesses in the
+        # single-column reference calls and corrupt water diagnostics.
+        shared_static = (
+            isinstance(obj, Static) and f.name == "soil_thickness"
+        )
+        if isinstance(v, torch.Tensor) and _is_batched(v) and not shared_static:
             kw[f.name] = v[start:stop]
         else:
             kw[f.name] = v

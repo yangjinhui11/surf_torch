@@ -1,74 +1,61 @@
-"""Skin-reservoir / canopy interception update (``SRFWL``).
+"""地表水库／冠层截留更新（``SRFWL``）。
 
-This module is the Python port of ``SRFWL`` -- the skin-reservoir
-(canopy interception) prognostic update used by ``SURFTSTP_CTL``
-(``surftstp_ctl_mod.F90:612``).  It advances the skin-reservoir water
-content ``PWL`` (intercepted water, kg/m^2) by one coupling interval
-and produces the throughfall fluxes ``PTSFC`` / ``PTSFL`` (convective
-/ large-scale rain reaching the soil) together with the per-tile
-interception-layer evaporation mismatch ``PEINTTI`` that the soil-
-moisture solve consumes.
+本模块是 ``SRFWL`` 的 Python 移植——即 ``SURFTSTP_CTL``
+（``surftstp_ctl_mod.F90:612``）所使用的地表水库（冠层截留）预报量更新。
+它将地表水库含水量 ``PWL``（截留水量，kg/m^2）推进一个耦合时间间隔，
+并产出到达土壤的穿透雨通量 ``PTSFC`` / ``PTSFL``（对流性／大尺度降水），
+以及土壤水分求解所消耗的逐斑块截留层蒸发不匹配量 ``PEINTTI``。
 
-What the scheme does
+方案内容
 --------------------
-The skin reservoir represents the water held on leaves and bare
-surfaces between rain events.  Over one coupling interval ``PTMST``
-the prognostic advances through five vectorisable stages
-(``srfwl_mod.F90`` 164-300):
+地表水库表示两次降雨事件之间滞留在叶片与裸面上的水分。在一个耦合时间
+间隔 ``PTMST`` 内，预报量通过五个可向量化阶段推进
+（``srfwl_mod.F90`` 164-300）：
 
-1. **Clamp to capacity** (label 2): ``PWL = clip(PWLM1M, 0, PWLMX)``.
-   Any clipping is booked onto ``PEINTTI(:,3)`` (the wet-skin tile) as
-   a virtual evaporation that the soil-W solve must see.
+1. **截断至容量上限**（label 2）：``PWL = clip(PWLM1M, 0, PWLMX)``。
+   任何截断都以虚拟蒸发的形式记到 ``PEINTTI(:,3)``（湿表皮斑块）上，
+   土壤水分求解必须看到这部分。
 
-2. **Evaporation of the reservoir** (label 3): when the wet-skin tile
-   evaporates (``PEVAPTI(:,3) < 0``) the reservoir is drawn down by
-   ``PTMST*PFRTI(:,3)*PEVAPTI(:,3)``, floored at zero.  The realised
-   flux (after the zero-floor) is booked onto ``PEINTTI(:,3)``.
+2. **水库蒸发**（label 3）：当湿表皮斑块蒸发时（``PEVAPTI(:,3) < 0``），
+   水库按 ``PTMST*PFRTI(:,3)*PEVAPTI(:,3)`` 减少，下限取零。实际
+   （取零下限之后）的通量记到 ``PEINTTI(:,3)`` 上。
 
-3. **Dew collection** (label 4): tiles 4/6/7/8/10 (port 3/5/6/7/9) with
-   a positive moisture flux deposit dew onto the reservoir up to
-   ``PWLMX``.  The snow-under-high-veg tile (F90 7 / port 6) excludes
-   the snow-under-canopy sublimation ``PEVAPSNW`` (only the liquid
-   fraction is intercepted).  Each realised dew increment is booked
-   onto the respective ``PEINTTI`` column.
+3. **露水收集**（label 4）：水汽通量为正的斑块 4/6/7/8/10（端口
+   3/5/6/7/9）向水库凝结露水，直至 ``PWLMX``。高植被下积雪斑块
+   （F90 7／端口 6）排除冠层下积雪升华 ``PEVAPSNW``（仅液态部分被
+   截留）。每个实际露水增量记到相应的 ``PEINTTI`` 列上。
 
-4. **Budget accumulation** (label 5): ``PFWEL1 = (PWL - PWLM1M)/PTMST``
-   (the net skin-reservoir flux tendency, kg/m^2/s).
+4. **收支累积**（label 5）：``PFWEL1 = (PWL - PWLM1M)/PTMST``
+   （净地表水库通量倾向，kg/m^2/s）。
 
-5. **Interception of precipitation** (label 6): large-scale and
-   convective rainfall is intercepted by the vegetation cover
-   ``(CVL+CVH)*RVINTER`` up to the remaining capacity ``PWLMX-PWL``.
-   The throughfall ``PTSFL`` / ``PTSFC`` is what reaches the soil.
+5. **降水截留**（label 6）：大尺度与对流降雨被植被覆盖度
+   ``(CVL+CVH)*RVINTER`` 截留，直至剩余容量 ``PWLMX-PWL``。
+   穿透雨 ``PTSFL`` / ``PTSFC`` 即到达土壤的部分。
 
-Sign convention
+符号约定
 ---------------
-``PEVAPTI`` is positive *downward* (dew/deposition into the surface),
-negative upward (evaporation).  ``PEINTTI`` follows the same
-convention: a positive value means the interception reservoir
-*absorbed* flux that the soil therefore does *not* see (so the soil-W
-solve subtracts it from its surface moisture input), a negative value
-means the reservoir *released* flux the soil must see as an extra
-input.  The soil-moisture solve consumes
-``PEINTTI = PEVAPTI(: realisable) - PEVAPTI(: intercepted)`` per tile.
+``PEVAPTI`` 以*向下*为正（露水／沉积进入地表），向上（蒸发）为负。
+``PEINTTI`` 遵循相同约定：正值表示截留水库*吸收*了通量，土壤因此
+*看不到*这部分（故土壤水分求解从其地表水汽输入中减去它）；负值表示
+水库*释放*了通量，土壤必须将其视为额外输入。土壤水分求解按斑块消耗
+``PEINTTI = PEVAPTI(: realisable) - PEVAPTI(: intercepted)``。
 
-Cold-start simplifications
+冷启动简化
 --------------------------
-* Convective rain ``PRSFC`` is zero on the cold start (the port's
-  :class:`Forcing` does not split convective vs large-scale precip),
-  so ``PTSFC`` stays zero; only the large-scale branch ``PRSFL`` is
-  active.  This matches the convention used for the soil-moisture
-  throughfall in :meth:`LandSurface._update_soil_moisture`.
-* ``PEVAPSNW`` (snow-under-forest evaporation) is zero until the
-  single-layer snow scheme threads it back; the dew-collection branch
-  therefore treats the snow-high-veg tile identically to the others.
+* 冷启动时对流降雨 ``PRSFC`` 为零（本移植的 :class:`Forcing` 不区分
+  对流与大尺度降水），故 ``PTSFC`` 保持为零；仅大尺度分支 ``PRSFL``
+  起作用。这与 :meth:`LandSurface._update_soil_moisture` 中土壤水分
+  穿透雨所用的约定一致。
+* 在单层雪方案将其接回之前，``PEVAPSNW``（林下积雪蒸发）为零；因此
+  露水收集分支对高植被积雪斑块的处理与其他斑块相同。
 
-Index convention
+索引约定
 ----------------
-All per-tile tensors are 0-indexed.  Fortran tile 3 (wet skin) maps to
-:data:`surf_pytorch.config.TILE_WET_SKIN` (2); the dew-collection tiles
-F90 4/6/7/8/10 map to port 3/5/6/7/9 (low-veg-dry / high-veg-dry /
-high-veg-snow / bare-soil / urban).  Tile indices are guarded by
-``ntile`` so a narrower slab does not raise.
+所有逐斑块张量均为 0 索引。Fortran 斑块 3（湿表皮）映射为
+:data:`surf_pytorch.config.TILE_WET_SKIN`（2）；露水收集斑块
+F90 4/6/7/8/10 映射为端口 3/5/6/7/9（低植被干／高植被干／
+高植被雪／裸土／城市）。斑块索引由 ``ntile`` 防护，较窄的斑块切片
+不会引发越界。
 """
 
 from __future__ import annotations
@@ -108,10 +95,10 @@ _DEW_TILES = (
 
 @dataclass
 class CanopyInputs:
-    """All inputs to the skin-reservoir update.
+    """地表水库更新的全部输入。
 
-    Each tensor is ``(Ngrid,)`` unless noted.  Per-tile fields are
-    ``(Ngrid, Ntile)``.  Naming mirrors the ``SRFWL`` dummy list.
+    除注明外，每个张量形状为 ``(Ngrid,)``。逐斑块字段为
+    ``(Ngrid, Ntile)``。命名对应 ``SRFWL`` 的形参列表。
     """
 
     # Coupling interval [s].
@@ -144,9 +131,9 @@ class CanopyInputs:
 
 @dataclass
 class CanopyOutputs:
-    """Outputs of the skin-reservoir update.
+    """地表水库更新的输出。
 
-    All ``(Ngrid,)`` except ``peintti`` which is ``(Ngrid, Ntile)``.
+    除 ``peintti`` 为 ``(Ngrid, Ntile)`` 外，其余均为 ``(Ngrid,)``。
     """
 
     pwl: torch.Tensor               # PWL  t+1 skin-reservoir water [kg/m^2]
@@ -163,29 +150,27 @@ def update_canopy(
     inp: CanopyInputs,
     veg_table: VegTable,
 ) -> CanopyOutputs:
-    """Advance the skin-reservoir prognostic by one coupling step.
+    """将地表水库预报量推进一个耦合步长。
 
-    Vectorised transcription of ``SRFWL`` (``srfwl_mod.F90`` 164-300).
-    Every stage is elementwise torch math over the ``(Ngrid,)`` /
-    ``(Ngrid, Ntile)`` axes, so a single call reproduces the upstream
-    JL loop exactly (including the per-tile dew-collection loop, which
-    is column-local).
+    ``SRFWL``（``srfwl_mod.F90`` 164-300）的向量化转录。每个阶段都是
+    在 ``(Ngrid,)`` / ``(Ngrid, Ntile)`` 轴上的逐元素 torch 运算，
+    因此单次调用即可精确复现上游的 JL 循环（包括逐斑块的露水收集
+    循环，该循环是列局部的）。
 
     Parameters
     ----------
     inp:
-        :class:`CanopyInputs` -- t-1 state + fluxes + masks.
+        :class:`CanopyInputs` —— t-1 时刻状态 + 通量 + 掩码。
     veg_table:
-        :class:`VegTable` -- provides ``RVINTER`` (interception
-        efficiency, default 0.5).
+        :class:`VegTable` —— 提供 ``RVINTER``（截留效率，
+        默认 0.5）。
 
     Returns
     -------
     :class:`CanopyOutputs`
-        The t+1 skin-reservoir water ``PWL``, the net flux tendency
-        ``PFWEL1``, the convective / large-scale throughfall
-        ``PTSFC`` / ``PTSFL`` and the per-tile interception-layer
-        evaporation mismatch ``PEINTTI``.
+        t+1 时刻的地表水库水量 ``PWL``、净通量倾向 ``PFWEL1``、
+        对流／大尺度穿透雨 ``PTSFC`` / ``PTSFL``，以及逐斑块截留层
+        蒸发不匹配量 ``PEINTTI``。
     """
     device = inp.pwlm1m.device
     dtype = inp.pwlm1m.dtype
@@ -276,7 +261,12 @@ def update_canopy(
         zwl_dew = pwl
         headroom = inp.pwlmx - zeptiny - zwl_dew
         inc = torch.minimum(headroom, zqhf)
-        pwl = torch.where(is_dew, zwl_dew + inc, pwl)
+        # SRFWL: PWL = ZWL + MIN(PWLMX - ZEPTINY - ZWL, ZQHFLW).
+        # Do not clamp the subsequent addition to PWLMX: doing so changes
+        # its IEEE-754 rounding and can erase the tiny non-zero tile fraction
+        # retained by the reference implementation.
+        dew_candidate = zwl_dew + inc
+        pwl = torch.where(is_dew, dew_candidate, pwl)
         # Book the realised dew increment onto PEINTTI(:, tile).
         realised_dew = (pwl - zwl_dew) * ztmst
         dew_touched_reservoir = dew_touched_reservoir | (is_dew & (pwl != zwl_dew))
@@ -343,10 +333,10 @@ def update_canopy(
 
 
 def _tile_frac(pfrti: torch.Tensor, port_idx: int, ntile: int) -> torch.Tensor:
-    """Return ``pfrti[:, port_idx]`` clamped to zero if the tile is absent.
+    """返回 ``pfrti[:, port_idx]``；若该斑块不存在则返回零。
 
-    Mirrors the ``ntile``-guard pattern used throughout the port so a
-    narrower tile slab (e.g. a 4-tile test) does not index out of range.
+    对应本移植中贯穿使用的 ``ntile`` 防护模式，使较窄的斑块切片
+    （例如 4 斑块测试）不会索引越界。
     """
     ngrid = pfrti.shape[0]
     if port_idx >= ntile:

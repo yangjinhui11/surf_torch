@@ -131,6 +131,70 @@ class TestLandSurfaceForward:
         assert torch.allclose(actual[:, 3], expected_low)
         assert torch.allclose(actual[:, 5], expected_high)
 
+    def test_offline_vexcs_uses_vsurf_moist_static_energy(self, monkeypatch):
+        """OSM offline passes VSURF moist static energy to VEXCS."""
+        import surf_pytorch.model as model_mod
+        from surf_pytorch.physics.exchange import ExchangeOutputs
+
+        state, forcing, static, cfg = _make_inputs(N=1)
+        seen = {}
+
+        def fake_vexcs(*args, **kwargs):
+            seen["pcpts"] = args[7].reshape(1, cfg.n_tile).clone()
+            seen["pqsam"] = args[8].reshape(1, cfg.n_tile).clone()
+            n = args[0].shape[0]
+            one = torch.ones(n, dtype=cfg.dtype)
+            zero = torch.zeros(n, dtype=cfg.dtype)
+            return ExchangeOutputs(one, one, one, zero, zero, zero)
+
+        monkeypatch.setattr(model_mod, "compute_vexcs", fake_vexcs)
+        model = LandSurface(cfg)
+        model._per_tile_monin_obukhov_coeffs(forcing, static, state)
+
+        expected = state.skin_t * model.consts.cpd * (
+            1.0 + model.consts.rvtmp2 * seen["pqsam"]
+        )
+        assert torch.allclose(seen["pcpts"], expected)
+
+    def test_vsurf_absent_high_veg_snow_uses_rtt_only_for_saturation(self, monkeypatch):
+        """Match VSURF's tile-7 epsilon-fraction temperature guard.
+
+        The Fortran guard changes ZTSK only for PQS/PDQS/PQSAM.  PCPTS is
+        deliberately formed from the original PTSKM1M afterward.
+        """
+        import surf_pytorch.model as model_mod
+        from surf_pytorch.physics.exchange import ExchangeOutputs
+        from surf_pytorch.utils import qsat
+
+        state, forcing, static, cfg = _make_inputs(N=1)
+        hot_tile7 = state.skin_t.clone()
+        hot_tile7[:, TILE_HIGH_VEG_SNOW] = 310.0
+        state = dataclasses.replace(state, skin_t=hot_tile7)
+        seen = {}
+
+        def fake_vexcs(*args, **kwargs):
+            seen["pcpts"] = args[7].reshape(1, cfg.n_tile).clone()
+            seen["pqsam"] = args[8].reshape(1, cfg.n_tile).clone()
+            n = args[0].shape[0]
+            one = torch.ones(n, dtype=cfg.dtype)
+            zero = torch.zeros(n, dtype=cfg.dtype)
+            return ExchangeOutputs(one, one, one, zero, zero, zero)
+
+        monkeypatch.setattr(model_mod, "compute_vexcs", fake_vexcs)
+        model = LandSurface(cfg)
+        model._per_tile_monin_obukhov_coeffs(forcing, static, state)
+
+        expected_qsat = qsat(
+            model.consts.rtt.reshape(1), forcing.p_surf, model.consts,
+        )
+        assert torch.equal(
+            seen["pqsam"][:, TILE_HIGH_VEG_SNOW], expected_qsat,
+        )
+        expected_pcpts = state.skin_t * model.consts.cpd * (
+            1.0 + model.consts.rvtmp2 * seen["pqsam"]
+        )
+        assert torch.equal(seen["pcpts"], expected_pcpts)
+
     def test_external_vup_z0_override_feeds_vexcs(self, monkeypatch):
         import surf_pytorch.model as model_mod
         from surf_pytorch.physics.exchange import ExchangeOutputs
@@ -336,6 +400,38 @@ class TestLandSurfaceForward:
         for value in (diag.str_tile, diag.h_flux_tile, diag.slh_tile, diag.g0_tile):
             assert torch.isfinite(value).all()
 
+    def test_budget_diagnostics_close_for_bare_soil(self):
+        state, forcing, static, cfg = _make_inputs(N=3)
+        frac = torch.zeros_like(static.tile_frac_base)
+        frac[:, 7] = 1.0
+        static = dataclasses.replace(
+            static,
+            tile_frac_base=frac,
+            land_frac=torch.ones_like(static.land_frac),
+        )
+        model = LandSurface(cfg)
+
+        new_state, diag = model(state, forcing, static)
+
+        assert diag.precip_input is not None
+        assert diag.evaporation_input is not None
+        assert diag.surface_runoff is not None
+        assert diag.subsurface_runoff is not None
+        assert diag.water_storage is not None
+        assert diag.water_storage_change is not None
+        assert diag.water_budget_residual is not None
+        assert diag.energy_budget_residual is not None
+        assert torch.isfinite(diag.water_budget_residual).all()
+        assert torch.isfinite(diag.energy_budget_residual).all()
+        assert diag.water_budget_residual.abs().max().item() < 1.0e-6
+
+        thickness = static.soil_thickness
+        rho_water = float(model.soil_table.consts.rho_h2o)
+        expected_storage = (
+            new_state.soil_w_liq * thickness * rho_water
+        ).sum(dim=-1) + new_state.snow_w + new_state.skin_water
+        assert torch.allclose(diag.water_storage, expected_storage)
+
     def test_chainable_across_steps(self):
         # The model can be called repeatedly with the previous output.
         state, forcing, static, cfg = _make_inputs(N=2)
@@ -363,6 +459,40 @@ class TestLandSurfaceForward:
         assert state.skin_t.grad is not None
         assert torch.isfinite(state.skin_t.grad).all()
         assert state.skin_t.grad.abs().sum() > 0
+
+    def test_multistep_grad_is_finite_without_snow_or_precipitation(self):
+        """Masked snow throughfall divisions must not poison a trajectory adjoint.
+
+        Snow-free, rain-free columns have a zero throughfall denominator. The
+        forward snow branch is masked, but its inactive division still exists
+        in the autograd graph unless the denominator is made safe. Advancing
+        two steps makes this a regression test for the unrolled trajectory,
+        rather than a one-step output smoke test.
+        """
+        state, forcing, static, cfg = _make_inputs(N=2, differentiable=True)
+        tair = forcing.t.clone().requires_grad_(True)
+        forcing = dataclasses.replace(forcing, t=tair)
+        model = LandSurface(cfg)
+        for _ in range(2):
+            state, _ = model(state, forcing, static)
+        gradient = torch.autograd.grad(state.skin_t.sum(), tair)[0]
+        assert torch.isfinite(gradient).all()
+        assert gradient.abs().sum() > 0
+
+    def test_nighttime_shortwave_zero_branch_has_finite_gradient(self):
+        """Inactive SW rescaling must not create a backward 0/0."""
+        state, forcing, static, cfg = _make_inputs(N=2, differentiable=True)
+        tair = forcing.t.clone().requires_grad_(True)
+        forcing = dataclasses.replace(
+            forcing,
+            t=tair,
+            fr_so=torch.zeros_like(forcing.fr_so),
+            mu0=torch.zeros_like(forcing.mu0),
+        )
+        model = LandSurface(cfg)
+        output, _ = model(state, forcing, static)
+        gradient = torch.autograd.grad(output.skin_t.sum(), tair)[0]
+        assert torch.isfinite(gradient).all()
 
     def test_no_grad_default(self):
         # differentiable=False (default) -> no graph built.

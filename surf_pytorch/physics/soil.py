@@ -1,79 +1,72 @@
-"""HTESSEL soil temperature update (apparent heat capacity + implicit Thomas).
+"""HTESSEL 土壤温度更新（表观热容 + 隐式 Thomas 求解）。
 
-This module is the Python port of the soil-temperature branch of
-``SURFTSTP_CTL`` (``surf/module/surftstp_ctl_mod.F90`` section 3),
-comprising three upstream routines:
+本模块是 ``SURFTSTP_CTL`` 土壤温度分支的 Python 移植
+（``surf/module/surftstp_ctl_mod.F90`` 第 3 节），
+由三个上游例程组成：
 
-* ``SRFRCGS`` (``surf/module/srfrcgs_mod.F90``) -- apparent volumetric
-  heat capacity.  The "apparent" qualifier is the freeze/melt term: when
-  soil water is in the freeze window ``[RTF2, RTF1]`` the heat capacity
-  absorbs the latent-heat release/uptake via
-  ``PCTSA = ZRCSOIL - RLMLT*RHOH2O*ZWA*ZDFDT`` with
-  ``ZDFDT = -0.5*RTF4*COS(RTF4*(T-RTF3))`` (the derivative of the liquid
-  fraction ``F(T) = 0.5*(1 - SIN(RTF4*(T-RTF3)))`` from SRFENE).
+* ``SRFRCGS`` (``surf/module/srfrcgs_mod.F90``) -- 表观体积热容。
+  "表观"（apparent）一词指的是冻结/融化项：当土壤水分处于冻结窗口
+  ``[RTF2, RTF1]`` 内时，热容通过
+  ``PCTSA = ZRCSOIL - RLMLT*RHOH2O*ZWA*ZDFDT`` 吸收潜热的释放/吸收，
+  其中 ``ZDFDT = -0.5*RTF4*COS(RTF4*(T-RTF3))``
+  （即 SRFENE 中液态水比例 ``F(T) = 0.5*(1 - SIN(RTF4*(T-RTF3)))`` 的导数）。
 
-* ``SRFTS``  (``surf/module/srfts_mod.F90``)     -- assembles the
-  tridiagonal coefficients for the soil-temperature solve: net surface
-  heat flux ``ZSURFL``, Peters-Liddard / Kersten thermal conductivity
-  ``ZDIF``, layer heat capacity ``ZCDZ = PCTSA*RDAT``, and the RHS.
+* ``SRFTS``  (``surf/module/srfts_mod.F90``)     -- 组装土壤温度求解的
+  三对角系数：地表净热通量 ``ZSURFL``、Peters-Liddard / Kersten
+  热导率 ``ZDIF``、层热容 ``ZCDZ = PCTSA*RDAT``，以及右端项。
 
-* ``SRFWDIFS`` (``surf/module/srfwdifs_mod.F90``) -- the Thomas
-  tridiagonal solver.  Despite the ``W`` (water) prefix, this is a
-  generic solver used for both soil temperature (from ``SRFTS``) and
-  soil moisture (from the M5b path).  It carries the ``LDALLAYS`` flag
-  that lets ``SRFTS`` opt out of solving below the top layer.
+* ``SRFWDIFS`` (``surf/module/srfwdifs_mod.F90``) -- Thomas 三对角求解器。
+  尽管带有 ``W``（水）前缀，这是一个通用求解器，同时用于土壤温度
+  （来自 ``SRFTS``）和土壤水分（来自 M5b 路径）。它携带 ``LDALLAYS``
+  标志，允许 ``SRFTS`` 选择不求解顶层以下的层次。
 
-The new temperature is closed by
-``PTSA = PTSAM1M*ZCONS2 + ZTSA`` with
-``ZCONS2 = 1 - 1/RSIMP`` (over-implicit time weight, RSIMP=1 in the
-offline driver so ZCONS2=0 and the new T is the Thomas solution
-``ZTSA`` itself -- i.e. a fully implicit Euler step).
+新温度由下式闭合：
+``PTSA = PTSAM1M*ZCONS2 + ZTSA``，其中
+``ZCONS2 = 1 - 1/RSIMP``（超隐式时间权重；离线驱动中 RSIMP=1，
+因此 ZCONS2=0，新温度 T 就是 Thomas 解 ``ZTSA`` 本身——即全隐式
+Euler 步）。
 
-Steps reproduced (SRFTS section numbers)
+复现的步骤（SRFTS 节号）
 ----------------------------------------
-1.  Computational constants
-    ``ZCONS1 = PTMST*RSIMP``, ``ZCONS2 = 1 - 1/RSIMP``.
+1.  计算常数
+    ``ZCONS1 = PTMST*RSIMP``，``ZCONS2 = 1 - 1/RSIMP``。
 
-2.  Net surface heat flux ``ZSURFL`` (SRFTS lines 183-218):
-    fractional average of net SW + net LW + (sensible + latent) over the
-    four soil-viewing tiles (wet-skin 3, low-veg-dry 4, high-veg-dry 6,
-    bare-soil 8) plus the snow-bottom heat flux ``PGSN``.
+2.  地表净热通量 ``ZSURFL``（SRFTS 第 183-218 行）：
+    对四个面向土壤的贴块（湿皮肤 3、低植被-干 4、高植被-干 6、
+    裸土 8）上的净短波 + 净长波 +（感热 + 潜热）做面积加权平均，
+    再加上雪底热通量 ``PGSN``。
 
-3.  Per-layer thermal conductivity ``ZDIF`` (SRFTS lines 223-247,
-    Peters-Liddard / Kersten formula):
-    ``ZLAMBDASAT = RLAMSAT1M * RLAMBDAICE**(WSAT-W) * RLAMBDAWAT**W``,
-    ``ZKERSTEN   = RKERST2*LOG10(MAX(RKERST1, W/WSAT)) + RKERST3``,
-    ``ZDIF       = RLAMBDADRYM + ZKERSTEN*(ZLAMBDASAT - RLAMBDADRYM)``.
+3.  逐层热导率 ``ZDIF``（SRFTS 第 223-247 行，
+    Peters-Liddard / Kersten 公式）：
+    ``ZLAMBDASAT = RLAMSAT1M * RLAMBDAICE**(WSAT-W) * RLAMBDAWAT**W``，
+    ``ZKERSTEN   = RKERST2*LOG10(MAX(RKERST1, W/WSAT)) + RKERST3``，
+    ``ZDIF       = RLAMBDADRYM + ZKERSTEN*(ZLAMBDASAT - RLAMBDADRYM)``。
 
-4.  Thomas coefficient assembly (SRFTS lines 252-281):
-    ``ZLST(JK) = ZCONS1*(ZDIF(JK)+ZDIF(JK+1))/(RDAT(JK)+RDAT(JK+1))``
-    for the inter-layer thermal coupling (half-level JK+1/2), and
-    ``ZCDZ(JK) = PCTSA(JK)*RDAT(JK)`` for the layer heat capacity.
-    Surface RHS ``ZRHS(:,1) = PTMST*ZSURFL/ZCDZ(:,1)`` injects the net
-    surface flux; deeper-layer RHS are zero (no internal sources).
-    The bottom layer ``ZLST(:,KLEVS) = 0`` enforces zero-flux lower BC.
+4.  Thomas 系数组装（SRFTS 第 252-281 行）：
+    层间热耦合（半层 JK+1/2）
+    ``ZLST(JK) = ZCONS1*(ZDIF(JK)+ZDIF(JK+1))/(RDAT(JK)+RDAT(JK+1))``，
+    以及层热容 ``ZCDZ(JK) = PCTSA(JK)*RDAT(JK)``。
+    地表右端项 ``ZRHS(:,1) = PTMST*ZSURFL/ZCDZ(:,1)`` 注入地表净通量；
+    深层的右端项为零（无内部源项）。
+    底层 ``ZLST(:,KLEVS) = 0`` 强制零通量下边界条件。
 
-5.  Thomas solve (SRFWDIFS): see :func:`_solve_tridiag`.
+5.  Thomas 求解（SRFWDIFS）：见 :func:`_solve_tridiag`。
 
-6.  New temperature ``PTSA = PTSAM1M*ZCONS2 + ZTSA``.
+6.  新温度 ``PTSA = PTSAM1M*ZCONS2 + ZTSA``。
 
-Cold-start simplifications
+冷启动简化
 --------------------------
-With RSIMP=1 (offline-driver default) ZCONS2=0, so the solver is a
-straightforward fully-implicit step and the per-tile ZSURFL collapses to
-the four-tile fractional average.  Snow-bottom heat flux ``PGSN`` is
-zero here (M6 snow not yet wired) and snow evaporation mismatch
-``PEMSSN`` is zero, matching the cold-start assumption documented in the
-M5 design notes.
+当 RSIMP=1（离线驱动默认值）时 ZCONS2=0，因此求解器就是一个
+直接的全隐式步，且逐贴块的 ZSURFL 退化为四贴块的面积加权平均。
+此处雪底热通量 ``PGSN`` 为零（M6 雪方案尚未接入），雪蒸发不匹配量
+``PEMSSN`` 为零，与 M5 设计文档中记录的冷启动假设一致。
 
-Sign convention
+符号约定
 ---------------
-``ZSURFL`` is positive *downward* (into the soil), consistent with the
-SURFSEB ground-heat-flux convention documented in
-:mod:`surf_pytorch.physics.seb`.  Sensible and latent heat fluxes from
-``VDFDIFH1S`` follow the same convention; the latent contribution is
-``RLVTT*PEVAP`` (evaporation is positive, removing energy from the soil
-as latent heat of vapourisation).
+``ZSURFL`` 以*向下*（进入土壤）为正，与
+:mod:`surf_pytorch.physics.seb` 中记录的 SURFSEB 地面热通量约定一致。
+来自 ``VDFDIFH1S`` 的感热和潜热通量遵循相同的约定；潜热贡献为
+``RLVTT*PEVAP``（蒸发为正，以汽化潜热的形式从土壤中带走能量）。
 """
 
 from __future__ import annotations
@@ -97,16 +90,16 @@ from ..tables.soil import SoilTable
 
 
 # --------------------------------------------------------------------------- #
-# Hard-wired constants (yoevdf / yos_soil)
+# 硬编码常数（yoevdf / yos_soil）
 # --------------------------------------------------------------------------- #
-# RRCSICE -- volumetric heat capacity of sea ice (sussoil line 467).
-# Surf points (LDLAND=.F., LDSICE=.F.) get PCTSA=0 so they never feed the
-# temperature solve; we mirror that here by zeroing the whole profile.
+# RRCSICE -- 海冰的体积热容（sussoil 第 467 行）。
+# Surf 点（LDLAND=.F., LDSICE=.F.）的 PCTSA=0，因此它们永远不会进入
+# 温度求解；这里通过将整个廓线置零来镜像该行为。
 _RRCSICE = 1.884e6
 
-# RGH2O -- volumetric heat capacity of liquid water (sussoil line 135),
-# used by SRFRCG in the sea-ice branch (ZGICE = 0.5*RGH2O).  Surf points
-# are zeroed regardless, but the constant is kept here for parity.
+# RGH2O -- 液态水的体积热容（sussoil 第 135 行），
+# 由 SRFRCG 在海冰分支中使用（ZGICE = 0.5*RGH2O）。Surf 点
+# 无论如何都会被置零，但为保持一致性此处保留该常数。
 _RGH2O = 4.18e6
 
 _SRFT_DEBUG_STEP = 0
@@ -114,66 +107,64 @@ _SRFW_DEBUG_STEP = 0
 
 
 # --------------------------------------------------------------------------- #
-# Soil-temperature branch (SRFRCGS + SRFTS + SRFWDIFS)
+# 土壤温度分支（SRFRCGS + SRFTS + SRFWDIFS）
 # --------------------------------------------------------------------------- #
 @dataclass
 class SoilTempInputs:
-    """All inputs to the HTESSEL soil-temperature solve.
+    """HTESSEL 土壤温度求解的全部输入。
 
-    Each tensor is ``(Ngrid, Nsoil)`` for per-(grid,layer) fields, per-grid
-    fields are ``(Ngrid,)`` and per-tile flux fields are ``(Ngrid, Ntile)``.
-    Naming mirrors the Fortran dummy list of ``SRFTS`` so a side-by-side
-    audit is easy.
+    逐（格点，层）场的张量为 ``(Ngrid, Nsoil)``，逐格点场为
+    ``(Ngrid,)``，逐贴块通量场为 ``(Ngrid, Ntile)``。
+    命名与 ``SRFTS`` 的 Fortran 哑元列表一致，便于并排审查。
 
-    Cold-start note: ``pgsn`` (PGSN, ground heat flux from the snow deck
-    to the soil) is zero until the M6 single-layer snow prognostic is
-    wired; passing a non-zero value is harmless and forwards-compatible.
+    冷启动说明：``pgsn``（PGSN，从雪层到土壤的地面热通量）在 M6
+    单层雪预报量接入之前为零；传入非零值是无害的，且向前兼容。
     """
 
-    # ---- Soil state at t-1 ----
-    ptsam1m: torch.Tensor            # PTSAM1M  soil temperature    [K]      (Ngrid, Nsoil)
-    pwsam1m: torch.Tensor            # PWSAM1M  soil moisture       [m3/m3]  (Ngrid, Nsoil)
+    # ---- t-1 时刻的土壤状态 ----
+    ptsam1m: torch.Tensor            # PTSAM1M  土壤温度          [K]      (Ngrid, Nsoil)
+    pwsam1m: torch.Tensor            # PWSAM1M  土壤湿度          [m3/m3]  (Ngrid, Nsoil)
 
-    # ---- Per-tile fluxes (from VDFDIFH1S / SURFSEB) ----
-    pfrti: torch.Tensor              # PFRTI    tile fractions     [-]      (Ngrid, Ntile)
-    pahfsti: torch.Tensor            # PAHFSTI  tile sensible heat  [W/m^2]  (Ngrid, Ntile)
-    pevapti: torch.Tensor            # PEVAPTI  tile moisture flux  [kg/m^2/s] (Ngrid, Ntile)
-    pssrflti: torch.Tensor           # PSSRFLTI tile net SW         [W/m^2]  (Ngrid, Ntile)
+    # ---- 逐贴块通量（来自 VDFDIFH1S / SURFSEB） ----
+    pfrti: torch.Tensor              # PFRTI    贴块面积比        [-]      (Ngrid, Ntile)
+    pahfsti: torch.Tensor            # PAHFSTI  贴块感热通量      [W/m^2]  (Ngrid, Ntile)
+    pevapti: torch.Tensor            # PEVAPTI  贴块水汽通量      [kg/m^2/s] (Ngrid, Ntile)
+    pssrflti: torch.Tensor           # PSSRFLTI 贴块净短波        [W/m^2]  (Ngrid, Ntile)
 
-    # ---- Per-grid radiation ----
-    pslrfl: torch.Tensor             # PSLRFL   net LW              [W/m^2]  (Ngrid,)
+    # ---- 逐格点辐射 ----
+    pslrfl: torch.Tensor             # PSLRFL   净长波            [W/m^2]  (Ngrid,)
 
-    # ---- Snow-bottom heat flux (M6 forward-compat; zero at cold start) ----
-    pgsn: torch.Tensor               # PGSN     ground heat flux from snow  [W/m^2] (Ngrid,)
+    # ---- 雪底热通量（M6 向前兼容；冷启动时为零） ----
+    pgsn: torch.Tensor               # PGSN     来自雪的地面热通量 [W/m^2] (Ngrid,)
 
-    # ---- Static descriptors ----
-    ksoty: torch.Tensor              # KSOTY    soil texture type  [long]   (Ngrid,)  0..7
-    pcvl: torch.Tensor               # PCVL     low-veg  cover     [-]      (Ngrid,)
-    pcvh: torch.Tensor               # PCVH     high-veg cover     [-]      (Ngrid,)
+    # ---- 静态描述量 ----
+    ksoty: torch.Tensor              # KSOTY    土壤质地类型      [long]   (Ngrid,)  0..7
+    pcvl: torch.Tensor               # PCVL     低植被覆盖度      [-]      (Ngrid,)
+    pcvh: torch.Tensor               # PCVH     高植被覆盖度      [-]      (Ngrid,)
 
-    # ---- Masks ----
-    ldland: torch.Tensor             # LDLAND   land mask (bool)            (Ngrid,)
+    # ---- 掩膜 ----
+    ldland: torch.Tensor             # LDLAND   陆地掩膜（bool）            (Ngrid,)
 
-    # ---- Timestep ----
-    ptmst: torch.Tensor              # PTMST    timestep            [s]     scalar
+    # ---- 时间步长 ----
+    ptmst: torch.Tensor              # PTMST    时间步长          [s]     标量
 
-    # SRFT uses tiled net longwave (PSLRFLTI).  Keep pslrfl above for
-    # legacy SRFTS-style callers and tests; when this field is present it
-    # takes precedence in the surface heat-flux assembly.
+    # SRFT 使用逐贴块的净长波（PSLRFLTI）。保留上面的 pslrfl 以兼容
+    # 旧式 SRFTS 风格的调用方和测试；当该字段存在时，它在地表热通量
+    # 组装中优先使用。
     pslrflti: Optional[torch.Tensor] = None  # (Ngrid, Ntile) [W/m^2]
 
 
 @dataclass
 class SoilTempOutputs:
-    """All outputs of the HTESSEL soil-temperature solve."""
+    """HTESSEL 土壤温度求解的全部输出。"""
 
-    ptsa: torch.Tensor               # PTSA  new soil temperature  [K]     (Ngrid, Nsoil)
-    pctsa: torch.Tensor              # PCTSA apparent heat capacity [J/K/m^3] (Ngrid, Nsoil)
+    ptsa: torch.Tensor               # PTSA  新的土壤温度        [K]     (Ngrid, Nsoil)
+    pctsa: torch.Tensor              # PCTSA 表观热容            [J/K/m^3] (Ngrid, Nsoil)
 
-    # Surface net heat flux into the top soil layer (positive downward).
-    # Surfaced as a diagnostic so the energy-balance closure check can be
-    # run from the model.forward() without re-deriving it.
-    zsurfl: torch.Tensor             # ZSURFL surface net heat flux [W/m^2] (Ngrid,)
+    # 进入土壤顶层的地表净热通量（向下为正）。
+    # 作为诊断量输出，以便无需重新推导即可从 model.forward()
+    # 进行能量平衡闭合检查。
+    zsurfl: torch.Tensor             # ZSURFL 地表净热通量       [W/m^2] (Ngrid,)
 
 
 def compute_soil_temperature(
@@ -184,29 +175,28 @@ def compute_soil_temperature(
     *,
     differentiable: Optional[bool] = None,
 ) -> SoilTempOutputs:
-    """Run the HTESSEL soil-temperature solve (SRFRCGS + SRFTS + SRFWDIFS).
+    """运行 HTESSEL 土壤温度求解（SRFRCGS + SRFTS + SRFWDIFS）。
 
     Args
     ----
     inp:
-        :class:`SoilTempInputs` -- packed soil state, fluxes and masks.
+        :class:`SoilTempInputs` -- 打包的土壤状态、通量与掩膜。
     soil_table:
-        :class:`surf_pytorch.tables.soil.SoilTable` -- per-class LUT
-        (wsat, lambdadry, lamsat1, rcsoil) and class-agnostic thermal
-        scalars (rsimp, rlambdace, rlambdawat, rkerst1/2/3).
+        :class:`surf_pytorch.tables.soil.SoilTable` -- 逐类别查找表
+        （wsat、lambdadry、lamsat1、rcsoil）以及与类别无关的热力
+        标量（rsimp、rlambdace、rlambdawat、rkerst1/2/3）。
     consts:
-        :class:`ConstantBundle` -- provides ``rtt``, ``rlmlt``, ``rlvtt``
-        and the freeze-ramp endpoints ``rtf1..rtf4``.
+        :class:`ConstantBundle` -- 提供 ``rtt``、``rlmlt``、``rlvtt``
+        以及冻结过渡区端点 ``rtf1..rtf4``。
     config:
-        :class:`SurfConfig` -- ``n_soil`` selects the soil-layer count
-        and ``soil_thickness`` provides ``RDAT``.
+        :class:`SurfConfig` -- ``n_soil`` 选定土壤层数，
+        ``soil_thickness`` 提供 ``RDAT``。
     differentiable:
-        Override ``config.differentiable`` for this call.
+        为本次调用覆盖 ``config.differentiable``。
 
     Returns
     -------
-    :class:`SoilTempOutputs` -- new temperature, apparent heat capacity
-    and the surface net heat flux diagnostic.
+    :class:`SoilTempOutputs` -- 新温度、表观热容以及地表净热通量诊断量。
     """
     diff = config.differentiable if differentiable is None else differentiable
 
@@ -225,14 +215,14 @@ def _soil_temperature_core(
     consts: ConstantBundle,
     config: SurfConfig,
 ) -> SoilTempOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部：假定 no_grad / enable_grad 的决定已经做出。"""
     ngrid = inp.ptsam1m.shape[0]
     nlevs = config.n_soil
     dtype = inp.ptsam1m.dtype
     device = inp.ptsam1m.device
 
-    # Scalar constants (evaluated in the same order as the Fortran so
-    # compound expressions match to the last ULP).
+    # 标量常数（按与 Fortran 相同的顺序求值，使复合表达式
+    # 到最后一个 ULP 都一致）。
     rlmlt = consts.rlmlt
     rlvtt = consts.rlvtt
     rtt = consts.rtt
@@ -245,9 +235,9 @@ def _soil_temperature_core(
     rsimp = soil_table.consts.rsimp
     ptmst = inp.ptmst
 
-    # Per-class LUT columns indexed by soil type (0..7; index 0 is the
-    # water sentinel with all zeros -- gather returns 0 there, which is
-    # correct because surf points are masked out below anyway).
+    # 按土壤类型索引的逐类别查找表列（0..7；索引 0 是水体哨兵值，
+    # 全部为零——gather 在那里返回 0，这是正确的，因为 surf 点
+    # 在下方会被掩膜掉）。
     ksoty = inp.ksoty.long().detach()
     wsat = soil_table.gather("wsat", ksoty)             # (Ngrid,)
     lambdadry = soil_table.gather("lambdadry", ksoty)   # (Ngrid,)
@@ -255,16 +245,16 @@ def _soil_temperature_core(
     rcsoil = soil_table.gather("rcsoil", ksoty)         # (Ngrid,)
     wcap = soil_table.gather("wcap", ksoty)             # (Ngrid,)
 
-    # Soil-layer thicknesses RDAT (sussoil lines 178-181).  Broadcast to
-    # (Ngrid, Nsoil) so the per-layer expressions vectorise; the
-    # temperature solve uses these as plain per-layer scalars.
+    # 土壤层厚度 RDAT（sussoil 第 178-181 行）。广播到
+    # (Ngrid, Nsoil)，使逐层表达式可以向量化；温度求解
+    # 将这些作为普通的逐层标量使用。
     rdat = _soil_thickness(config, dtype, device)       # (Nsoil,)
     rdat_b = rdat.expand(ngrid, nlevs)                  # (Ngrid, Nsoil)
 
     land = inp.ldland.to(dtype)                         # (Ngrid,)  1 / 0
 
     # ------------------------------------------------------------------ #
-    # Step 1: SRFRCGS -- apparent volumetric heat capacity.
+    # 步骤 1：SRFRCGS -- 表观体积热容。
     # ------------------------------------------------------------------ #
     pctsa = _apparent_heat_capacity(
         inp.ptsam1m, wcap, rcsoil, inp.pcvl, inp.pcvh,
@@ -273,7 +263,7 @@ def _soil_temperature_core(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 2: SRFTS section 2 -- net surface heat flux ZSURFL.
+    # 步骤 2：SRFTS 第 2 节 -- 地表净热通量 ZSURFL。
     # ------------------------------------------------------------------ #
     zsurfl = _surface_net_heat_flux(
         inp.pfrti, inp.pssrflti, inp.pslrfl,
@@ -282,9 +272,9 @@ def _soil_temperature_core(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 3: SRFT section 3 -- per-layer thermal conductivity ZDIF.
-    # The offline namelist default uses LESOILCOND=.TRUE.; keep the old
-    # ZFF=0 path available for the standalone SURF_REF_SOILT test helper.
+    # 步骤 3：SRFT 第 3 节 -- 逐层热导率 ZDIF。
+    # 离线 namelist 默认使用 LESOILCOND=.TRUE.；保留旧的 ZFF=0 路径，
+    # 供独立的 SURF_REF_SOILT 测试辅助程序使用。
     # ------------------------------------------------------------------ #
     zdif = _thermal_conductivity(
         inp.pwsam1m, inp.ptsam1m, wsat, lambdadry, lamsat1,
@@ -295,18 +285,18 @@ def _soil_temperature_core(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 4: SRFTS section 4 -- Thomas coefficient assembly.
+    # 步骤 4：SRFTS 第 4 节 -- Thomas 系数组装。
     # ------------------------------------------------------------------ #
     zcons1 = ptmst * rsimp
-    # ZLST is the half-level thermal coupling; Fortran indexes it 1..KLEVS
-    # but only uses 1..KLEVS-1 (ZLST(:,KLEVS)=0 enforces zero lower BC).
+    # ZLST 是半层热耦合；Fortran 将其索引为 1..KLEVS，
+    # 但只使用 1..KLEVS-1（ZLST(:,KLEVS)=0 强制零下边界条件）。
     zlst = torch.zeros((ngrid, nlevs), dtype=dtype, device=device)
     zcdz = torch.zeros((ngrid, nlevs), dtype=dtype, device=device)
     zrhs = torch.zeros((ngrid, nlevs), dtype=dtype, device=device)
 
-    # Layers 1..KLEVS-1 use the inter-layer coupling
-    #   ZLST(JK) = ZCONS1*(ZDIF(JK)+ZDIF(JK+1))/(RDAT(JK)+RDAT(JK+1)).
-    # The bottom layer ZLST(:,KLEVS) stays zero (zero-flux lower BC).
+    # 层 1..KLEVS-1 使用层间耦合
+    #   ZLST(JK) = ZCONS1*(ZDIF(JK)+ZDIF(JK+1))/(RDAT(JK)+RDAT(JK+1))。
+    # 底层 ZLST(:,KLEVS) 保持为零（零通量下边界条件）。
     if nlevs > 1:
         zdif_lo = zdif[:, :-1]                          # ZDIF(:,1..KLEVS-1)
         zdif_hi = zdif[:, 1:]                           # ZDIF(:,2..KLEVS)
@@ -316,10 +306,10 @@ def _soil_temperature_core(
 
     zcdz = pctsa * rdat_b                              # ZCDZ = PCTSA*RDAT
 
-    # Surface RHS injects the net surface flux into the top layer.
-    # ZRHS(:,1) = PTMST*ZSURFL/ZCDZ(:,1).  Guard ZCDZ(:,1) > 0; surf
-    # points have ZCDZ=0 and are masked out, but a safe divide keeps the
-    # autograd graph finite everywhere.
+    # 地表右端项将地表净通量注入顶层。
+    # ZRHS(:,1) = PTMST*ZSURFL/ZCDZ(:,1)。保护 ZCDZ(:,1) > 0；surf
+    # 点的 ZCDZ=0 且会被掩膜掉，但安全除法可保持 autograd 图
+    # 处处有限。
     zcdz1_safe = torch.where(
         zcdz[:, 0] != 0.0, zcdz[:, 0], torch.ones_like(zcdz[:, 0])
     )
@@ -327,19 +317,21 @@ def _soil_temperature_core(
     zrhs[:, 0] = torch.where(zcdz[:, 0] != 0.0, zrhs[:, 0], torch.zeros_like(zrhs[:, 0]))
 
     # ------------------------------------------------------------------ #
-    # Step 5: SRFWDIFS -- Thomas tridiagonal solve.
+    # 步骤 5：SRFWDIFS -- Thomas 三对角求解。
     # ------------------------------------------------------------------ #
     ztsa = _solve_tridiag(inp.ptsam1m, zlst, zrhs, zcdz, land, rsimp)
 
     _write_srft_debug(
         inp.ptsam1m, inp.pwsam1m, zsurfl, inp.pgsn, zdif, zlst, zcdz, zrhs, ztsa,
         inp.ptsam1m * (1.0 - 1.0 / rsimp) + ztsa,
+        inp.pfrti, inp.pssrflti, inp.pslrfl, inp.pslrflti,
+        inp.pahfsti, inp.pevapti, rlvtt,
     )
 
     # ------------------------------------------------------------------ #
-    # Step 6: SRFTS section 7 -- new temperatures.
-    #   PTSA = PTSAM1M*ZCONS2 + ZTSA,  ZCONS2 = 1 - 1/RSIMP.
-    # Surf points keep their t-1 temperature (LDLAND=.F. branch).
+    # 步骤 6：SRFTS 第 7 节 -- 新温度。
+    #   PTSA = PTSAM1M*ZCONS2 + ZTSA,  ZCONS2 = 1 - 1/RSIMP。
+    # Surf 点保留其 t-1 时刻的温度（LDLAND=.F. 分支）。
     # ------------------------------------------------------------------ #
     zcons2 = 1.0 - 1.0 / rsimp
     ptsa_land = inp.ptsam1m * zcons2 + ztsa
@@ -361,8 +353,15 @@ def _write_srft_debug(
     zrhs: torch.Tensor,
     ztsa: torch.Tensor,
     ptsa_land: torch.Tensor,
+    pfrti: torch.Tensor,
+    pssrflti: torch.Tensor,
+    pslrfl: torch.Tensor,
+    pslrflti: Optional[torch.Tensor],
+    pahfsti: torch.Tensor,
+    pevapti: torch.Tensor,
+    rlvtt: float,
 ) -> None:
-    """Optional CSV diagnostic matching the Fortran SRFT debug columns."""
+    """可选的 CSV 诊断，与 Fortran SRFT 调试列对应。"""
     global _SRFT_DEBUG_STEP
     path = os.environ.get("SURF_TORCH_SRFT_DEBUG_CSV")
     if not path:
@@ -390,11 +389,40 @@ def _write_srft_debug(
 
     write_header = not os.path.exists(path)
     rows = []
+    f3 = pfrti[:, TILE_WET_SKIN]
+    f4 = pfrti[:, TILE_LOW_VEG_DRY]
+    f6 = pfrti[:, TILE_HIGH_VEG_DRY]
+    f8 = pfrti[:, TILE_BARE_SOIL]
+    zssrfl = (
+        f3 * pssrflti[:, TILE_WET_SKIN]
+        + f4 * pssrflti[:, TILE_LOW_VEG_DRY]
+        + f6 * pssrflti[:, TILE_HIGH_VEG_DRY]
+        + f8 * pssrflti[:, TILE_BARE_SOIL]
+    )
+    if pslrflti is None:
+        zslrfl = (f3 + f4 + f6 + f8) * pslrfl
+    else:
+        zslrfl = (
+            f3 * pslrflti[:, TILE_WET_SKIN]
+            + f4 * pslrflti[:, TILE_LOW_VEG_DRY]
+            + f6 * pslrflti[:, TILE_HIGH_VEG_DRY]
+            + f8 * pslrflti[:, TILE_BARE_SOIL]
+        )
+    zthfl = (
+        f3 * (pahfsti[:, TILE_WET_SKIN] + rlvtt * pevapti[:, TILE_WET_SKIN])
+        + f4 * (pahfsti[:, TILE_LOW_VEG_DRY] + rlvtt * pevapti[:, TILE_LOW_VEG_DRY])
+        + f6 * (pahfsti[:, TILE_HIGH_VEG_DRY] + rlvtt * pevapti[:, TILE_HIGH_VEG_DRY])
+        + f8 * (pahfsti[:, TILE_BARE_SOIL] + rlvtt * pevapti[:, TILE_BARE_SOIL])
+    )
+
     arrays = [
         ptsam1m.detach().cpu(),
         pwsam1m.detach().cpu(),
         zsurfl.detach().cpu(),
         pgsn.detach().cpu(),
+        zssrfl.detach().cpu(),
+        zslrfl.detach().cpu(),
+        zthfl.detach().cpu(),
         zdif.detach().cpu(),
         zlst.detach().cpu(),
         zcdz.detach().cpu(),
@@ -402,13 +430,17 @@ def _write_srft_debug(
         ztsa.detach().cpu(),
         ptsa_land.detach().cpu(),
     ]
-    ptsam1m_c, pwsam1m_c, zsurfl_c, pgsn_c, zdif_c, zlst_c, zcdz_c, zrhs_c, ztsa_c, ptsa_c = arrays
+    (
+        ptsam1m_c, pwsam1m_c, zsurfl_c, pgsn_c, zssrfl_c, zslrfl_c,
+        zthfl_c, zdif_c, zlst_c, zcdz_c, zrhs_c, ztsa_c, ptsa_c,
+    ) = arrays
     for jl in indices:
         rows.append([
             _SRFT_DEBUG_STEP, jl + 1,
             *[float(ptsam1m_c[jl, k]) for k in range(4)],
             *[float(pwsam1m_c[jl, k]) for k in range(4)],
             float(zsurfl_c[jl]), float(pgsn_c[jl]),
+            float(zssrfl_c[jl]), float(zslrfl_c[jl]), float(zthfl_c[jl]),
             *[float(zdif_c[jl, k]) for k in range(4)],
             *[float(zlst_c[jl, k]) for k in range(4)],
             *[float(zcdz_c[jl, k]) for k in range(4)],
@@ -421,7 +453,7 @@ def _write_srft_debug(
         "step", "jl",
         "ptsa_in1", "ptsa_in2", "ptsa_in3", "ptsa_in4",
         "pwsa_in1", "pwsa_in2", "pwsa_in3", "pwsa_in4",
-        "zsurfl", "pgsn",
+        "zsurfl", "pgsn", "zssrfl", "zslrfl", "zthfl",
         "zdif1", "zdif2", "zdif3", "zdif4",
         "zlst1", "zlst2", "zlst3", "zlst4",
         "zcdz1", "zcdz2", "zcdz3", "zcdz4",
@@ -438,16 +470,16 @@ def _write_srft_debug(
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# 辅助函数
 # --------------------------------------------------------------------------- #
 def _soil_thickness(
     config: SurfConfig, dtype: torch.dtype, device,
 ) -> torch.Tensor:
-    """Return RDAT (soil layer thicknesses, m) as a 1-D tensor.
+    """以 1 维张量返回 RDAT（土壤层厚度，m）。
 
-    Mirrors sussoil lines 178-181: (0.07, 0.21, 0.72, 1.89) for the
-    4-layer default.  SurfConfig.soil_thickness is the source of truth so
-    configurations with non-default layer counts keep working.
+    对应 sussoil 第 178-181 行：4 层默认为 (0.07, 0.21, 0.72, 1.89)。
+    SurfConfig.soil_thickness 是唯一权威来源，因此采用非默认层数的
+    配置仍可正常工作。
     """
     return torch.as_tensor(
         config.soil_thickness, dtype=dtype, device=device
@@ -456,8 +488,8 @@ def _soil_thickness(
 
 def _apparent_heat_capacity(
     ptsam1m: torch.Tensor,
-    wcap: torch.Tensor,        # (Ngrid,) per-class field capacity
-    rcsoil: torch.Tensor,      # (Ngrid,) per-class dry-soil heat capacity
+    wcap: torch.Tensor,        # (Ngrid,) 逐类别田间持水量
+    rcsoil: torch.Tensor,      # (Ngrid,) 逐类别干土热容
     pcvl: torch.Tensor,        # (Ngrid,)
     pcvh: torch.Tensor,        # (Ngrid,)
     land: torch.Tensor,        # (Ngrid,) 1/0
@@ -467,32 +499,31 @@ def _apparent_heat_capacity(
     nlevs: int,
     dtype: torch.dtype, device,
 ) -> torch.Tensor:
-    """SRFRCGS -- apparent volumetric heat capacity (J/K/m^3).
+    """SRFRCGS -- 表观体积热容（J/K/m^3）。
 
-    Reproduces srfrcgs_mod.F90 lines 132-188.  For land points::
+    复现 srfrcgs_mod.F90 第 132-188 行。对于陆地点::
 
         ZDFDT = -0.5*RTF4*COS(RTF4*(T-RTF3))   if RTF2 < T < RTF1 else 0
         ZWA   = (PCVL + PCVH) * RWCAPM(JS)
         PCTSA = RRCSOILM(JS) - RLMLT*RHOH2O*ZWA*ZDFDT
 
-    Surf points (LDLAND=.F.) are zeroed; sea-ice points use RRCSICE on
-    the top layer and zero below (not exercised here -- the offline
-    driver runs the sea-ice branch through SRFI, and the port routes sea
-    ice via a separate path).
+    Surf 点（LDLAND=.F.）被置零；海冰点在顶层使用 RRCSICE、下层为零
+    （此处不涉及——离线驱动通过 SRFI 运行海冰分支，本移植将海冰
+    经由单独路径处理）。
     """
     t = ptsam1m
     in_freeze = (t > rtf2) & (t < rtf1)
     zdfdt = -0.5 * rtf4 * torch.cos(rtf4 * (t - rtf3))
     zdfdt = torch.where(in_freeze, zdfdt, torch.zeros_like(zdfdt))
 
-    # ZWA = (PCVL + PCVH) * RWCAPM(JS) -- per-class field capacity scaled
-    # by the vegetation cover.  Broadcast (Ngrid,) -> (Ngrid, Nsoil).
+    # ZWA = (PCVL + PCVH) * RWCAPM(JS) -- 逐类别田间持水量乘以
+    # 植被覆盖度。广播 (Ngrid,) -> (Ngrid, Nsoil)。
     zwa = (pcvl + pcvh) * wcap                       # (Ngrid,)
     zwa_b = zwa[:, None].expand(-1, nlevs)
 
     pctsa = rcsoil[:, None] - rlmlt * rho_h2o * zwa_b * zdfdt   # (Ngrid, Nsoil)
 
-    # Surf points: zero whole profile (LDLAND=.F., LDSICE=.F. branch).
+    # Surf 点：整个廓线置零（LDLAND=.F., LDSICE=.F. 分支）。
     land_b = land[:, None].to(dtype)
     pctsa = torch.where(land_b != 0.0, pctsa, torch.zeros_like(pctsa))
     return pctsa
@@ -510,18 +541,17 @@ def _surface_net_heat_flux(
     dtype: torch.dtype, device,
     pslrflti: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """SRFTS section 2 -- net surface heat flux ZSURFL (positive downward).
+    """SRFTS 第 2 节 -- 地表净热通量 ZSURFL（向下为正）。
 
-    Reproduces srfts_mod.F90 lines 183-218.  The four soil-viewing tiles
-    are wet-skin (3), low-veg-dry (4), high-veg-dry (6), bare-soil (8).
-    Their tile fractions sum to ~1 over land (the rest are water / ice /
-    snow tiles) so the fractional average is just the tile-weighted sum;
-    the snow-bottom heat flux ``PGSN`` is added as a grid-mean term.
+    复现 srfts_mod.F90 第 183-218 行。四个面向土壤的贴块是
+    湿皮肤（3）、低植被-干（4）、高植被-干（6）、裸土（8）。
+    它们的贴块面积比在陆地上之和约为 1（其余是水体/冰/雪贴块），
+    因此面积加权平均就是贴块加权求和；雪底热通量 ``PGSN``
+    作为格点平均项加入。
 
-    The lake special-case (SRFTS lines 205-213, LEFLAKE branch) is not
-    transcribed here: the offline driver has LEFLAKE=.FALSE. and the M5
-    port leaves lake tiles routed through a separate path.  Passing a
-    non-zero PGSN for snow is M6-forward-compatible.
+    湖泊特例（SRFTS 第 205-213 行，LEFLAKE 分支）此处未转写：
+    离线驱动中 LEFLAKE=.FALSE.，且 M5 移植将湖泊贴块经由单独
+    路径处理。为雪传入非零 PGSN 是 M6 向前兼容的。
     """
     f3 = pfrti[:, TILE_WET_SKIN]
     f4 = pfrti[:, TILE_LOW_VEG_DRY]
@@ -552,9 +582,8 @@ def _surface_net_heat_flux(
 
     zsurfl = zssrfl + zslrfl + zthfl + pgsn
 
-    # Surf points: ZSURFL=0 (SRFTS line 216 ELSE branch).  Masked here so
-    # the diagnostic carries the land-only value; the tridiag RHS uses
-    # this masked field.
+    # Surf 点：ZSURFL=0（SRFTS 第 216 行 ELSE 分支）。此处掩膜，
+    # 使诊断量只携带陆地值；三对角右端项使用该掩膜后的场。
     land_mask = land.to(dtype)
     zsurfl = torch.where(land_mask != 0.0, zsurfl, torch.zeros_like(zsurfl))
     return zsurfl
@@ -567,19 +596,19 @@ def _thermal_conductivity(
     lambdadry: torch.Tensor,   # (Ngrid,)
     lamsat1: torch.Tensor,     # (Ngrid,)
     land: torch.Tensor,
-    soil_consts,               # SoilConstants dataclass
+    soil_consts,               # SoilConstants 数据类
     rtf1: float, rtf2: float, rtf3: float, rtf4: float,
     nlevs: int,
     dtype: torch.dtype, device,
     *,
     lesoilcond: bool = True,
 ) -> torch.Tensor:
-    """SRFT section 3 -- per-layer soil thermal conductivity ZDIF.
+    """SRFT 第 3 节 -- 逐层土壤热导率 ZDIF。
 
-    Default path matches ``srft_mod.F90`` with ``LESOILCOND=.TRUE.`` and
-    the ``FSOILTCOND`` statement function from ``fcsurf.h``::
+    默认路径对应 ``srft_mod.F90`` 在 ``LESOILCOND=.TRUE.`` 时的情形，
+    并使用 ``fcsurf.h`` 中的 ``FSOILTCOND`` 语句函数::
 
-        ZFF        = temperature-dependent frozen fraction
+        ZFF        = 依赖于温度的冻结比例
         ZWU        = WSAT * (1 - ZFF)
         ZLWT       = RLAMBDAWAT ** ZWU
         ZLIC       = RLAMBDAICE ** (WSAT * ZFF)
@@ -588,11 +617,11 @@ def _thermal_conductivity(
         ZKERSTEN   = RKERST2 * LOG10(ZCOND) + RKERST3
         ZDIF       = RLAMBDADRYM + ZKERSTEN * (ZLAMBDASAT - RLAMBDADRYM)
 
-    ``lesoilcond=False`` selects the standalone ``SURF_REF_SOILT`` helper
-    branch: ``ZFF=0`` and ``ZWU=W``.
+    ``lesoilcond=False`` 选择独立的 ``SURF_REF_SOILT`` 辅助分支：
+    ``ZFF=0`` 且 ``ZWU=W``。
 
-    Vectorised over (Ngrid, Nsoil); per-class columns broadcast across
-    the soil-axis.  Surf points stay zero (LDLAND=.F. branch).
+    在 (Ngrid, Nsoil) 上向量化；逐类别列沿土壤维广播。
+    Surf 点保持为零（LDLAND=.F. 分支）。
     """
     w = pwsam1m
     t = ptsam1m
@@ -613,6 +642,9 @@ def _thermal_conductivity(
             torch.ones_like(t),
             torch.where(t < rtf1, zff_ramp, torch.zeros_like(t)),
         )
+        # SRFT 最终会用 fcsurf.h 中的 FSOILTCOND 语句函数
+        # 覆盖其展开的热导率。逐字匹配该函数，
+        # 包括除法和指数分组方式。
         zwu = wsat_b * (1.0 - zff)
         zlic_exp = wsat_b * zff
     else:
@@ -623,7 +655,7 @@ def _thermal_conductivity(
     zlic = rlambdace ** zlic_exp
     zlambdasat = lamsat1_b * zlic * zlwt
 
-    zcond = torch.clamp(w / wsat_b, min=rkerst1)   # MAX(RKERST1, W/WSAT)
+    zcond = torch.maximum(torch.full_like(w, rkerst1), w / wsat_b)
     zkersten = rkerst2 * torch.log10(zcond) + rkerst3
 
     zdif = lambdadry_b + zkersten * (zlambdasat - lambdadry_b)
@@ -634,65 +666,61 @@ def _thermal_conductivity(
 
 
 def _solve_tridiag(
-    pwsam1m: torch.Tensor,    # actually PTSAM1M here (generic solver)
-    pcfw: torch.Tensor,       # ZLST (lambda-star, half-level coupling)
-    prhsw: torch.Tensor,      # ZRHS (right-hand side)
+    pwsam1m: torch.Tensor,    # 此处实际是 PTSAM1M（通用求解器）
+    pcfw: torch.Tensor,       # ZLST（lambda-star，半层耦合）
+    prhsw: torch.Tensor,      # ZRHS（右端项）
     pcdz: torch.Tensor,       # ZCDZ = PCTSA*RDAT
     land: torch.Tensor,
     rsimp: float,
 ) -> torch.Tensor:
-    """SRFWDIFS -- Thomas tridiagonal solver, batched over Ngrid.
+    """SRFWDIFS -- Thomas 三对角求解器，在 Ngrid 上批量处理。
 
-    Despite the ``W`` prefix this is a generic solver used for both soil
-    temperature (called from SRFTS) and soil moisture (called from the
-    M5b path).  The semantics are identical; the variable names mirror
-    the Fortran dummy list so the side-by-side audit is clean.
+    尽管带有 ``W`` 前缀，这是一个通用求解器，同时用于土壤温度
+    （由 SRFTS 调用）和土壤水分（由 M5b 路径调用）。两者的语义
+    完全一致；变量名与 Fortran 哑元列表一致，便于并排审查。
 
-    Algorithm (srfwdifs_mod.F90 lines 117-176, LDALLAYS=.TRUE.)::
+    算法（srfwdifs_mod.F90 第 117-176 行，LDALLAYS=.TRUE.）::
 
         ZTPFAC2       = 1/RSIMP
         PWSADIF(:,JK) = ZTPFAC2*PWSAM1M(:,JK) + PRHSW(:,JK)
 
-        # Top layer elimination (JK=1)
+        # 顶层消元（JK=1）
         ZTCOE       = PCFW(:,1)
         ZQDP        = 1/PCDZ(:,1)
         ZDISC       = 1/(1 + PCFW(:,1)*ZQDP)
         ZEBSW(:,1)  = ZDISC*(PCFW(:,1)*ZQDP)
         PWSADIF(:,1)= ZDISC*PWSADIF(:,1)
 
-        # Middle layers JK=2..KLEVS-1
+        # 中间层 JK=2..KLEVS-1
         ZFAC        = ZTCOE*ZQDP(JK)
         ZTCOE       = PCFW(:,JK)
         ZDISC       = 1/(1 + ZFAC*(1-ZEBSW(:,JK-1)) + PCFW(:,JK)*ZQDP(JK))
         ZEBSW(:,JK) = ZDISC*(PCFW(:,JK)*ZQDP(JK))
         PWSADIF(:,JK)= ZDISC*(PWSADIF(:,JK) + ZFAC*PWSADIF(:,JK-1))
 
-        # Bottom layer JK=KLEVS
+        # 底层 JK=KLEVS
         ZFAC        = ZTCOE*ZQDP(KLEVS)
         ZDISC       = 1/(1 + ZFAC*(1-ZEBSW(:,KLEVS-1)) + PCFW(:,KLEVS)*ZQDP(KLEVS))
         PWSADIF(:,KLEVS) = ZDISC*(PWSADIF(:,KLEVS) + ZFAC*PWSADIF(:,KLEVS-1))
 
-        # Back-substitution JK=KLEVS-1..1
+        # 回代 JK=KLEVS-1..1
         PWSADIF(:,JK) += ZEBSW(:,JK)*PWSADIF(:,JK+1)
 
-    The middle/bottom sweep carries a *column recurrence* (ZTCOE feeds
-    the next layer's ZFAC), so it cannot be fully vectorised across
-    layers; we unroll it as a Python loop over JK.  With nlevs=4 this is
-    three iterations -- trivially cheap and exactly mirrors the Fortran
-    control flow.
+    中间层/底层的扫描携带一个*列递推*（ZTCOE 馈入下一层的 ZFAC），
+    因此无法沿层维完全向量化；我们将其展开为对 JK 的 Python 循环。
+    当 nlevs=4 时只有三次迭代——代价微不足道，且精确镜像 Fortran
+    的控制流。
 
-    Implementation note: the sweep is written *functionally* (per-layer
-    solution tensors accumulated in a Python list, joined at the end via
-    :func:`torch.stack`) rather than with in-place indexed assignment.
-    The in-place form mirrors the Fortran more literally but breaks
-    autograd (in-place writes to a leaf of the graph invalidate the
-    version counter).  The functional form is bit-identical in the
-    forward pass and stays differentiable for ML training.
+    实现说明：扫描以*函数式*方式书写（逐层解张量累积在 Python
+    列表中，最后通过 :func:`torch.stack` 合并），而不是使用原地
+    索引赋值。原地写法更贴近 Fortran 的字面形式，但会破坏 autograd
+    （对计算图叶节点的原地写入会使版本计数器失效）。函数式写法在
+    前向传播中逐位一致，并且保持可微，可用于 ML 训练。
 
-    Land mask: surf points are never updated (the Fortran guards every
-    assignment with ``IF (LDLAND(JL))``).  We carry the land mask
-    through the sweep as a multiplicative gate so non-land columns stay
-    at their initialised value (zero), matching the Fortran OUT array.
+    陆地掩膜：surf 点永远不会被更新（Fortran 用
+    ``IF (LDLAND(JL))`` 守护每一次赋值）。我们在扫描中以乘性门控
+    携带陆地掩膜，使非陆地列保持其初始值（零），与 Fortran 的
+    OUT 数组一致。
     """
     ngrid, nlevs = pwsam1m.shape
     dtype = pwsam1m.dtype
@@ -700,41 +728,39 @@ def _solve_tridiag(
 
     ztpfac2 = 1.0 / rsimp
 
-    # 1.1 RHS set-up.
+    # 1.1 右端项设置。
     pwsadif = ztpfac2 * pwsam1m + prhsw
 
-    # Gate non-land columns to zero so they never contribute to the
-    # recurrence (the Fortran skips them entirely; we zero them and let
-    # the masked update at the end restore the original).
+    # 将非陆地列门控为零，使其对递推不产生任何贡献（Fortran 完全
+    # 跳过这些列；我们将其置零，并在最后通过掩膜更新恢复原值）。
     land_b = land[:, None].to(dtype)
     pwsadif = pwsadif * land_b
 
-    # Per-layer elimination coefficients and the running solution.  Both
-    # are accumulated functionally (no in-place writes) so autograd can
-    # backprop through the sweep.
+    # 逐层消元系数和滚动解。两者均以函数式方式累积（无原地写入），
+    # 以便 autograd 能沿扫描反向传播。
     ebsw: list[torch.Tensor] = [torch.empty(0)] * nlevs
     sol: list[torch.Tensor] = [torch.empty(0)] * nlevs
 
-    # 1.2 Top layer elimination (JK=1).
-    ztcoe = pcfw[:, 0]                              # PCFW(:,1); a view, never mutated
+    # 1.2 顶层消元（JK=1）。
+    ztcoe = pcfw[:, 0]                              # PCFW(:,1)；视图，从不被修改
     zqdp = 1.0 / pcdz[:, 0]
     zdisc = 1.0 / (1.0 + pcfw[:, 0] * zqdp)
     ebsw[0] = zdisc * (pcfw[:, 0] * zqdp)
     sol[0] = zdisc * pwsadif[:, 0]
 
-    # 1.3 Middle layers JK=2..KLEVS-1 (Python loop, exact Fortran order).
+    # 1.3 中间层 JK=2..KLEVS-1（Python 循环，严格的 Fortran 顺序）。
     for jk in range(1, nlevs - 1):
         zqdp = 1.0 / pcdz[:, jk]
         zfac = ztcoe * zqdp                         # ZTCOE = PCFW(:,JK-1)
-        ztcoe = pcfw[:, jk]                         # advance for next iter
+        ztcoe = pcfw[:, jk]                         # 为下一次迭代推进
         zdisc = 1.0 / (
             1.0 + zfac * (1.0 - ebsw[jk - 1]) + pcfw[:, jk] * zqdp
         )
         ebsw[jk] = zdisc * (pcfw[:, jk] * zqdp)
         sol[jk] = zdisc * (pwsadif[:, jk] + zfac * sol[jk - 1])
 
-    # 1.4 Bottom layer elimination (JK=KLEVS).  Guard nlevs==1 (single-
-    # layer configuration skips the middle loop and reuses JK=1 ZTCOE).
+    # 1.4 底层消元（JK=KLEVS）。保护 nlevs==1 的情形（单层
+    # 配置跳过中间层循环，复用 JK=1 的 ZTCOE）。
     if nlevs >= 2:
         jk = nlevs - 1
         zqdp = 1.0 / pcdz[:, jk]
@@ -744,8 +770,8 @@ def _solve_tridiag(
         )
         sol[jk] = zdisc * (pwsadif[:, jk] + zfac * sol[jk - 1])
 
-    # 1.5 Back-substitution JK=KLEVS-1..1.  Build a fresh tensor per
-    # layer so the graph stays clean (sol[jk+1] is consumed read-only).
+    # 1.5 回代 JK=KLEVS-1..1。每层构建一个全新的张量，
+    # 使计算图保持干净（sol[jk+1] 仅以只读方式被消费）。
     for jk in range(nlevs - 2, -1, -1):
         sol[jk] = sol[jk] + ebsw[jk] * sol[jk + 1]
 
@@ -753,79 +779,73 @@ def _solve_tridiag(
 
 
 # =========================================================================== #
-# Soil-moisture branch (SRFWEXC_VG + SRFWDIF + SRFWINC + SRFWNG)
+# 土壤水分分支（SRFWEXC_VG + SRFWDIF + SRFWINC + SRFWNG）
 # =========================================================================== #
-"""HTESSEL soil-moisture update with Van Genuchten hydraulics.
+"""采用 Van Genuchten 水力学的 HTESSEL 土壤水分更新。
 
-This is the Python port of the soil-moisture branch of ``SURFTSTP_CTL``
-(``surf/module/surftstp_ctl_mod.F90`` section 4), four upstream routines:
+这是 ``SURFTSTP_CTL`` 土壤水分分支的 Python 移植
+（``surf/module/surftstp_ctl_mod.F90`` 第 4 节），由四个上游例程组成：
 
-* ``SRFWEXC_VG`` (``surf/module/srfwexc_vg_mod.F90``) -- assembles the
-  tridiagonal coefficients for the moisture solve: Van Genuchten
-  hydraulic conductivity K(W) and diffusivity D(W), VIC saturation-
-  excess runoff *or* infiltration-limit runoff (gated by LESSRO), root
-  extraction from the four soil-viewing tiles, and the surface forcing
-  (throughfall + snowmelt - runoff + evap).
+* ``SRFWEXC_VG`` (``surf/module/srfwexc_vg_mod.F90``) -- 组装水分求解的
+  三对角系数：Van Genuchten 水力传导度 K(W) 和扩散率 D(W)、
+  VIC 饱和超渗产流*或*入渗限制产流（由 LESSRO 门控）、
+  来自四个面向土壤贴块的根系吸水，以及地表强迫
+  （穿透雨 + 融雪 - 产流 + 蒸发）。
 
-* ``SRFWDIF`` (``surf/module/srfwdif_mod.F90``) -- the same Thomas
-  solver as the temperature path (the generic
-  :func:`_solve_tridiag` above).  Despite the ``W`` prefix both paths
-  share the algorithm.
+* ``SRFWDIF`` (``surf/module/srfwdif_mod.F90``) -- 与温度路径相同的
+  Thomas 求解器（即上面的通用 :func:`_solve_tridiag`）。尽管带有
+  ``W`` 前缀，两条路径共享同一算法。
 
-* ``SRFWINC`` (``surf/module/srfwinc_mod.F90``) -- converts the Thomas
-  solution ``PWSADIF`` to the unfiltered t+1 moisture
-  ``PWSA = PWSADIF - ZTPFAC3*PWSAM1M`` and re-applies the gravity flux
-  to the drainage diagnostic.
+* ``SRFWINC`` (``surf/module/srfwinc_mod.F90``) -- 将 Thomas 解
+  ``PWSADIF`` 转换为未滤波的 t+1 时刻湿度
+  ``PWSA = PWSADIF - ZTPFAC3*PWSAM1M``，并将重力通量
+  重新施加到排水诊断量上。
 
-* ``SRFWNG`` (``surf/module/srfwng_mod.F90``) -- negative-moisture
-  clipping with downward redistribution.  Excess water in layer JK is
-  pushed into JK+1 (column recurrence); saturation excess becomes
-  surface runoff (top layer) or sub-surface runoff (deeper layers).
+* ``SRFWNG`` (``surf/module/srfwng_mod.F90``) -- 负湿度截断并向下
+  再分配。层 JK 中多余的水被推入 JK+1（列递推）；饱和超出量
+  成为地表径流（顶层）或地下径流（深层）。
 
-Van Genuchten hydraulics
+Van Genuchten 水力学
 ------------------------
-With effective saturation ``Se = (W - Wres) / (Wsat - Wres)``::
+设有效饱和度 ``Se = (W - Wres) / (Wsat - Wres)``::
 
     K(Se) = WCONS * Se**lam * (1 - (1 - Se**(1/m))**m)**2
     D(Se) = ((1-m)*WCONS / (alpha*m*WFAC)) * Se**(lam-1/m)
               * ( (1 - Se**(1/m))**m + (1 - Se**(1/m))**(-m) - 2 )
 
-with ``m = 1 - 1/n``, ``WFAC = Wsat - Wres``.  At the air-dry floor
-``W <= 1.001*Wres`` the functions clamp to ``K=0, D=Dmin``; near
-saturation ``W >= 0.999*Wsat`` they clamp to ``K=WCONS, D=Dmax``.  The
-freezing function ``ZF = 0.5*(1-SIN(RTF4*(T-RTF3)))`` further reduces
-both (K is driven to zero, D is linearly interpolated toward Dmin) so
-frozen soil neither drains nor diffuses appreciably.
+其中 ``m = 1 - 1/n``，``WFAC = Wsat - Wres``。在气干下限
+``W <= 1.001*Wres`` 处，函数钳制到 ``K=0, D=Dmin``；接近饱和
+``W >= 0.999*Wsat`` 时钳制到 ``K=WCONS, D=Dmax``。冻结函数
+``ZF = 0.5*(1-SIN(RTF4*(T-RTF3)))`` 进一步削减两者（K 被压到零，
+D 向 Dmin 线性插值），因此冻结土壤既不明显排水也不明显扩散。
 
-Cold-start simplifications
+冷启动简化
 --------------------------
-* Snow inputs (PMSN snowmelt, PEMSSN evaporative mismatch, PEVAPSNW
-  snow-under-forest evaporation) are all zero at cold start.
-* The interception-layer evaporation mismatch PEINTTI is zero (no
-  SRFWL call in the offline driver until M6 wires the skin reservoir).
-* The lake/urban branches (KTILES > 9) are skipped -- the offline
-  driver runs the 8-tile base configuration.
+* 雪输入（PMSN 融雪、PEMSSN 蒸发不匹配、PEVAPSNW 林下积雪蒸发）
+  在冷启动时全部为零。
+* 截留层蒸发不匹配量 PEINTTI 为零（在 M6 接入皮肤层水库之前，
+  离线驱动不调用 SRFWL）。
+* 跳过湖泊/城市分支（KTILES > 9）——离线驱动运行 8 贴块基础配置。
 
-Runoff sign convention
+径流符号约定
 -----------------------
-``PROS`` (surface runoff) and ``PROD`` (sub-surface runoff) are
-positive *out of* the soil column, in kg/m^2 (accumulated over the
-timestep).  Drainage from the bottom layer is added to ``PROD`` by the
-caller (SURFTSTP section 4.6).
+``PROS``（地表径流）和 ``PROD``（地下径流）以*流出*土柱为正，
+单位为 kg/m^2（在时间步内累积）。底层的排水由调用方加入
+``PROD``（SURFTSTP 第 4.6 节）。
 """
 
 
 @dataclass
 class SoilMoistInputs:
-    """All inputs to the HTESSEL soil-moisture solve.
+    """HTESSEL 土壤水分求解的全部输入。
 
-    Per-(grid,layer) fields are ``(Ngrid, Nsoil)``, per-grid fields are
-    ``(Ngrid,)``, per-tile flux fields are ``(Ngrid, Ntile)``.  Naming
-    mirrors the Fortran dummy list of ``SRFWEXC_VG``.
+    逐（格点，层）场的张量为 ``(Ngrid, Nsoil)``，逐格点场为
+    ``(Ngrid,)``，逐贴块通量场为 ``(Ngrid, Ntile)``。
+    命名与 ``SRFWEXC_VG`` 的 Fortran 哑元列表一致。
 
-    Cold-start note: the snow/interception mismatch inputs (``pmsn``,
-    ``pemssn``, ``pevapsnw``, ``peintti``) all default to zero and may
-    be left at that until the M6 snow prognostic populates them.
+    冷启动说明：雪/截留不匹配输入（``pmsn``、``pemssn``、
+    ``pevapsnw``、``peintti``）全部默认为零，在 M6 雪预报量
+    填充它们之前可以保持为零。
     """
 
     # ---- Soil state at t-1 ----
@@ -861,7 +881,7 @@ class SoilMoistInputs:
 
 @dataclass
 class SoilMoistOutputs:
-    """All outputs of the HTESSEL soil-moisture solve."""
+    """HTESSEL 土壤水分求解的全部输出。"""
 
     pwsa: torch.Tensor               # PWSA  new soil moisture  [m3/m3]   (Ngrid, Nsoil)
     pros: torch.Tensor               # PROS  surface runoff     [kg/m^2]  (Ngrid,)
@@ -879,32 +899,32 @@ def compute_soil_moisture(
     *,
     differentiable: Optional[bool] = None,
 ) -> SoilMoistOutputs:
-    """Run the HTESSEL soil-moisture solve (SRFWEXC_VG + SRFWDIF + SRFWINC + SRFWNG).
+    """运行 HTESSEL 土壤水分求解（SRFWEXC_VG + SRFWDIF + SRFWINC + SRFWNG）。
 
     Args
     ----
     inp:
-        :class:`SoilMoistInputs` -- packed soil state, fluxes and masks.
+        :class:`SoilMoistInputs` -- 打包的土壤状态、通量与掩膜。
     soil_table:
-        :class:`surf_pytorch.tables.soil.SoilTable` -- per-class VG LUT
-        (wsat, wrest, wcap, wpwp, wconsm, mvgalpha, mfac, lambda,
-        dmax, dmin) and class-agnostic scalars (rsimp, rsrdep).
+        :class:`surf_pytorch.tables.soil.SoilTable` -- 逐类别 VG 查找表
+        （wsat、wrest、wcap、wpwp、wconsm、mvgalpha、mfac、lambda、
+        dmax、dmin）以及与类别无关的标量（rsimp、rsrdep）。
     veg_table:
-        :class:`surf_pytorch.tables.veg.VegTable` -- provides the
-        per-veg-type root profile ``rvrootsa``.
+        :class:`surf_pytorch.tables.veg.VegTable` -- 提供逐植被类型的
+        根系廓线 ``rvrootsa``。
     consts:
-        :class:`ConstantBundle` -- provides ``rtt`` and the freeze-ramp
-        endpoints ``rtf1..rtf4``.
+        :class:`ConstantBundle` -- 提供 ``rtt`` 以及冻结过渡区端点
+        ``rtf1..rtf4``。
     config:
-        :class:`SurfConfig` -- ``n_soil``, ``soil_thickness``, and the
-        ``lessro`` flag (VIC vs infiltration-limit runoff).
+        :class:`SurfConfig` -- ``n_soil``、``soil_thickness``，以及
+        ``lessro`` 标志（VIC 与入渗限制产流的切换）。
     differentiable:
-        Override ``config.differentiable`` for this call.
+        为本次调用覆盖 ``config.differentiable``。
 
     Returns
     -------
-    :class:`SoilMoistOutputs` -- new moisture, runoff split (surface +
-    sub-surface), inter-layer flux and the gravity water-flux profile.
+    :class:`SoilMoistOutputs` -- 新湿度、径流分解（地表 + 地下）、
+    层间通量以及重力水通量廓线。
     """
     diff = config.differentiable if differentiable is None else differentiable
 
@@ -924,7 +944,7 @@ def _soil_moisture_core(
     consts: ConstantBundle,
     config: SurfConfig,
 ) -> SoilMoistOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made."""
+    """内部：假定 no_grad / enable_grad 的决定已经做出。"""
     ngrid = inp.pwsam1m.shape[0]
     nlevs = config.n_soil
     dtype = inp.pwsam1m.dtype
@@ -1055,7 +1075,7 @@ def _write_srfwater_debug(
     pwsam1m, pcfw, prhsw, pwsadif, pwsa_pre, pwsa, psawgfl,
     pros, prod, pwfsd,
 ) -> None:
-    """Write an optional SRFWEXC/SRFWDIF/SRFWINC audit for one column."""
+    """为单个列写出可选的 SRFWEXC/SRFWDIF/SRFWINC 审计信息。"""
     global _SRFW_DEBUG_STEP
     path = os.environ.get("SURF_TORCH_SRF_WATER_DEBUG_CSV")
     column = os.environ.get("SURF_TORCH_SRF_WATER_DEBUG_COLUMN")
@@ -1097,16 +1117,16 @@ def _liquid_fraction(
     ptsam1m: torch.Tensor,
     rtf1: float, rtf2: float, rtf3: float, rtf4: float,
 ) -> torch.Tensor:
-    """Liquid-water fraction ZF as a function of soil temperature.
+    """液态水比例 ZF，作为土壤温度的函数。
 
-    Reproduces srfwexc_vg_mod.F90 lines 219-227::
+    复现 srfwexc_vg_mod.F90 第 219-227 行::
 
         ZF = 0.5*(1 - SIN(RTF4*(T-RTF3)))   if RTF2 < T < RTF1
         ZF = 1.0                             if T <= RTF2  (all liquid)
         ZF = 0.0                             if T >= RTF1  (all frozen)
 
-    Outside the freeze window ZF is piecewise-constant, matching the
-    upstream SRFENE definition.  Vectorised over (Ngrid, Nsoil).
+    在冻结窗口之外 ZF 为分段常数，与上游 SRFENE 的定义一致。
+    在 (Ngrid, Nsoil) 上向量化。
     """
     t = ptsam1m
     zf = 0.5 * (1.0 - torch.sin(rtf4 * (t - rtf3)))
@@ -1128,18 +1148,18 @@ def _root_extraction_weights(
     nlevs: int,
     lewbsoilfix: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-tile root extraction weights ZROOTW and normaliser ZEXT.
+    """逐贴块根系吸水权重 ZROOTW 和归一化因子 ZEXT。
 
-    Reproduces srfwexc_vg_mod.F90 lines 268-310 (TILES + LAYERS loops).
-    Only tiles 4 (low-veg-dry, KTVL), 6 (high-veg-dry, KTVH) and 7
-    (high-veg-snow, KTVH) carry root extraction.  For positive evap
-    (dew deposition) all roots are in layer 1; for transpiration the
-    weight is ``RVROOTSA(JK, ITYP) * (ZLIQ - RWPWPM + ZEPSILONADD)``.
+    复现 srfwexc_vg_mod.F90 第 268-310 行（TILES + LAYERS 循环）。
+    只有贴块 4（低植被-干，KTVL）、6（高植被-干，KTVH）和 7
+    （高植被-雪，KTVH）携带根系吸水。对于正蒸发（露水凝结），
+    所有根系都在第 1 层；对于蒸腾，权重为
+    ``RVROOTSA(JK, ITYP) * (ZLIQ - RWPWPM + ZEPSILONADD)``。
 
     Returns
     -------
-    zrootw: ``(Ngrid, Nsoil, 3)`` -- per-(grid,layer,tile-in-{4,6,7}).
-    zext:   ``(Ngrid, 3)`` -- per-tile normaliser (clamped to >= ZEPSILON).
+    zrootw: ``(Ngrid, Nsoil, 3)`` -- 逐（格点，层，贴块∈{4,6,7}）。
+    zext:   ``(Ngrid, 3)`` -- 逐贴块归一化因子（钳制到 >= ZEPSILON）。
     """
     ngrid = pfrti.shape[0]
     dtype = pfrti.dtype
@@ -1167,7 +1187,11 @@ def _root_extraction_weights(
         torch.zeros_like(zrootw[:, 1:, 0]),
         w4[:, 1:],
     )
-    zext[:, 0] = zrootw[:, :, 0].sum(dim=1)
+    # srfwexc_mod.F90 222-265: ZEXT accumulates layers JK=1..KLEVS
+    # sequentially inside the LAYERS loop.
+    zext[:, 0] = torch.zeros_like(zrootw[:, 0, 0])
+    for jk in range(zrootw.shape[1]):
+        zext[:, 0] = zext[:, 0] + zrootw[:, jk, 0]
 
     # Tile 6 (high-veg-dry) -> uses KTVH roots.
     zevap6 = pfrti[:, 5] * pevapti[:, 5]
@@ -1179,7 +1203,11 @@ def _root_extraction_weights(
         torch.zeros_like(zrootw[:, 1:, 1]),
         w6[:, 1:],
     )
-    zext[:, 1] = zrootw[:, :, 1].sum(dim=1)
+    # srfwexc_mod.F90 222-265: ZEXT accumulates layers JK=1..KLEVS
+    # sequentially inside the LAYERS loop.
+    zext[:, 1] = torch.zeros_like(zrootw[:, 0, 1])
+    for jk in range(zrootw.shape[1]):
+        zext[:, 1] = zext[:, 1] + zrootw[:, jk, 1]
 
     # Tile 7 (high-veg-snow) -> uses KTVH roots; evap excludes PEVAPSNW.
     zevap7 = pfrti[:, 6] * (pevapti[:, 6] - pevapsnw)
@@ -1191,7 +1219,11 @@ def _root_extraction_weights(
         torch.zeros_like(zrootw[:, 1:, 2]),
         w7[:, 1:],
     )
-    zext[:, 2] = zrootw[:, :, 2].sum(dim=1)
+    # srfwexc_mod.F90 222-265: ZEXT accumulates layers JK=1..KLEVS
+    # sequentially inside the LAYERS loop.
+    zext[:, 2] = torch.zeros_like(zrootw[:, 0, 2])
+    for jk in range(zrootw.shape[1]):
+        zext[:, 2] = zext[:, 2] + zrootw[:, jk, 2]
 
     # Clamp ZEXT to >= ZEPSILON (Fortran MAX(ZEPSILON, ZEXT)).
     zeps = 100.0 * torch.finfo(dtype).eps
@@ -1211,18 +1243,17 @@ def _vg_hydraulics(
     dmin: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Van Genuchten hydraulic conductivity K and diffusivity D.
+    """Van Genuchten 水力传导度 K 和扩散率 D。
 
-    Reproduces the half-level VG block in srfwexc_vg_mod.F90 (top layer
-    lines 318-332, deeper layers 509-523).  The three-branch piecewise
-    form clamps K/D at the air-dry floor (W <= 1.001*Wres) and near
-    saturation (W >= 0.999*Wsat); in between the closed-form VG
-    expressions are used.
+    复现 srfwexc_vg_mod.F90 中的半层 VG 块（顶层第 318-332 行，
+    深层第 509-523 行）。三分段的分段形式在气干下限
+    （W <= 1.001*Wres）和接近饱和（W >= 0.999*Wsat）处钳制 K/D；
+    两者之间使用闭式 VG 表达式。
 
     Returns
     -------
-    (zk, zd): ``(Ngrid,)`` hydraulic conductivity [m/s] and diffusivity
-    [m^2/s] at the given half-level moisture.
+    (zk, zd): ``(Ngrid,)`` 给定半层湿度处的水力传导度 [m/s]
+    和扩散率 [m^2/s]。
     """
     wfac = wsat - wrest
 
@@ -1275,10 +1306,10 @@ def _top_layer_coeffs(
     rsigormin, rsigormax, rpsfr,
     pcfw, prhsw, psawgfl, pros,
 ):
-    """SRFWEXC_VG section 2.3 -- top-layer coefficients.
+    """SRFWEXC_VG 第 2.3 节 -- 顶层系数。
 
-    Returns the updated (pcfw, prhsw, psawgfl, pros) plus the
-    diagnostics (zsawext_l1, zconds) needed by SRFWNG.
+    返回更新后的 (pcfw, prhsw, psawgfl, pros)，以及 SRFWNG 所需的
+    诊断量 (zsawext_l1, zconds)。
     """
     ngrid = inp.pwsam1m.shape[0]
     nlevs = rdaw.shape[0]
@@ -1358,14 +1389,14 @@ def _runoff(
     rdaw, rsrdep, lessro, ptmst, rho_h2o,
     rsigormin, rsigormax, rpsfr,
 ) -> torch.Tensor:
-    """Surface runoff ZROT (kg/m^2/s, positive out of the soil).
+    """地表径流 ZROT（kg/m^2/s，以流出土壤为正）。
 
-    Two branches gated by ``lessro``:
-    * LESSRO = .TRUE.  -> VIC saturation-excess runoff (srfwexc_vg 340-391).
-    * LESSRO = .FALSE. -> infiltration-limit runoff (srfwexc_vg 393-416).
+    由 ``lessro`` 门控的两个分支：
+    * LESSRO = .TRUE.  -> VIC 饱和超渗产流（srfwexc_vg 第 340-391 行）。
+    * LESSRO = .FALSE. -> 入渗限制产流（srfwexc_vg 第 393-416 行）。
 
-    Returns the per-grid runoff rate (kg/m^2/s).  Surf points are zeroed
-    by the caller's land mask.
+    返回逐格点径流率（kg/m^2/s）。surf 点由调用方的陆地掩膜
+    置零。
     """
     ngrid = inp.pwsam1m.shape[0]
     nlevs = rdaw.shape[0]
@@ -1406,9 +1437,15 @@ def _runoff(
             1.0 - zf
         ) + wpwp[:, None]
         rdaw_g = rdaw.expand(ngrid, nlevs)
-        zw = (zfrk * zwk * rdaw_g).sum(dim=1)
+        # srfwexc_vg_mod.F90 392/399: SUM(ZFRK*ZWK*RDAW) is a sequential
+        # layer sum (gfortran SUM == DO loop, verified bitwise).
+        zw = torch.zeros_like(zfrk[:, 0])
+        for jk in range(zfrk.shape[1]):
+            zw = zw + (zfrk[:, jk] * zwk[:, jk]) * rdaw_g[:, jk]
         zwmk = (wsat[:, None] - wpwp[:, None]) * (1.0 - zf) + wpwp[:, None]
-        zwmax = (zfrk * zwmk * rdaw_g).sum(dim=1)
+        zwmax = torch.zeros_like(zfrk[:, 0])
+        for jk in range(zfrk.shape[1]):
+            zwmax = zwmax + (zfrk[:, jk] * zwmk[:, jk]) * rdaw_g[:, jk]
 
         zconw1 = zwmax * zb1
         zlyeps = torch.clamp(zw - zwmax, min=0.0)
@@ -1418,14 +1455,22 @@ def _runoff(
             zlyeps > 0.1 * zwmax, torch.zeros_like(zlimrs), zlimrs
         )
         # ZLYSIC = saturation-area fraction.
-        zlysic = torch.clamp((zw - zlyeps) / zwmax, min=0.0, max=1.0)
-        # Guard divide-by-zero when ZWMAX = 0.
-        zlysic = torch.where(
-            zwmax != 0.0, zlysic, torch.zeros_like(zlysic)
-        )
+        # ``where`` does not short-circuit its operands. Use a neutral
+        # denominator before masking zero-capacity columns, otherwise the
+        # inactive 0/0 division poisons an unrolled autograd graph.
+        zwmax_safe = torch.where(zwmax != 0.0, zwmax, torch.ones_like(zwmax))
+        zlysic = torch.clamp((zw - zlyeps) / zwmax_safe, min=0.0, max=1.0)
+        zlysic = torch.where(zwmax != 0.0, zlysic, torch.zeros_like(zlysic))
         # ZVOL = saturation-excess volume.
+        zpow_base = 1.0 - zlysic
+        if torch.is_grad_enabled():
+            # At saturation zpow_base=0 and zbm is fractional. The forward
+            # value is finite but d(x**zbm)/dx is singular at x=0. The
+            # epsilon floor is only for the differentiated graph.
+            zpow_base = torch.clamp(zpow_base, min=torch.finfo(dtype).eps)
+        zconw1_safe = torch.where(zconw1 != 0.0, zconw1, torch.ones_like(zconw1))
         zvol = torch.clamp(
-            (1.0 - zlysic) ** zbm - zrsfl / (invtmst * rho_h2o * zconw1),
+            zpow_base ** zbm - zrsfl / (invtmst * rho_h2o * zconw1_safe),
             min=0.0,
         )
         # ZROS (m): saturation-excess runoff.
@@ -1449,8 +1494,12 @@ def _runoff(
     ) * rho_h2o
     # Large-scale precip runoff.
     zrol = torch.clamp(inp.ptsfl + inp.pmsn - zinfmax, min=0.0)
-    # Convective precip runoff (RPSFR = 1 default; ZPSFR = 1).
-    zroc = torch.clamp(inp.ptsfc - zinfmax, min=0.0)
+    # Convective precip runoff. Keep the Fortran operation order:
+    # ZROC = MAX(0, RPSFR * PTSFC - ZINFMAX) * ZPSFR,
+    # with RPSFR=2 and ZPSFR=1/RPSFR=0.5 in SUSSOIL.
+    rpsfr = torch.as_tensor(rpsfr, dtype=dtype, device=device)
+    zpsfr = 1.0 / rpsfr
+    zroc = torch.clamp(rpsfr * inp.ptsfc - zinfmax, min=0.0) * zpsfr
     zrot = zrol + zroc
     return zrot
 
@@ -1462,12 +1511,12 @@ def _deep_layer_coeffs(
     rdaw, land, ptmst, rsimp, rho_h2o,
     pcfw, prhsw, psawgfl,
 ):
-    """SRFWEXC_VG section 2.4 -- coefficients for layers JK=2..KLEVS.
+    """SRFWEXC_VG 第 2.4 节 -- 层 JK=2..KLEVS 的系数。
 
-    Each half-level JK+1/2 uses MAX(W(:,JK), W(:,JK+1)) for the K/D
-    half-level moisture; the gravity-flux K at the *top* of layer JK
-    uses MAX(W(:,JK-1), W(:,JK)) (the ZKM variable in the Fortran).  The
-    freezing reduction couples adjacent layers via MIN(ZF(:,JK), ...).
+    每个半层 JK+1/2 使用 MAX(W(:,JK), W(:,JK+1)) 作为 K/D 的
+    半层湿度；层 JK *顶部*的重力通量 K 使用
+    MAX(W(:,JK-1), W(:,JK))（Fortran 中的 ZKM 变量）。冻结削减
+    通过 MIN(ZF(:,JK), ...) 耦合相邻层。
     """
     ngrid = inp.pwsam1m.shape[0]
     nlevs = rdaw.shape[0]
@@ -1544,11 +1593,11 @@ def _deep_layer_coeffs(
 def _vg_hydraulics_toponly(
     w, wsat, wrest, wconsm, mvgalpha, mfac, lam, eps,
 ):
-    """Van Genuchten K only (no D), used for the ZKM top-of-layer K.
+    """仅 Van Genuchten K（无 D），用于层顶 ZKM 的 K。
 
-    Reproduces srfwexc_vg_mod.F90 lines 529-540 (the ZKM block).  Same
-    three-branch piecewise form as :func:`_vg_hydraulics` but returns
-    only K (ZKM is never used as a diffusivity).
+    复现 srfwexc_vg_mod.F90 第 529-540 行（ZKM 块）。与
+    :func:`_vg_hydraulics` 相同的三分段分段形式，但只返回 K
+    （ZKM 从不作为扩散率使用）。
     """
     wfac = wsat - wrest
     floor = w <= wrest
@@ -1575,17 +1624,17 @@ def _vg_hydraulics_toponly(
 def _soil_moisture_update(
     pwsam1m, pwsadif, pcfw, psawgfl, ldland, rsimp, ptmst, rho_h2o,
 ):
-    """SRFWINC -- convert Thomas solution to t+1 moisture + drainage diag.
+    """SRFWINC -- 将 Thomas 解转换为 t+1 湿度 + 排水诊断量。
 
-    Reproduces srfwinc_mod.F90 lines 120-144::
+    复现 srfwinc_mod.F90 第 120-144 行::
 
         ZTPFAC3 = 1/RSIMP - 1
         ZCONS   = RHOH2O/PTMST
         PWSA(:,JK) = PWSADIF(:,JK) - ZTPFAC3*PWSAM1M(:,JK)
         PSAWGFL(:,JK) += ZCONS*PCFW(:,JK)*(PWSADIF(:,JK) - PWSADIF(:,JK+1))
 
-    With RSIMP=1, ZTPFAC3=0 and PWSA = PWSADIF (the Thomas solution is
-    the new moisture directly).  Surf points keep their t-1 moisture.
+    当 RSIMP=1 时，ZTPFAC3=0 且 PWSA = PWSADIF（Thomas 解
+    直接就是新湿度）。Surf 点保留其 t-1 时刻的湿度。
     """
     ztpfac3 = 1.0 / rsimp - 1.0
     zcons = rho_h2o / ptmst
@@ -1609,21 +1658,18 @@ def _clip_and_redistribute(
     pwsa, pwsam1m, pros, pwfsd, wsat, wrest, rdaw,
     land, ldland, ptmst, rho_h2o,
 ):
-    """SRFWNG -- clip negative moisture, redistribute downward, split
-    saturation excess into surface / sub-surface runoff.
+    """SRFWNG -- 截断负湿度，向下再分配，并将饱和超出量分解为
+    地表 / 地下径流。
 
-    Reproduces srfwng_mod.F90 lines 130-182.  The clipping is a column
-    recurrence: any negative moisture in layer JK is pushed into JK+1
-    (scaled by the layer-thickness ratio), and any saturation excess
-    becomes surface runoff (top layer) or sub-surface runoff (deeper
-    layers).  The skin-reservoir clipping (PWL > PWLMX) is omitted --
-    the offline driver leaves the skin reservoir to a separate path
-    (M6 / SRFWL).
+    复现 srfwng_mod.F90 第 130-182 行。截断是一个列递推：
+    层 JK 中任何负湿度都被推入 JK+1（按层厚比缩放），任何
+    饱和超出量成为地表径流（顶层）或地下径流（深层）。
+    皮肤层水库截断（PWL > PWLMX）被省略——离线驱动将皮肤层
+    水库留给单独路径（M6 / SRFWL）。
 
-    Because the redistribution carries a layer-axis recurrence we
-    unroll it as a Python loop over JK; with nlevs=4 this is three
-    iterations.  The loop body is written functionally (per-layer
-    moisture tensors accumulated in a list) to stay autograd-clean.
+    由于再分配携带层轴递推，我们将其展开为对 JK 的 Python
+    循环；nlevs=4 时只有三次迭代。循环体以函数式方式书写
+    （逐层湿度张量累积在列表中），以保持 autograd 干净。
     """
     ngrid = pwsa.shape[0]
     nlevs = rdaw.shape[0]

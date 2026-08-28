@@ -1,17 +1,15 @@
-"""Top-level configuration for the land-surface model.
+"""陆面模式的顶层配置。
 
-``SurfConfig`` is the single object a user passes to
-:class:`surf_pytorch.LandSurface`.  It bundles:
+``SurfConfig`` 是用户传给 :class:`surf_pytorch.LandSurface` 的唯一对象。
+它打包了：
 
-* dimensioning integers (n_soil, n_tile, etc.) -- kept in sync with
-  the offline driver's ``sudim1s.F90`` defaults;
-* feature flags (which tiles are active, is differentiation enabled);
-* the default dtype / device;
-* the per-table learnable overrides (which LUTs may be optimised).
+* 维数整数（n_soil、n_tile 等）—— 与离线驱动 ``sudim1s.F90`` 的默认值保持同步；
+* 特性开关（哪些瓦片激活、是否启用微分）；
+* 默认 dtype / device；
+* 各查找表的可学习覆盖（哪些 LUT 可被优化）。
 
-All defaults match the offline single-column driver so that ``import
-surf_pytorch; m = LandSurface()`` is ready to plug into the
-single-column comparison harness.
+所有默认值都与离线单列驱动一致，因此 ``import surf_pytorch; m =
+LandSurface()`` 即可直接接入单列对比台架。
 """
 
 from __future__ import annotations

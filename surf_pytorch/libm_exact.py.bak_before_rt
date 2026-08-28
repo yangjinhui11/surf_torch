@@ -1,0 +1,130 @@
+"""与 glibc 标量 libm 位一致的超越函数替换（等价性验证用）。
+
+GPU 的 libdevice 数学库与 glibc 标量 libm 在 ``log``/``exp``/``pow``/
+``sin``/``cos``/``atan`` 上存在不超过 1 ULP 的实现差异。这些差异经由
+VDF 通量（感热 / 潜热 / 长波）进入陆面状态，在阈值分支（雪的融化窗口、
+密度压实的 SWE>=15 判据等）处被放大成 O(1) 的轨迹分离——这是 1 年积分
+torch 与 Fortran 分叉的根本来源。
+
+本模块在 ``SURF_LIBM_EXACT=1`` 时把 torch 的超越函数调用重定向到 CPU
+上的 numpy。进程必须以 ``NPY_DISABLE_CPU_FEATURES`` 禁用 numpy 的 SIMD
+实现（如 ``AVX512F AVX512CD AVX512SKX AVX512CLX AVX2 FMA3``），使
+``np.log`` 等逐元素退回 glibc 标量 libm——与 gfortran（无 fast-math）
+编译的 osmMASTER 所调用的 libm 位一致。
+
+CUDA 上 ``tensor / python标量`` 不是正确舍入的除法：div_true_kernel 对
+CPU 标量除数走"乘倒数"快路径（``x/200.0`` 实为 ``x*fl(1/200)``，约
+15-35% 的值与真除法差 1 ULP），而 gfortran 保持 IEEE 真除法。把非二进制
+（非 2 的幂）标量除数包成同 device 的 0 维张量后，kernel 走通用二元路径，
+得到与 glibc 位一致的正确舍入除法（已在 CUDA float64 上逐位验证），
+且无需 CPU 往返。二进制标量除数两种路径都精确，跳过以省开销。
+
+加减乘与 ``sqrt`` 两端都是 IEEE 精确运算（CUDA double sqrt 遵循
+IEEE-754 正确舍入），无需替换。梯度不经过该路径（仅供推理 / 等价性
+验证运行使用）。
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import torch
+
+_ORIGINALS: dict = {}
+
+
+def _elementwise(np_func, torch_func):
+    def patched(tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float64:
+            return torch_func(tensor)
+        with np.errstate(all="ignore"):
+            values = np_func(tensor.detach().cpu().numpy())
+        return torch.as_tensor(values, dtype=torch.float64, device=tensor.device)
+
+    return patched
+
+
+def _torch_pow(base, exponent):
+    if not isinstance(base, torch.Tensor) or base.dtype != torch.float64:
+        return _ORIGINALS["torch_pow"](base, exponent)
+    base_np = base.detach().cpu().numpy()
+    if isinstance(exponent, torch.Tensor):
+        if exponent.dtype != torch.float64:
+            return _ORIGINALS["torch_pow"](base, exponent)
+        exp_np = exponent.detach().cpu().numpy()
+    else:
+        exp_np = exponent
+    # gfortran expands literal integer powers into multiplications
+    # (X**2 -> X*X, X**3 -> X*X*X) and never calls pow for them; glibc
+    # pow(x, 2.0) can differ from x*x by 1 ulp, so mirror the Fortran
+    # expansion to keep bitwise parity.  Fractional/variable exponents
+    # (2/3, 0.25, 1.5, ...) DO call libm pow in the Fortran and np.power
+    # here -- both use the same glibc pow, so they already agree.
+    if isinstance(exp_np, int) and not isinstance(exp_np, bool) and exp_np == 2:
+        with np.errstate(all="ignore"):
+            values = base_np * base_np
+    elif isinstance(exp_np, int) and not isinstance(exp_np, bool) and exp_np == 3:
+        with np.errstate(all="ignore"):
+            values = base_np * base_np * base_np
+    else:
+        with np.errstate(all="ignore"):
+            values = np.power(base_np, exp_np)
+    device = base.device if isinstance(exponent, (int, float)) or exponent.ndim == 0 else base.device
+    return torch.as_tensor(values, dtype=torch.float64, device=device)
+
+
+def _tensor_pow(self, exponent):
+    return _torch_pow(self, exponent)
+
+
+def _is_dyadic(value: float) -> bool:
+    """2 的幂（含 0）除法两种路径都精确舍入，无需替换。"""
+    value = float(value)
+    if value == 0.0:
+        return True
+    mantissa = abs(value)
+    while mantissa >= 2.0:
+        mantissa /= 2.0
+    while mantissa < 1.0:
+        mantissa *= 2.0
+    return mantissa == 1.0
+
+
+def _tensor_truediv(self, other):
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and self.dtype == torch.float64
+        and not _is_dyadic(other)
+    ):
+        divisor = torch.as_tensor(float(other), dtype=torch.float64, device=self.device)
+        return _ORIGINALS["tensor_truediv"](self, divisor)
+    return _ORIGINALS["tensor_truediv"](self, other)
+
+
+def install() -> bool:
+    """安装替换；未设置 ``SURF_LIBM_EXACT=1`` 时原样返回。"""
+    if os.environ.get("SURF_LIBM_EXACT") != "1":
+        return False
+    if _ORIGINALS:
+        return True
+
+    _ORIGINALS.update({
+        "log": torch.log, "log10": torch.log10, "exp": torch.exp,
+        "sin": torch.sin, "cos": torch.cos, "atan": torch.atan,
+        "torch_pow": torch.pow, "tensor_pow": torch.Tensor.pow,
+        "tensor_ipow": torch.Tensor.__pow__,
+        "tensor_truediv": torch.Tensor.__truediv__,
+    })
+    torch.log = _elementwise(np.log, _ORIGINALS["log"])
+    torch.log10 = _elementwise(np.log10, _ORIGINALS["log10"])
+    torch.exp = _elementwise(np.exp, _ORIGINALS["exp"])
+    torch.sin = _elementwise(np.sin, _ORIGINALS["sin"])
+    torch.cos = _elementwise(np.cos, _ORIGINALS["cos"])
+    torch.atan = _elementwise(np.arctan, _ORIGINALS["atan"])
+    torch.pow = _torch_pow
+    torch.Tensor.pow = _tensor_pow
+    torch.Tensor.__pow__ = _tensor_pow
+    torch.Tensor.__truediv__ = _tensor_truediv
+    return True

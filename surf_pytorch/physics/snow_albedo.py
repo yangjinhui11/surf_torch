@@ -1,98 +1,89 @@
-"""Snow albedo aging (``SRFSN`` 340-361 and ``SRFSN_ASN`` 133-179).
+"""雪反照率老化（``SRFSN`` 340-361 与 ``SRFSN_ASN`` 133-179）。
 
-This module ports the snow-albedo aging of the single-layer snow scheme.
-Two algorithms live here, dispatched by whether the land-ice cover
-fraction ``PCIL`` is supplied on the inputs:
+本模块移植单层雪方案的雪反照率老化。此处有两个算法，根据输入上是否
+提供陆冰覆盖率 ``PCIL`` 来分派：
 
-* **Legacy** (``SRFSN`` lines 340-361) -- the pure-land-snow path,
-  selected when ``pcil`` is ``None``.  This is bit-for-bit the original
-  port: a no-snow reset, a melt exponential-decay / cold linear-decay
-  branch, and a fresh-snow hard reset on the ``RSFRESH`` threshold.
+* **传统版**（``SRFSN`` 第 340-361 行）——纯陆地积雪路径，当
+  ``pcil`` 为 ``None`` 时选用。这是对原始移植的逐位复现：无雪重置、
+  消融指数衰减 / 冷态线性衰减分支，以及在 ``RSFRESH`` 阈值上的新雪
+  硬重置。
 
-* **SRFSN_ASN** (``srfsn_asn_mod.F90`` lines 133-179) -- the full
-  multi-surface scheme, selected when ``pcil`` is supplied.  It splits
-  the new albedo into a **land part** (``ZASN_L``) and a **glacier /
-  land-ice part** (``ZASN_I``), then blends them by ``PCIL``.  The land
-  part reuses the legacy melt/cold decay but swaps the hard RSFRESH
-  reset for a **linear snowfall brightening** (a graded approach to
-  RALFMAXSN as the snowfall water-equivalent grows toward 10 mm).  The
-  glacier part uses glacier-specific constants (ZALBMIN=0.65,
-  ZRTAUF_GL=0.085, ZALBMAX_GL=RALFMINPSN=0.82) and a hemisphere-
-  dependent snowfall reset threshold (5 mm NH / 4 mm SH).
+* **SRFSN_ASN**（``srfsn_asn_mod.F90`` 第 133-179 行）——完整的多
+  表面方案，当提供 ``pcil`` 时选用。它将新反照率拆分为**陆地部分**
+  （``ZASN_L``）与**冰川 / 陆冰部分**（``ZASN_I``），再按 ``PCIL``
+  混合。陆地部分复用传统版的消融/冷态衰减，但把 RSFRESH 硬重置换成
+  **线性降雪增亮**（随着降雪水当量增长至 10 mm，渐变逼近
+  RALFMAXSN）。冰川部分使用冰川专属常数（ZALBMIN=0.65、
+  ZRTAUF_GL=0.085、ZALBMAX_GL=RALFMINPSN=0.82）和半球相关的降雪重置
+  阈值（北半球 5 mm / 南半球 4 mm）。
 
-The ``SRFSN_LWIMP`` path that :mod:`surf_pytorch.physics.snow`
-mirrors *does not* update the snow albedo ``PASN`` -- its signature only
-outputs ``PTSN``/``PGSN`` -- so this module supplies the aging that
-advances ``PASNM1M`` alongside ``PSNM1M``,
-``PTSNM1M`` and ``PRSNM1M``.
+:mod:`surf_pytorch.physics.snow` 所镜像的 ``SRFSN_LWIMP`` 路径*并不*
+更新雪反照率 ``PASN``——其签名只输出 ``PTSN``/``PGSN``——因此本
+模块提供随 ``PSNM1M``、``PTSNM1M`` 和 ``PRSNM1M`` 一起推进
+``PASNM1M`` 的老化过程。
 
-What the legacy scheme does
+传统方案概述
 ---------------------------
-The new snow albedo ``PASN`` (dimensionless, in [RALFMINSN, RALFMAXSN] =
-[0.50, 0.85]) is built from three branches, exactly as in ``SRFSN`` lines
-340-361:
+新的雪反照率 ``PASN``（无量纲，在 [RALFMINSN, RALFMAXSN] =
+[0.50, 0.85] 内）由三个分支构建，与 ``SRFSN`` 第 340-361 行完全
+一致：
 
-1. **No-snow branch** (``LLNOSNOW``): the albedo is reset to fresh-snow
-   maximum ``RALFMAXSN``::
+1. **无雪分支**（``LLNOSNOW``）：反照率重置为新雪最大值
+   ``RALFMAXSN``::
 
        PASN = RALFMAXSN
 
-2. **Melt branch** (``PMSN > 0``): when the snow is melting the albedo
-   decays exponentially toward ``RALFMINSN`` with the melt decay time
-   ``RTAUF`` (1/day)::
+2. **消融分支**（``PMSN > 0``）：雪在消融时，反照率以消融衰减时间
+   ``RTAUF``（1/天）向 ``RALFMINSN`` 指数衰减::
 
        ZEXPF = exp(-RTAUF * PTMST / RDAY)
        PASN  = (PASNM1M - RALFMINSN) * ZEXPF + RALFMINSN
 
-3. **Cold branch** (``PMSN <= 0``): when the snow is not melting the
-   albedo decays linearly toward ``RALFMINSN`` with the cold decay rate
-   ``RTAUA`` (1/day), floored at ``RALFMINSN``::
+3. **冷态分支**（``PMSN <= 0``）：雪未消融时，反照率以冷态衰减率
+   ``RTAUA``（1/天）向 ``RALFMINSN`` 线性衰减，下界为
+   ``RALFMINSN``::
 
        ZLINA = RTAUA * PTMST / RDAY
        PASN  = max(RALFMINSN, PASNM1M - ZLINA)
 
-4. **Fresh-snow reset**: on top of either snow branch, a snowfall rate
-   exceeding the ``RSFRESH`` threshold (1/3600 kg/m^2/s) resets the
-   albedo to ``RALFMAXSN``, modelling the brightening effect of fresh
-   snow::
+4. **新雪重置**：在任一积雪分支之上，降雪率超过 ``RSFRESH`` 阈值
+   （1/3600 kg/m^2/s）时将反照率重置为 ``RALFMAXSN``，模拟新雪的
+   增亮效应::
 
        IF (ZSSFC + ZSSFL) > RSFRESH: PASN = RALFMAXSN
 
-The commented-out ``PSSNM1M >= RSNPER`` branch in the Fortran (lines 349-
-353) is deliberately kept inert here: ``RSNPER`` is not in the port's
-constant set, and the dead branch collapses to ``ZALFMINSN = RALFMINSN``
-in every case, so it has no effect.
+Fortran 中被注释掉的 ``PSSNM1M >= RSNPER`` 分支（第 349-353 行）在此
+有意保持不生效：``RSNPER`` 不在移植的常数集合中，且该死分支在任何
+情况下都塌缩为 ``ZALFMINSN = RALFMINSN``，因此没有影响。
 
-What the SRFSN_ASN glacier scheme adds
+SRFSN_ASN 冰川方案的新增内容
 --------------------------------------
-When ``PCIL`` is supplied, the same no-snow reset fires, but the snow-
-bearing branch splits into (``srfsn_asn_mod.F90`` 137-176):
+当提供 ``PCIL`` 时，同样的无雪重置触发，但积雪分支拆分为
+（``srfsn_asn_mod.F90`` 137-176）：
 
-* **Land part** ``ZASN_L``: identical melt/cold decay as the legacy
-  branch, then a *linear* snowfall brightening
-  ``ZASN_L += min(max(PSNOWF*PTMST,0)/10,1)*(RALFMAXSN - ZASN_L)`` and a
-  clamp to ``[RALFMINSN, RALFMAXSN]``.
+* **陆地部分** ``ZASN_L``：与传统分支相同的消融/冷态衰减，然后是
+  *线性*降雪增亮
+  ``ZASN_L += min(max(PSNOWF*PTMST,0)/10,1)*(RALFMAXSN - ZASN_L)``，
+  并截断到 ``[RALFMINSN, RALFMAXSN]``。
 
-* **Glacier part** ``ZASN_I``: if ``PTSNM1M(:,1) > RTT - 5`` (melting
-  conditions) decays exponentially toward ``ZALBMIN=0.65`` with the
-  glacier melt rate ``ZRTAUF_GL=0.085``; otherwise ``ZASN_I = PASNM1M``
-  (cold glaciers keep their albedo).  A linear snowfall brightening
-  with the hemisphere-dependent threshold ``ZALBRESET`` (5 mm NH / 4 mm
-  SH) drives ``ZASN_I`` toward ``ZALBMAX_GL=RALFMINPSN``, then a clamp
-  to ``[ZALBMIN, ZALBMAX_GL]``.
+* **冰川部分** ``ZASN_I``：若 ``PTSNM1M(:,1) > RTT - 5``（消融条
+  件），则以冰川消融率 ``ZRTAUF_GL=0.085`` 向 ``ZALBMIN=0.65`` 指数
+  衰减；否则 ``ZASN_I = PASNM1M``（冷冰川保持其反照率）。带半球相关
+  阈值 ``ZALBRESET``（北半球 5 mm / 南半球 4 mm）的线性降雪增亮驱动
+  ``ZASN_I`` 趋向 ``ZALBMAX_GL=RALFMINPSN``，然后截断到
+  ``[ZALBMIN, ZALBMAX_GL]``。
 
-* **Blend**: ``PASN = (1-PCIL)*ZASN_L + PCIL*ZASN_I`` (or ``ZASN_I``
-  when ``PCIL >= 1 - epsilon``), with a final safety clamp to
-  ``[RALFMINSN, RALFMAXSN]``.
+* **混合**：``PASN = (1-PCIL)*ZASN_L + PCIL*ZASN_I``（或当
+  ``PCIL >= 1 - epsilon`` 时取 ``ZASN_I``），最后安全截断到
+  ``[RALFMINSN, RALFMAXSN]``。
 
-Sign / unit convention
+符号 / 单位约定
 ----------------------
-``PASN`` is dimensionless in [0.50, 0.85].  ``PMSN`` is the melt rate in
-kg/m^2/s (positive only on the melt branch, as exported by
-:mod:`surf_pytorch.physics.snow`).  ``ZSSFC + ZSSFL`` is the total
-snowfall rate (convective + large-scale) in kg/m^2/s.  ``PTMST`` is the
-coupling interval in seconds; ``RDAY`` is the day length in seconds.
-``PCIL`` is the land-ice cover fraction in [0,1].
+``PASN`` 无量纲，在 [0.50, 0.85] 内。``PMSN`` 是消融率，单位
+kg/m^2/s（仅在消融分支为正，如 :mod:`surf_pytorch.physics.snow` 所
+导出）。``ZSSFC + ZSSFL`` 是总降雪率（对流 + 大尺度），单位
+kg/m^2/s。``PTMST`` 是耦合间隔，单位秒；``RDAY`` 是日长，单位秒。
+``PCIL`` 是陆冰覆盖率，在 [0,1] 内。
 """
 
 from __future__ import annotations
@@ -105,22 +96,21 @@ import torch
 
 from ..constants import ConstantBundle
 from ..tables.soil import SoilTable
+from ._ieee import true_div
 
 
 @dataclass
 class SnowAlbedoInputs:
-    """Inputs to the snow-albedo aging solve.
+    """雪反照率老化求解的输入。
 
-    Each tensor is ``(Ngrid,)`` unless noted.  Naming mirrors the
-    ``SRFSN`` / ``SRFSN_ASN`` local / dummy variables so a side-by-side
-    audit is easy.
+    除注明外，每个张量均为 ``(Ngrid,)``。命名镜像 ``SRFSN`` /
+    ``SRFSN_ASN`` 的局部变量 / 哑元变量，便于逐行对照审计。
 
-    The glacier (land-ice) branch fields are **optional**.  When
-    ``pcil`` is ``None`` the solver runs the pure-land-snow legacy
-    ``SRFSN`` algorithm (340-361) bit-for-bit.  Supplying ``pcil``
-    activates the full ``SRFSN_ASN`` scheme (133-179) which splits the
-    albedo into a land part (``ZASN_L``) and a glacier part (``ZASN_I``),
-    weighted by the land-ice cover fraction ``PCIL``.
+    冰川（陆冰）分支字段是**可选的**。当 ``pcil`` 为 ``None`` 时，
+    求解器逐位复现纯陆地积雪的传统 ``SRFSN`` 算法（340-361）。提供
+    ``pcil`` 则激活完整的 ``SRFSN_ASN`` 方案（133-179），将反照率
+    拆分为陆地部分（``ZASN_L``）与冰川部分（``ZASN_I``），并按陆冰
+    覆盖率 ``PCIL`` 加权。
     """
 
     # ---- Snow albedo at t-1 ----
@@ -150,7 +140,7 @@ class SnowAlbedoInputs:
 
 @dataclass
 class SnowAlbedoOutputs:
-    """Outputs of the single-layer snow-albedo aging solve."""
+    """单层雪反照率老化求解的输出。"""
 
     pasn: torch.Tensor          # PASN  new snow albedo  [-]       (Ngrid,)
 
@@ -162,24 +152,24 @@ def compute_snow_albedo(
     *,
     differentiable: bool = True,
 ) -> SnowAlbedoOutputs:
-    """Run the single-layer snow-albedo aging (``SRFSN`` 340-361).
+    """运行单层雪反照率老化（``SRFSN`` 340-361）。
 
     Args
     ----
     inp:
-        :class:`SnowAlbedoInputs` -- packed snow albedo, melt rate,
-        snowfall and the no-snow mask from the snow solve.
+        :class:`SnowAlbedoInputs`——打包的雪反照率、消融率、降雪
+        以及来自雪求解的无雪掩码。
     soil_table:
-        :class:`surf_pytorch.tables.soil.SoilTable` -- provides the
-        albedo constants (ralfminsn, ralfmaxsn, rtauf, rtaua, rsfresh).
+        :class:`surf_pytorch.tables.soil.SoilTable`——提供反照率
+        常数（ralfminsn, ralfmaxsn, rtauf, rtaua, rsfresh）。
     consts:
-        :class:`ConstantBundle` -- provides ``rday``.
+        :class:`ConstantBundle`——提供 ``rday``。
     differentiable:
-        If ``False`` run under ``torch.no_grad()`` for speed.
+        若为 ``False`` 则在 ``torch.no_grad()`` 下运行以提速。
 
     Returns
     -------
-    :class:`SnowAlbedoOutputs` -- the new snow albedo ``PASN``.
+    :class:`SnowAlbedoOutputs`——新的雪反照率 ``PASN``。
     """
 
     def _core() -> SnowAlbedoOutputs:
@@ -196,14 +186,14 @@ def _albedo_core(
     soil_table: SoilTable,
     consts: ConstantBundle,
 ) -> SnowAlbedoOutputs:
-    """Internal: assumes the no_grad / enable_grad decision is already made.
+    """内部：假定 no_grad / enable_grad 的决定已经做出。
 
-    Dispatches on ``inp.pcil``:
+    按 ``inp.pcil`` 分派：
 
-    * ``pcil is None`` -> legacy ``SRFSN`` (340-361), bit-for-bit the
-      original port (no-snow reset + melt/cold decay + RSFRESH reset).
-    * ``pcil`` supplied -> full ``SRFSN_ASN`` (133-179) with the glacier
-      branch and linear snowfall brightening.
+    * ``pcil is None`` -> 传统 ``SRFSN``（340-361），逐位复现原始
+      移植（无雪重置 + 消融/冷态衰减 + RSFRESH 重置）。
+    * 提供 ``pcil`` -> 完整 ``SRFSN_ASN``（133-179），含冰川分支
+      与线性降雪增亮。
     """
     if inp.pcil is None:
         return _legacy_albedo(inp, soil_table, consts)
@@ -215,9 +205,9 @@ def _legacy_albedo(
     soil_table: SoilTable,
     consts: ConstantBundle,
 ) -> SnowAlbedoOutputs:
-    """Legacy single-layer snow-albedo aging (``SRFSN`` 340-361).
+    """传统单层雪反照率老化（``SRFSN`` 340-361）。
 
-    Bit-for-bit the original port.  Activated when ``pcil`` is None.
+    逐位复现原始移植。当 ``pcil`` 为 None 时激活。
     """
     # ------------------------------------------------------------------ #
     # Scalar constants (sussoil lines 497-528 + physical constants).
@@ -268,7 +258,7 @@ def _legacy_albedo(
     # whose land branch uses a linear approach to RALFMAXSN over 10 mm SWE,
     # not the older SRFSN hard reset at RSFRESH.
     # ------------------------------------------------------------------ #
-    snow_amt = torch.clamp(torch.clamp_min(pssflpssfc * ptmst, 0.0) / 10.0, max=1.0)
+    snow_amt = torch.clamp(true_div(torch.clamp_min(pssflpssfc * ptmst, 0.0), 10.0), max=1.0)
     pasn_with = pasn_with + snow_amt * (zalfmaxsn - pasn_with)
     pasn_with = torch.clamp(pasn_with, min=ralfminsn, max=ralfmaxsn)
 
@@ -285,11 +275,10 @@ def _asn_albedo(
     soil_table: SoilTable,
     consts: ConstantBundle,
 ) -> SnowAlbedoOutputs:
-    """Full SRFSN_ASN snow-albedo aging (``srfsn_asn_mod.F90`` 133-179).
+    """完整的 SRFSN_ASN 雪反照率老化（``srfsn_asn_mod.F90`` 133-179）。
 
-    Activated when ``pcil`` is supplied.  Splits the new albedo into a
-    land part (``ZASN_L``) and a glacier part (``ZASN_I``), blends them
-    by PCIL, and applies a final safety clamp.
+    当提供 ``pcil`` 时激活。将新反照率拆分为陆地部分（``ZASN_L``）
+    与冰川部分（``ZASN_I``），按 PCIL 混合，并施加最终的安全截断。
     """
     # ------------------------------------------------------------------ #
     # Scalar constants.
@@ -348,7 +337,7 @@ def _asn_albedo(
     pasn_cold = torch.clamp_min(pasnm1m - zlina, min=ralfminsn)
     zasn_l = torch.where(melt, pasn_melt, pasn_cold)
     # Linear snowfall brightening (replaces the RSFRESH hard reset).
-    snow_amt = torch.clamp(torch.clamp_min(psnowf * ptmst, 0.0) / 10.0, max=1.0)
+    snow_amt = torch.clamp(true_div(torch.clamp_min(psnowf * ptmst, 0.0), 10.0), max=1.0)
     zasn_l = zasn_l + snow_amt * (zalfmaxsn - zasn_l)
     zasn_l = torch.clamp(zasn_l, min=ralfminsn, max=ralfmaxsn)
 

@@ -50,15 +50,14 @@ def foedelta(t: torch.Tensor, c: ConstantBundle) -> torch.Tensor:
 
         FOEDELTA(PTARE) = MAX(0.0_JPRB, SIGN(1.0_JPRB, PTARE-RTT))
 
-    Returns 1.0 for water (T >= RTT) and 0.0 for ice (T < RTT), with a
-    branch at exactly ``RTT`` matching ``SIGN(1.0, 0.0) == 0.0`` hence
-    ``MAX(0,0) == 0`` -- i.e. ice at the triple point.  Implemented with
-    ``torch.where`` so the derivative is exactly zero on the boundary,
-    matching the statement-function semantics.
+    Returns 1.0 for water (T >= RTT) and 0.0 for ice (T < RTT).  The
+    equality case is important: Fortran ``SIGN(1.0, +0.0)`` returns
+    ``+1.0``, so ``FOEDELTA(RTT)`` selects the liquid coefficients.
+    Implemented with ``torch.where`` so the discrete phase convention is
+    preserved in the port.
     """
     diff = t - c.rtt
-    sign = torch.where(diff > 0, torch.ones_like(t), torch.where(diff < 0, -torch.ones_like(t), torch.zeros_like(t)))
-    return torch.clamp(sign, min=0.0)
+    return torch.where(diff >= 0.0, torch.ones_like(t), torch.zeros_like(t))
 
 
 def foealfa(t: torch.Tensor, c: ConstantBundle) -> torch.Tensor:
@@ -366,7 +365,13 @@ def scatter_to_tiles(
     Returns:
         (..., Ngrid) grid-mean quantity.
     """
-    return (per_tile * tile_frac).sum(dim=-1)
+    # Every Fortran tile-to-grid aggregation (SURFPP ZTSK, CALLPAR1S
+    # PAHFSG, SURFEXCDRIVER PCFMLEV, ...) is a sequential DO-loop sum.
+    # A pairwise tree reduction rounds differently and seeds ulp drift.
+    out = torch.zeros(per_tile.shape[:-1], dtype=per_tile.dtype, device=per_tile.device)
+    for tile in range(per_tile.shape[-1]):
+        out = out + per_tile[..., tile] * tile_frac[..., tile]
+    return out
 
 
 def expand_as_tiles(
