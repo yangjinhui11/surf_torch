@@ -178,29 +178,14 @@ def _density_core(
     rpi = consts.pi
 
     sc = soil_table.consts
-    # density-evolution constants (rdnml_params.F90:28-65)
-    rhominsna = float(sc.rhominsna)
-    rhominsnb = float(sc.rhominsnb)
-    rhominsnc = float(sc.rhominsnc)
-    rhominsnd = float(sc.rhominsnd)
-    rsndtovera = float(sc.rsndtovera)
-    rsndtoverb = float(sc.rsndtoverb)
-    rsndtoverc = float(sc.rsndtoverc)
-    rsndtdesta = float(sc.rsndtdesta)
-    rsndtdestb = float(sc.rsndtdestb)
-    rsndtdestc = float(sc.rsndtdestc)
-    rsndtdestroi = float(sc.rsndtdestroi)
-    rhomaxsn_new = float(sc.rhomaxsn_new)
-    # supporting scalars (sussoil / rdnml_params)
-    rhominsn = float(sc.rhominsn)
-    rdsmax = float(sc.rdsmax)
-    rhoice = float(sc.rhoice)
-    rhoci = float(sc.rhoci)
-    rlwcswea = float(sc.rlwcswea)
-    rlwcsweb = float(sc.rlwcsweb)
-    rlwcswec = float(sc.rlwcswec)
-    rtempamp = float(sc.rtempamp)
-    rfrtiny = float(sc.rfrtiny)
+    # snow-density constants are fixed; float() of a device tensor is a
+    # host sync (forbidden during CUDA-graph capture) -- extract once.
+    _scc = _density_core.__dict__.get('_sc_floats')
+    if _scc is None or _scc[0] is not sc:
+        _scc = (sc, tuple(float(getattr(sc, n)) for n in (
+            'rhominsna', 'rhominsnb', 'rhominsnc', 'rhominsnd', 'rsndtovera', 'rsndtoverb', 'rsndtoverc', 'rsndtdesta', 'rsndtdestb', 'rsndtdestc', 'rsndtdestroi', 'rhomaxsn_new', 'rhominsn', 'rdsmax', 'rhoice', 'rhoci', 'rlwcswea', 'rlwcsweb', 'rlwcswec', 'rtempamp', 'rfrtiny')))
+        _density_core.__dict__['_sc_floats'] = _scc
+    (rhominsna, rhominsnb, rhominsnc, rhominsnd, rsndtovera, rsndtoverb, rsndtoverc, rsndtdesta, rsndtdestb, rsndtdestc, rsndtdestroi, rhomaxsn_new, rhominsn, rdsmax, rhoice, rhoci, rlwcswea, rlwcsweb, rlwcswec, rtempamp, rfrtiny) = _scc[1]
 
     ptmst = inp.ptmst
     ztmst = 1.0 / ptmst
@@ -251,7 +236,7 @@ def _density_core(
     phase = rpi * (ptsnm1m - zt0) / rtempamp
     zfunc_inside = 1.0 + torch.sin(phase)
     zdfunc_inside = torch.cos(phase) * rpi / rtempamp
-    zdfunc_above = torch.full_like(ptsnm1m, rpi / rtempamp)
+    zdfunc_above = (rpi / rtempamp).expand(ptsnm1m.shape)
     zfunc = torch.where(t_below, torch.zeros_like(ptsnm1m),
                 torch.where(t_inside, zfunc_inside, torch.zeros_like(ptsnm1m)))
     zdfunc = torch.where(t_below, torch.zeros_like(ptsnm1m),
@@ -308,7 +293,7 @@ def _density_core(
     prsn_snow = torch.clamp(prsn_snow, min=rhominsn)
 
     # No-snow branch (Fortran line 491): density resets to RHOMINSN.
-    prsn = torch.where(llnosnow, torch.full_like(prsn_snow, rhominsn), prsn_snow)
+    prsn = torch.where(llnosnow, torch.full((), rhominsn, dtype=prsn_snow.dtype, device=prsn_snow.device).expand(prsn_snow.shape), prsn_snow)
 
     return SnowDensityOutputs(prsn=prsn)
 

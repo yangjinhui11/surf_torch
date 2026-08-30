@@ -343,7 +343,7 @@ def farquhar(inp: FarquharInputs, veg, consts, debug: dict | None = None) -> Far
     # Mesophyll conductance (C3 only; C4 branch leaves ZGM=0).
     zt_gm = _arrhenius_mod(zleaf_temp, float(fc.rref_temp),
                            re_gm_g, rd_gm_g, rs_gm_g, float(RGAS))
-    zgm_c3 = rgm25 * zt_gm * torch.clamp_min(1.0 - rstress_gm, min=float(zwater_lim.min()))
+    zgm_c3 = rgm25 * zt_gm * torch.maximum(1.0 - rstress_gm, zwater_lim.min())
     zgm = torch.where(is_c4, torch.zeros_like(zgm_c3),
                       rgm25 * zt_gm * torch.maximum(1.0 - rstress_gm, zwater_lim))
 

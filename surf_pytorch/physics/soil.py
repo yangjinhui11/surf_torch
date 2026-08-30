@@ -481,9 +481,16 @@ def _soil_thickness(
     SurfConfig.soil_thickness 是唯一权威来源，因此采用非默认层数的
     配置仍可正常工作。
     """
-    return torch.as_tensor(
-        config.soil_thickness, dtype=dtype, device=device
-    )[: config.n_soil]
+    # 跨步不变的层厚向量；每步从 host 列表重建会做 host->device 拷贝
+    #（CUDA graph 捕获所禁止）。按 (id(config), dtype, device) 缓存一次。
+    _c = _soil_thickness.__dict__.get('_rdat_cache')
+    _key = (id(config), dtype, str(device))
+    if _c is None or _c[0] != _key:
+        _c = (_key, torch.as_tensor(
+            config.soil_thickness, dtype=dtype, device=device
+        )[: config.n_soil])
+        _soil_thickness.__dict__['_rdat_cache'] = _c
+    return _c[1]
 
 
 def _apparent_heat_capacity(
@@ -1413,14 +1420,22 @@ def _runoff(
         # ZFRK(JK) = fraction of layer JK inside the RSRDEP window.
         # rdaw is constant across the batch, so we evaluate ZFRK once as a
         # plain 1-D tensor and broadcast (no per-grid state involved).
-        rdaw_py = rdaw.detach().to("cpu", dtype=torch.float64).tolist()
-        zfrk_list = []
-        for jk in range(nlevs):
-            zsum_lo = sum(rdaw_py[:jk]) if jk > 0 else 0.0
-            zsum_hi = sum(rdaw_py[: jk + 1])
-            val = max(0.0, min(rsrdep, zsum_hi) - zsum_lo) / rdaw_py[jk]
-            zfrk_list.append(max(0.0, val))
-        zfrk_1d = torch.as_tensor(zfrk_list, dtype=dtype, device=device)
+        # Root fractions are constant per run; compute once eagerly and cache
+        # the device tensor.  The cache is checked before any host transfer so
+        # no D2H/H2D copy happens during CUDA-graph capture.
+        _zk = _runoff.__dict__.get('_zfrk_cache')
+        if _zk is None or str(_zk[0]) != str(device):
+            rdaw_py = rdaw.detach().to("cpu", dtype=torch.float64).tolist()
+            zfrk_list = []
+            for jk in range(nlevs):
+                zsum_lo = sum(rdaw_py[:jk]) if jk > 0 else 0.0
+                zsum_hi = sum(rdaw_py[: jk + 1])
+                val = max(0.0, min(rsrdep, zsum_hi) - zsum_lo) / rdaw_py[jk]
+                zfrk_list.append(max(0.0, val))
+            _zk = (torch.device(device),
+                   torch.tensor(zfrk_list, dtype=dtype, device=device))
+            _runoff.__dict__['_zfrk_cache'] = _zk
+        zfrk_1d = _zk[1]
         zfrk = zfrk_1d.expand(ngrid, nlevs)
 
         # Orographic sub-grid coefficient ZBWS.  RSIGORMIN/MAX are the
@@ -1497,7 +1512,7 @@ def _runoff(
     # Convective precip runoff. Keep the Fortran operation order:
     # ZROC = MAX(0, RPSFR * PTSFC - ZINFMAX) * ZPSFR,
     # with RPSFR=2 and ZPSFR=1/RPSFR=0.5 in SUSSOIL.
-    rpsfr = torch.as_tensor(rpsfr, dtype=dtype, device=device)
+    rpsfr = torch.full((), rpsfr, dtype=dtype, device=device)
     zpsfr = 1.0 / rpsfr
     zroc = torch.clamp(rpsfr * inp.ptsfc - zinfmax, min=0.0) * zpsfr
     zrot = zrol + zroc

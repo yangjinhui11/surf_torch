@@ -242,17 +242,16 @@ def _snow_core(
     rpi = consts.pi
 
     sc = soil_table.consts
-    rhoice = float(sc.rhoice)
-    rlamsn = float(sc.rlamdsn_pow)
-    rdsmax = float(sc.rdsmax)
-    rhoci = float(sc.rhoci)
-    rlamice = float(sc.rlamice)
-    rfrsmall = float(sc.rfrsmall)
-    rfrtiny = float(sc.rfrtiny)
-    rlwcswea = float(sc.rlwcswea)
-    rlwcsweb = float(sc.rlwcsweb)
-    rlwcswec = float(sc.rlwcswec)
-    rtempamp = float(sc.rtempamp)
+    # Snow constants are fixed; a float() of a device tensor is a host sync
+    # (forbidden during CUDA-graph capture), so extract once and cache.
+    _scc = _snow_core.__dict__.get('_sc_floats')
+    if _scc is None or _scc[0] is not sc:
+        _scc = (sc, tuple(float(getattr(sc, n)) for n in (
+            'rhoice', 'rlamdsn_pow', 'rdsmax', 'rhoci', 'rlamice', 'rfrsmall',
+            'rfrtiny', 'rlwcswea', 'rlwcsweb', 'rlwcswec', 'rtempamp')))
+        _snow_core.__dict__['_sc_floats'] = _scc
+    (rhoice, rlamsn, rdsmax, rhoci, rlamice, rfrsmall, rfrtiny,
+     rlwcswea, rlwcsweb, rlwcswec, rtempamp) = _scc[1]
 
     ptmst = inp.ptmst
 
@@ -329,7 +328,9 @@ def _snow_core(
     # 主循环体，向量化（Fortran 第 215-331 行）。
     # ------------------------------------------------------------------ #
     # 默认输出（无雪分支的取值；有雪处会被覆盖）。
-    zt0_t = torch.as_tensor(zt0, dtype=dtype, device=device)
+    # zt0 == consts.rtt is already a 0-dim device tensor; wrap with to() only
+    # (torch.full would read the fill value on the host, forbidden in capture).
+    zt0_t = zt0.to(dtype=dtype, device=device) if isinstance(zt0, torch.Tensor)         else torch.full((), zt0, dtype=dtype, device=device)
 
     # --- 雪面净热通量（ZHFLUX）---------------------------------------- #
     # ZHFLUXP = PFRTI(5)*(PAHFSTI(5)+RLSTT*PEVAPTI(5))
@@ -376,7 +377,7 @@ def _snow_core(
     zdsnr = pssnm1m / (prsnm1m * zfrsn)
     zconslwc = torch.clamp((rlwcswea - prsnm1m) / rlwcswea, min=0.0)
     zlwc = pssnm1m * (rlwcsweb + (rlwcswec - rlwcsweb) * zconslwc)
-    zdsn_rp = torch.minimum(zdsnr, torch.as_tensor(zrdsnmax, dtype=dtype, device=device))
+    zdsn_rp = torch.minimum(zdsnr, torch.full((), zrdsnmax, dtype=dtype, device=device))
     # Guard divide-by-zero: where ZDSNR is zero (no snow) the snow
     # branch is not taken, but the expression must still be finite for
     # autograd.  Use a safe divide and zero out the no-snow points later.
@@ -408,7 +409,7 @@ def _snow_core(
         ramp, zdfunc_ramp,
         torch.where(
             melting,
-            torch.full_like(ptsnm1m, rpi * zitempamp),
+            (rpi * zitempamp).expand(ptsnm1m.shape),
             zdfunc,                                  # cold -> 0
         ),
     )
@@ -435,7 +436,7 @@ def _snow_core(
     # ZRS     = 1 / (ZSNRES + ZSOILRES)
     zdsn = torch.minimum(
         pssnm1m / (prsnm1m * zfrsn),
-        torch.as_tensor(zrdsnresmax, dtype=dtype, device=device),
+        torch.full((), zrdsnresmax, dtype=dtype, device=device),
     )
     zsnres = 0.5 * zdsn / (
         rlamice * (prsnm1m * zhoice) ** rlamsn
@@ -548,7 +549,7 @@ def _snow_core(
     full_melt = zsstar1 < 0.0
     zsstar_melt = torch.where(full_melt, torch.zeros_like(zsstar1), zsstar1)
     pgsn_melt = torch.where(full_melt, pgsn_full, pgsn_partial)
-    ptsn_melt = torch.full_like(ptsnm1m, zt0)
+    ptsn_melt = zt0.expand(ptsnm1m.shape)
 
     # Combine the melt / no-melt branches.
     ptsn_with_snow = torch.where(no_melt, ptsn_no_melt, ptsn_melt)

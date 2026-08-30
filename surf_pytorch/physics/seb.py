@@ -409,8 +409,10 @@ def _tile_latent_heat(
     返回 ``(Ngrid, Ntile)`` 张量。tile 索引为 0 基
     （``TILE_ICE=1``、``TILE_LOW_VEG_SNOW=4``、``TILE_LAKE=8``）。
     """
-    lam = torch.full((ngrid, ntile), consts.rlvtt,
-                     dtype=dtype, device=device)
+    # consts.rlvtt is a 0-dim device tensor; torch.full from it would read the
+    # fill value on the host (forbidden during CUDA-graph capture).  expand
+    # broadcasts it with identical values and no host sync.
+    lam = consts.rlvtt.to(dtype=dtype, device=device).reshape(1, 1).expand(ngrid, ntile).clone()
     if ntile > TILE_ICE:
         lam[:, TILE_ICE] = consts.rlstt
     if ntile > TILE_LOW_VEG_SNOW:

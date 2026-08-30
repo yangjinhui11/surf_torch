@@ -1,4 +1,4 @@
-﻿"""OpenIFS 陆面模式包的顶层 ``nn.Module``。
+"""OpenIFS 陆面模式包的顶层 ``nn.Module``。
 
 这是对外入口：``surf_pytorch.LandSurface`` 是一个 ``nn.Module``，其
 ``forward`` 在给定大气强迫下把地表状态推进一个耦合间隔。它持有四张
@@ -1171,7 +1171,10 @@ class LandSurface(nn.Module):
         snow_t_safe = torch.where(
             active,
             snow_t.to(dtype=dtype, device=device),
-            torch.full((ngrid,), self.consts.rtt, dtype=dtype, device=device),
+            # consts.rtt is a 0-dim device tensor; torch.full from it would read
+            # the fill value on the host (forbidden during CUDA-graph capture).
+            # expand broadcasts it with identical values and no host sync.
+            self.consts.rtt.to(dtype=dtype, device=device).reshape(1).expand(ngrid),
         )
         qssn = qsat(
             snow_t_safe,
@@ -1437,12 +1440,22 @@ class LandSurface(nn.Module):
         # VDFDIFM1S/VDFINCR form PUDIF/PVDIF from the lowest-level
         # absolute wind plus the atmospheric momentum tendency; the F90
         # rounding order is replicated inside vdfdifm1s_surface_stress.
+        # Cache the constant scalars as python floats once (a float() read of a
+        # GPU tensor is a host sync, which CUDA-graph capture forbids).
+        _dtc = self.__dict__.get('_dt_cached')
+        if _dtc is None:
+            _dtc = float(forcing.dt)
+            self.__dict__['_dt_cached'] = _dtc
+        _rgc = self.__dict__.get('_rg_cached')
+        if _rgc is None:
+            _rgc = float(self.consts.g)
+            self.__dict__['_rg_cached'] = _rgc
         momentum = vdfdifm1s_surface_stress(
             out.pcfm.reshape(ngrid, ntile), frac,
             forcing.u.to(dtype=dtype, device=device),
             forcing.v.to(dtype=dtype, device=device),
-            dt=float(forcing.dt),
-            rg=float(self.consts.g),
+            dt=_dtc,
+            rg=_rgc,
             rvdifts=RVDIFTS,
             u_tendency=forcing.u_tendency.to(dtype=dtype, device=device)
             if forcing.u_tendency is not None else None,
@@ -1595,8 +1608,8 @@ class LandSurface(nn.Module):
         """
         dtype = z0m.dtype
         device = z0m.device
-        zblend = torch.as_tensor(10.0, dtype=dtype, device=device)
-        tiny = torch.as_tensor(1.0e-12, dtype=dtype, device=device)
+        zblend = torch.full((), 10.0, dtype=dtype, device=device)
+        tiny = torch.full((), 1.0e-12, dtype=dtype, device=device)
         z0_safe = torch.clamp(z0m, min=tiny, max=zblend * (1.0 - 1.0e-12))
         # surfexcdriver_ctl_mod.F90 577-588: ZCBLENDM/ZCBLENDH start from
         # the tile-1 term and accumulate tiles 2..KTILES sequentially.
@@ -1658,13 +1671,14 @@ class LandSurface(nn.Module):
                 (frac[:, TILE_HIGH_VEG_SNOW] <= torch.finfo(dtype).eps)
                 & (skin_t[:, TILE_HIGH_VEG_SNOW] > self.consts.rtt + 100.0 * torch.finfo(dtype).eps)
             )
-            if bool(vsurf_guard.any()):
-                vsurf_skin_t = skin_t.clone()
-                vsurf_skin_t[:, TILE_HIGH_VEG_SNOW] = torch.where(
-                    vsurf_guard,
-                    self.consts.rtt.to(dtype=dtype, device=device),
-                    skin_t[:, TILE_HIGH_VEG_SNOW],
-                )
+            # torch.where is idempotent where the guard is False, so apply it
+            # unconditionally: identical values, no host sync, graph-safe.
+            vsurf_skin_t = skin_t.clone()
+            vsurf_skin_t[:, TILE_HIGH_VEG_SNOW] = torch.where(
+                vsurf_guard,
+                self.consts.rtt.to(dtype=dtype, device=device),
+                skin_t[:, TILE_HIGH_VEG_SNOW],
+            )
         p_surf_t = expand_as_tiles(forcing.p_surf, ntile)
         qs_skin = qsat(vsurf_skin_t, p_surf_t, self.consts)
         z0m_tile, z0h, z0q = self._per_tile_z0(
@@ -1882,12 +1896,27 @@ class LandSurface(nn.Module):
         desert_mask = albd > 0.30
         ntile = frac.shape[1]
         emis = torch.zeros_like(zprop)
+        # Band constants are fixed host lists; build them on device once and
+        # reuse (30 host->device copies per step otherwise, and a pageable
+        # host copy is forbidden during CUDA-graph capture).
+        _emis_cache = self.__dict__.get('_emis_bands')
+        if _emis_cache is None or str(_emis_cache[0]) != str(device):
+            _emis_cache = (
+                torch.device(device),
+                torch.tensor(remiss_land, dtype=dtype, device=device),
+                torch.tensor(remiss_desert, dtype=dtype, device=device),
+                torch.tensor(remiss_snow, dtype=dtype, device=device),
+                torch.tensor(remiss_sea, dtype=dtype, device=device),
+                torch.tensor(weights, dtype=dtype, device=device),
+            )
+            self.__dict__['_emis_bands'] = _emis_cache
+        _, _rl, _rd, _rs, _re, _w = _emis_cache
         for s in range(6):
-            land_s = torch.tensor(remiss_land[s], dtype=dtype, device=device)
-            desert_s = torch.tensor(remiss_desert[s], dtype=dtype, device=device)
-            snow_s = torch.tensor(remiss_snow[s], dtype=dtype, device=device)
-            sea_s = torch.tensor(remiss_sea[s], dtype=dtype, device=device)
-            weight_s = torch.tensor(weights[s], dtype=dtype, device=device)
+            land_s = _rl[s]
+            desert_s = _rd[s]
+            snow_s = _rs[s]
+            sea_s = _re[s]
+            weight_s = _w[s]
             # ZEMISSTI(:,4) = REMISS_LAND*ZPROP + REMISS_DESERT*(1-ZPROP)
             soilveg_s = land_s * zprop + desert_s * (1.0 - zprop)
             # SUM over tiles 1..8 in F90 tile order; zero fractions add exact
@@ -1976,8 +2005,7 @@ class LandSurface(nn.Module):
 
         # Per-grid lower-boundary temperatures.
         psst = state.sst if state.sst is not None else \
-            torch.full((ngrid,), state.soil_t[:, 0].mean(),
-                       dtype=dtype, device=device)
+            state.soil_t[:, 0].mean().to(dtype=dtype, device=device).reshape(1).expand(ngrid)
         # PTICE / PTSNOW: until the sea-ice / snow prognostic stubs
         # land (M6) fall back to RTT for ice and to the top soil-layer
         # temperature for snow -- this matches the offline-driver
@@ -3001,7 +3029,7 @@ class LandSurface(nn.Module):
         )
         ssrfl_capped = torch.minimum(
             ssrfl_raw,
-            torch.as_tensor(700.0, dtype=dtype, device=device),
+            torch.full((), 700.0, dtype=dtype, device=device),
         )
         # surfexcdriver_ctl_mod.F90 654-658 loops over nine tiles; the
         # ninth (lake) tile carries PALBTI=0 and PFRTI=0 here.  Its raw
@@ -3082,15 +3110,17 @@ class LandSurface(nn.Module):
             (21,), 0.15 * (1.10598 if band == 1 else 0.90981),
             dtype=dtype, device=device,
         )
-        for veg_type, uv_val, nir_val in (
-            (3, 0.31, 0.24),
-            (4, 0.39, 0.27),
-            (5, 0.35, 0.27),
-            (6, 0.44, 0.33),
-            (18, 0.32, 0.25),
-            (19, 0.32, 0.25),
-        ):
-            table[veg_type] = uv_val if band == 1 else nir_val
+        # Device-side scatter from cached tensors (built once on the first
+        # eager step, so no host->device copy occurs inside a captured step).
+        _cache = self.__dict__.get('_snf_cache')
+        if _cache is None or str(_cache[0]) != str(device):
+            _ti = torch.tensor((3, 4, 5, 6, 18, 19), dtype=torch.long, device=device)
+            _uvt = torch.tensor((0.31, 0.39, 0.35, 0.44, 0.32, 0.32), dtype=dtype, device=device)
+            _nirt = torch.tensor((0.24, 0.27, 0.27, 0.33, 0.25, 0.25), dtype=dtype, device=device)
+            _cache = (torch.device(device), _ti, _uvt, _nirt)
+            self.__dict__['_snf_cache'] = _cache
+        _, _ti, _uvt, _nirt = _cache
+        table.index_put_((_ti,), _uvt if band == 1 else _nirt)
         if static.veg_type_high is None:
             idx = torch.zeros((ngrid,), dtype=torch.long, device=device)
         else:

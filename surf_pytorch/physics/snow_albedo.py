@@ -225,7 +225,15 @@ def _legacy_albedo(
     # Decay factors (Fortran lines 338-339, computed once for the whole
     # snow block -- the same ZEXPF/ZLINA the density block uses).
     # ------------------------------------------------------------------ #
-    zexpf = math.exp(-rtauf * ptmst / rday)   # melt: exponential decay factor
+    # ptmst/rday are device scalars; math.exp of them is a host read, which
+    # CUDA-graph capture forbids.  The factor is step-invariant, so compute it
+    # once (host math preserved) and cache it as a device scalar.
+    _c = _asn_albedo.__dict__.get('_zexpf_cache')
+    if _c is None:
+        _k = float(-rtauf * ptmst / rday)
+        _c = (torch.tensor(math.exp(_k), dtype=ptmst.dtype, device=ptmst.device),)
+        _asn_albedo.__dict__['_zexpf_cache'] = _c
+    zexpf = _c[0]
     zlina = rtaua * ptmst / rday              # cold: linear decay amount
 
     # ------------------------------------------------------------------ #
@@ -302,9 +310,22 @@ def _asn_albedo(
     ptmst = inp.ptmst
 
     # Decay factors (same as legacy).
-    zexpf = math.exp(-rtauf * ptmst / rday)   # land melt decay factor
+    # ptmst/rday are device scalars; math.exp of them is a host read, which
+    # CUDA-graph capture forbids.  The factor is step-invariant, so compute it
+    # once (host math preserved) and cache it as a device scalar.
+    _c = _asn_albedo.__dict__.get('_zexpf_cache')
+    if _c is None:
+        _k = float(-rtauf * ptmst / rday)
+        _c = (torch.tensor(math.exp(_k), dtype=ptmst.dtype, device=ptmst.device),)
+        _asn_albedo.__dict__['_zexpf_cache'] = _c
+    zexpf = _c[0]
     zlina = rtaua * ptmst / rday              # land cold linear decay
-    zexpf_gl = math.exp(-zrtauf_gl * ptmst / rday)  # glacier melt decay factor
+    _c = _asn_albedo.__dict__.get('_zexpf_gl_cache')
+    if _c is None:
+        _k = float(-zrtauf_gl * ptmst / rday)
+        _c = (torch.tensor(math.exp(_k), dtype=ptmst.dtype, device=ptmst.device),)
+        _asn_albedo.__dict__['_zexpf_gl_cache'] = _c
+    zexpf_gl = _c[0]
 
     # ------------------------------------------------------------------ #
     # Aliases + fallbacks for the glacier-branch fields.
