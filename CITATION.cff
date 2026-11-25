@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "SURF-Torch"
+abstract: "SURF-Torch v1.0: a differentiable PyTorch implementation of the OpenIFS land-surface physics."
+version: "1.0"
+date-released: "2026-11-25"
+authors:
+  - family-names: Yang
+    given-names: Jinhui
+  - family-names: Zhao
+    given-names: WenJing
+  - family-names: Lin
+    given-names: Xiumin
+  - family-names: Li
+    given-names: Congyuan
+  - family-names: Song
+    given-names: Junqiang
+license: Apache-2.0
+repository-code: "https://github.com/yangjinhui11/surf_torch"
+preferred-citation:
+  type: article
+  title: "SURF-Torch v1.0: a differentiable PyTorch implementation of the OpenIFS land-surface physics"
+  journal: "Geoscientific Model Development Discussions (EGUsphere, egusphere-2026-5516)"
+  year: 2026
+  authors:
+    - family-names: Yang
+      given-names: Jinhui
+    - family-names: Zhao
+      given-names: WenJing
+    - family-names: Lin
+      given-names: Xiumin
+    - family-names: Li
+      given-names: Congyuan
+    - family-names: Song
+      given-names: Junqiang
+notes: "Preprint DOI to be added once the discussion paper is posted on EGUsphere. Accompanying data package: https://doi.org/10.57760/sciencedb.0125b"

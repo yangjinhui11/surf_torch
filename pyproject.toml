@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "surf-pytorch"
-version = "0.1.0"
-description = "PyTorch port of the OpenIFS 48r1 land-surface package (HTESSEL + SEB + diffusion + snow)."
+version = "1.0.0"
+description = "SURF-Torch v1.0: a differentiable PyTorch implementation of the OpenIFS land-surface physics (HTESSEL + SEB + diffusion + snow)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [
-    { name = "OpenIFS-ML team" },
+    { name = "Jinhui Yang" },
+    { name = "WenJing Zhao" },
+    { name = "Xiumin Lin" },
+    { name = "Congyuan Li" },
+    { name = "Junqiang Song" },
 ]
 keywords = ["openifs", "land-surface", "htessel", "pytorch", "differentiable"]
 classifiers = [
@@ -42,8 +46,8 @@ dev = [
 ]
 
 [project.urls]
-Source = "https://example.invalid/openifs-surf-pytorch"
-Issues = "https://example.invalid/openifs-surf-pytorch/issues"
+Source = "https://github.com/yangjinhui11/surf_torch"
+Issues = "https://github.com/yangjinhui11/surf_torch/issues"
 
 # --------------------------------------------------------------------------- #
 # Packaging: ship the package, the offline driver bridge, and the tests

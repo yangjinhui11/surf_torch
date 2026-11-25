@@ -1,8 +1,16 @@
-# surf-pytorch
+# SURF-Torch v1.0
 
-**OpenIFS 48r1 陆面包**（`openifs-48r1/ifs-source/surf/`）的 PyTorch 移植。
+**OpenIFS 48r1 陆面包**（`openifs-48r1/ifs-source/surf/`）的 PyTorch 移植（发行名 **SURF-Torch**，Python 包名 `surf-pytorch` / 导入名 `surf_pytorch`）。
 设计目标是既可作为可微分的 `nn.Module` 接入 ML 模型，又能复现 Fortran 单柱驱动器
 的 bit-level 精度。
+
+> **引用 / Citing：** SURF-Torch v1.0 是以下稿件的配套代码版本——
+> Yang, J., Zhao, W., Lin, X., Li, C., and Song, J.: *SURF-Torch v1.0: a
+> differentiable PyTorch implementation of the OpenIFS land-surface physics*,
+> Geosci. Model Dev. Discuss. (egusphere-2026-5516), under review, 2026.
+> 配套数据包（初始场、观测子集、Fortran 参考输出、实验归档与逐实验清单）：
+> Science Data Bank, <https://doi.org/10.57760/sciencedb.0125b>。
+> 预印本 DOI 将在 EGUsphere 讨论版上线后补充于此。
 
 > **状态：** 里程碑 **M1–M6** 已完成。完整物理核心已移植，并与独立 Fortran 参考实现
 > 完成 bit-level 验证：查找表 / 常数 / 饱和函数（M1）、Fortran 参考工具
